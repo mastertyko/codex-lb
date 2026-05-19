@@ -1478,6 +1478,13 @@ class ProxyService:
                     continue
                 if not _http_bridge_session_allows_api_key(session, api_key):
                     continue
+                if not _http_bridge_session_reusable_for_request(
+                    session=session,
+                    key=candidate_key,
+                    incoming_turn_state=incoming_turn_state,
+                    previous_response_id=None,
+                ) and not _http_bridge_session_retiring_with_visible_requests(session):
+                    continue
                 return True
         return False
 
@@ -4365,7 +4372,12 @@ class ProxyService:
 
     async def _http_bridge_pending_count(self, session: "_HTTPBridgeSession") -> int:
         async with session.pending_lock:
-            return max(len(session.pending_requests), session.queued_request_count)
+            visible_pending_count = sum(
+                1
+                for request_state in session.pending_requests
+                if _http_bridge_request_counts_against_queue(request_state)
+            )
+            return max(visible_pending_count, session.queued_request_count)
 
     async def _select_account_with_budget_compatible(
         self,
@@ -4684,10 +4696,12 @@ class ProxyService:
                     existing = None
                 if existing is not None and not existing.closed and existing.account.status == AccountStatus.ACTIVE:
                     old_account_id = existing.account.id
+                    retiring_with_visible_requests = _http_bridge_session_retiring_with_visible_requests(existing)
                     self._http_bridge_sessions.pop(key, None)
                     self._unregister_http_bridge_turn_states_locked(existing)
-                    existing.closed = True
-                    sessions_to_close.append(existing)
+                    if not retiring_with_visible_requests:
+                        existing.closed = True
+                        sessions_to_close.append(existing)
                     existing = None
 
                 if shutdown_state.is_bridge_drain_active() and not _http_bridge_can_recover_during_drain(
@@ -5285,12 +5299,14 @@ class ProxyService:
                         return session
                 if not session.closed and session.account.status == AccountStatus.ACTIVE:
                     old_account_id = session.account.id
+                    retiring_with_visible_requests = _http_bridge_session_retiring_with_visible_requests(session)
                     async with self._http_bridge_lock:
                         if self._http_bridge_sessions.get(key) is session:
                             self._http_bridge_sessions.pop(key, None)
                         self._unregister_http_bridge_turn_states_locked(session)
-                    session.closed = True
-                    await self._close_http_bridge_session(session)
+                    if not retiring_with_visible_requests:
+                        session.closed = True
+                        await self._close_http_bridge_session(session)
                 continue
 
             created_session: _HTTPBridgeSession | None = None
@@ -5514,6 +5530,11 @@ class ProxyService:
             return
         async with self._http_bridge_lock:
             if session.closed:
+                return
+            if (
+                session.upstream_control.retire_after_drain
+                and self._http_bridge_sessions.get(session.key) is not session
+            ):
                 return
             alias_key = _http_bridge_previous_response_alias_key(stripped_response_id, session.key.api_key_id)
             self._http_bridge_previous_response_index[alias_key] = session.key
@@ -6098,14 +6119,17 @@ class ProxyService:
         *,
         request_state: _WebSocketRequestState,
     ) -> bool:
-        removed = False
+        detached = False
         async with session.pending_lock:
-            if request_state in session.pending_requests:
-                session.pending_requests.remove(request_state)
+            if request_state in session.pending_requests and not request_state.draining_until_terminal:
+                request_state.draining_until_terminal = True
+                request_state.downstream_visible = False
                 session.queued_request_count = max(0, session.queued_request_count - 1)
-                removed = True
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+                detached = True
         request_state.event_queue = None
-        if not removed:
+        if not detached:
             return False
         self._cancel_request_state_api_key_reservation_heartbeat(request_state)
         _release_websocket_response_create_gate(request_state, session.response_create_gate)
@@ -6118,7 +6142,12 @@ class ProxyService:
         if not (session.upstream_control.reconnect_requested and session.upstream_control.retire_after_drain):
             return False
         async with session.pending_lock:
-            should_reconnect = not session.pending_requests and session.queued_request_count == 0
+            has_visible_pending = any(
+                _http_bridge_request_counts_against_queue(request_state) for request_state in session.pending_requests
+            )
+            should_reconnect = not has_visible_pending and session.queued_request_count == 0
+            if should_reconnect:
+                session.pending_requests.clear()
         if not should_reconnect:
             return False
 
@@ -6288,7 +6317,8 @@ class ProxyService:
             retryable_requests = [
                 request_state
                 for request_state in session.pending_requests
-                if request_state.response_id is None
+                if not request_state.draining_until_terminal
+                and request_state.response_id is None
                 and request_state.awaiting_response_created
                 and bool(request_state.request_text)
             ]
@@ -6518,6 +6548,7 @@ class ProxyService:
             created_request_state = None
             has_other_pending_requests = False
             grouped_previous_response_request_states: list[_WebSocketRequestState] = []
+            anonymous_event_prefers_draining = event_type not in {"response.failed", "response.incomplete", "error"}
             if event_type == "response.created":
                 matched_request_state = _assign_websocket_response_id(session.pending_requests, response_id)
                 created_request_state = matched_request_state
@@ -6536,6 +6567,7 @@ class ProxyService:
                     previous_response_id_hint=previous_response_id_hint,
                     error_message=error_message,
                     allow_unanchored_previous_response_error=is_previous_response_not_found_event,
+                    prefer_draining_requests=anonymous_event_prefers_draining,
                 )
                 release_create_gate = False
             else:
@@ -6570,12 +6602,32 @@ class ProxyService:
                     allow_unanchored_previous_response_error=is_previous_response_not_found_event,
                     allow_precreated_terminal_fallback=event_type
                     in {
+                        "response.completed",
                         "response.failed",
                         "response.incomplete",
                         "error",
                     },
+                    prefer_draining_requests=anonymous_event_prefers_draining,
                 )
-                if terminal_request_state is not None:
+                if (
+                    matched_request_state is None
+                    and terminal_request_state is not None
+                    and response_id is not None
+                    and event_type == "response.completed"
+                    and terminal_request_state.response_id is None
+                ):
+                    terminal_request_state.response_id = response_id
+                    matched_request_state = terminal_request_state
+                elif (
+                    matched_request_state is None
+                    and terminal_request_state is not None
+                    and response_id is not None
+                    and terminal_request_state.response_id == response_id
+                ):
+                    matched_request_state = terminal_request_state
+                if terminal_request_state is not None and _http_bridge_request_counts_against_queue(
+                    terminal_request_state
+                ):
                     session.queued_request_count = max(0, session.queued_request_count - 1)
                 elif is_previous_response_not_found_event or is_missing_tool_output_event:
                     grouped_previous_response_request_states = _pop_matching_websocket_request_states(
@@ -6595,9 +6647,14 @@ class ProxyService:
                             ),
                         )
                     if grouped_previous_response_request_states:
+                        grouped_counted_requests = sum(
+                            1
+                            for grouped_request_state in grouped_previous_response_request_states
+                            if _http_bridge_request_counts_against_queue(grouped_request_state)
+                        )
                         session.queued_request_count = max(
                             0,
-                            session.queued_request_count - len(grouped_previous_response_request_states),
+                            session.queued_request_count - grouped_counted_requests,
                         )
                 if (
                     terminal_request_state is None
@@ -6608,9 +6665,14 @@ class ProxyService:
                     grouped_previous_response_request_states = list(session.pending_requests)
                     session.pending_requests.clear()
                     if grouped_previous_response_request_states:
+                        grouped_counted_requests = sum(
+                            1
+                            for grouped_request_state in grouped_previous_response_request_states
+                            if _http_bridge_request_counts_against_queue(grouped_request_state)
+                        )
                         session.queued_request_count = max(
                             0,
-                            session.queued_request_count - len(grouped_previous_response_request_states),
+                            session.queued_request_count - grouped_counted_requests,
                         )
                 has_other_pending_requests = bool(session.pending_requests)
 
@@ -6814,7 +6876,7 @@ class ProxyService:
         if event_type == "response.created" and release_create_gate and created_request_state is not None:
             _release_websocket_response_create_gate(created_request_state, session.response_create_gate)
 
-        if response_id is not None and matched_request_state is not None:
+        if response_id is not None and matched_request_state is not None and event_type == "response.completed":
             await self._register_http_bridge_previous_response_id(
                 session,
                 response_id,
@@ -7665,7 +7727,11 @@ class ProxyService:
         stream_idle_timeout_seconds: float,
     ) -> _WebSocketReceiveTimeout | None:
         async with pending_lock:
-            started_ats = [request_state.started_at for request_state in pending_requests]
+            started_ats = [
+                request_state.started_at
+                for request_state in pending_requests
+                if _http_bridge_request_counts_against_queue(request_state)
+            ]
         return _websocket_receive_timeout_for_pending_requests(
             started_ats,
             proxy_request_budget_seconds=proxy_request_budget_seconds,
@@ -7770,6 +7836,12 @@ class ProxyService:
         error_payload: UpstreamError | None = None
         response_id = request_state.response_id or request_state.request_id
         response_service_tier = request_state.service_tier
+
+        if request_state.draining_until_terminal:
+            _release_websocket_response_create_gate(request_state, response_create_gate)
+            await self._release_websocket_reservation(request_state.api_key_reservation)
+            request_state.api_key_reservation = None
+            return
 
         if event_type == "error":
             error = event.error if event else None
@@ -10441,6 +10513,7 @@ class _WebSocketRequestState:
     api_key_reservation_heartbeat_stop: asyncio.Event | None = None
     api_key_reservation_heartbeat_task: asyncio.Task[None] | None = None
     downstream_visible: bool = False
+    draining_until_terminal: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -11472,10 +11545,38 @@ def _assign_websocket_response_id(
     if existing is not None:
         return existing
     for request_state in pending_requests:
+        if request_state.response_id is None and _http_bridge_request_counts_against_queue(request_state):
+            request_state.response_id = response_id
+            return request_state
+    for request_state in pending_requests:
+        if request_state.response_id is None and request_state.draining_until_terminal:
+            request_state.response_id = response_id
+            return request_state
+    for request_state in pending_requests:
         if request_state.response_id is None:
             request_state.response_id = response_id
             return request_state
     return None
+
+
+def _http_bridge_request_counts_against_queue(request_state: _WebSocketRequestState) -> bool:
+    return not request_state.draining_until_terminal
+
+
+def _http_bridge_session_has_visible_requests(session: "_HTTPBridgeSession") -> bool:
+    return session.queued_request_count > 0 or any(
+        _http_bridge_request_counts_against_queue(request_state) for request_state in session.pending_requests
+    )
+
+
+def _http_bridge_session_retiring_with_visible_requests(session: "_HTTPBridgeSession") -> bool:
+    return session.upstream_control.retire_after_drain and _http_bridge_session_has_visible_requests(session)
+
+
+def _draining_websocket_request_states(
+    pending_requests: deque[_WebSocketRequestState],
+) -> list[_WebSocketRequestState]:
+    return [request_state for request_state in pending_requests if request_state.draining_until_terminal]
 
 
 def _match_websocket_request_state_for_anonymous_event(
@@ -11485,6 +11586,7 @@ def _match_websocket_request_state_for_anonymous_event(
     previous_response_id_hint: str | None = None,
     error_message: str | None = None,
     allow_unanchored_previous_response_error: bool = False,
+    prefer_draining_requests: bool = True,
 ) -> _WebSocketRequestState | None:
     if prefer_previous_response_not_found:
         return _match_websocket_request_state_for_previous_response_error(
@@ -11494,12 +11596,36 @@ def _match_websocket_request_state_for_anonymous_event(
             allow_unanchored_previous_response_error=allow_unanchored_previous_response_error,
         )
 
-    if len(pending_requests) == 1:
-        return pending_requests[0]
+    visible_requests = [
+        request_state for request_state in pending_requests if _http_bridge_request_counts_against_queue(request_state)
+    ]
+    draining_requests = _draining_websocket_request_states(pending_requests)
+    if prefer_draining_requests and draining_requests:
+        unresolved_draining_requests = [
+            request_state for request_state in draining_requests if request_state.response_id is None
+        ]
+        if len(unresolved_draining_requests) == 1:
+            return unresolved_draining_requests[0]
+        if not visible_requests:
+            return draining_requests[0]
 
-    unresolved_requests = [request_state for request_state in pending_requests if request_state.response_id is None]
-    if len(unresolved_requests) == 1:
-        return unresolved_requests[0]
+    if len(visible_requests) == 1:
+        return visible_requests[0]
+
+    unresolved_visible_requests = [
+        request_state for request_state in visible_requests if request_state.response_id is None
+    ]
+    if len(unresolved_visible_requests) == 1:
+        return unresolved_visible_requests[0]
+
+    if not visible_requests and draining_requests:
+        unresolved_draining_requests = [
+            request_state for request_state in draining_requests if request_state.response_id is None
+        ]
+        if len(unresolved_draining_requests) == 1:
+            return unresolved_draining_requests[0]
+        return draining_requests[0]
+
     return None
 
 
@@ -12067,6 +12193,7 @@ def _pop_terminal_websocket_request_state(
     error_message: str | None = None,
     allow_unanchored_previous_response_error: bool = False,
     allow_precreated_terminal_fallback: bool = False,
+    prefer_draining_requests: bool = True,
 ) -> _WebSocketRequestState | None:
     if response_id is not None:
         request_state = _find_websocket_request_state_by_response_id(pending_requests, response_id)
@@ -12098,6 +12225,7 @@ def _pop_terminal_websocket_request_state(
             previous_response_id_hint=previous_response_id_hint,
             error_message=error_message,
             allow_unanchored_previous_response_error=allow_unanchored_previous_response_error,
+            prefer_draining_requests=prefer_draining_requests,
         )
         if request_state is not None and request_state in pending_requests:
             pending_requests.remove(request_state)
@@ -12843,6 +12971,8 @@ def _http_bridge_session_reusable_for_request(
     incoming_turn_state: str | None,
     previous_response_id: str | None,
 ) -> bool:
+    if session.upstream_control.retire_after_drain:
+        return False
     if key.affinity_kind != "prompt_cache":
         return True
     if incoming_turn_state is not None:

@@ -932,9 +932,11 @@ async def test_proxy_stream_drops_forwarded_headers(async_client, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_proxy_stream_usage_limit_returns_http_error(async_client, monkeypatch):
-    expected_account_id = await _import_account(async_client, "acc_limit", "limit@example.com")
+    raw_account_id = "acc_stream_usage_limit"
+    expected_account_id = await _import_account(async_client, raw_account_id, "stream-usage-limit@example.com")
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        assert account_id == raw_account_id
         raise ProxyResponseError(
             429,
             {
@@ -950,6 +952,12 @@ async def test_proxy_stream_usage_limit_returns_http_error(async_client, monkeyp
             yield ""
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    # This regression checks that the startup probe turns a pre-first-event
+    # upstream usage-limit failure into an HTTP error and still marks the account
+    # unhealthy. Keep the test on the single-candidate branch so PostgreSQL CI
+    # does not spend the probe budget on an intentionally absent failover target.
+    monkeypatch.setattr(proxy_module, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 1)
+    monkeypatch.setattr(proxy_api_module, "_STREAM_STARTUP_ERROR_PROBE_SECONDS", 5.0)
 
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
     response = await async_client.post("/backend-api/codex/responses", json=payload)
