@@ -5160,8 +5160,12 @@ class ProxyService:
                     pending_states = list(bridge_session.pending_requests)
                     pending_count = len(pending_states)
                     queued_count = bridge_session.queued_request_count
-                pending_request_ids = [state.request_log_id or state.request_id for state in pending_states]
-                pending_request_ages_seconds = [max(0.0, now - state.started_at) for state in pending_states]
+                pending_request_ids = [
+                    state.request_log_id or state.request_id for state in pending_states
+                ]
+                pending_request_ages_seconds = [
+                    max(0.0, now - state.started_at) for state in pending_states
+                ]
             _log_http_bridge_startup_wait_timeout(
                 stage="response_create_gate",
                 timeout_seconds=timeout_seconds,
@@ -12888,17 +12892,17 @@ class ProxyService:
                             preferred_account_id,
                         )
                         return preferred_selection
+                    logger.warning(
+                        "Proxy preferred account unavailable request_id=%s kind=%s request_stage=%s "
+                        "preferred_account_id=%s error_code=%s error=%s",
+                        request_id,
+                        kind,
+                        request_stage,
+                        preferred_account_id,
+                        preferred_selection.error_code,
+                        preferred_selection.error_message,
+                    )
                     if not fallback_on_preferred_account_unavailable:
-                        logger.warning(
-                            "Proxy preferred account unavailable request_id=%s kind=%s request_stage=%s "
-                            "preferred_account_id=%s error_code=%s error=%s",
-                            request_id,
-                            kind,
-                            request_stage,
-                            preferred_account_id,
-                            preferred_selection.error_code,
-                            preferred_selection.error_message,
-                        )
                         return preferred_selection
                 selection = await self._load_balancer.select_account(
                     sticky_key=sticky_key,
