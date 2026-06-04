@@ -5052,7 +5052,6 @@ class ProxyService:
         responses_payload = normalize_responses_request_payload(
             payload,
             openai_compat=openai_cache_affinity,
-            codex_tool_compat=codex_session_affinity,
         )
         previous_response_trimmed_input_count: int | None = None
         previous_response_trimmed_input_fingerprint: str | None = None

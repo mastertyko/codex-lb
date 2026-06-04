@@ -426,7 +426,7 @@ async def test_backend_responses_allows_web_search(async_client, monkeypatch, to
 
 
 @pytest.mark.asyncio
-async def test_backend_responses_strip_image_generation_tool_advertisement(async_client, monkeypatch):
+async def test_backend_responses_preserves_image_generation_tool_advertisement(async_client, monkeypatch):
     await _import_account(async_client, "acc_backend_image_gen", "backend-image-gen@example.com")
 
     seen = {}
@@ -450,7 +450,7 @@ async def test_backend_responses_strip_image_generation_tool_advertisement(async
     }
     resp = await async_client.post("/backend-api/codex/responses", json=request_payload)
     assert resp.status_code == 200
-    assert seen["payload"].tools == [function_tool]
+    assert seen["payload"].tools == [{"type": "image_generation", "output_format": "png"}, function_tool]
 
 
 @pytest.mark.asyncio

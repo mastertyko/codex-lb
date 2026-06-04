@@ -453,7 +453,7 @@ def test_apply_api_key_enforcement_normalizes_minimal_without_api_key():
     assert payload.reasoning.effort == "low"
 
 
-def test_normalize_responses_request_payload_strips_backend_codex_image_generation_tools():
+def test_normalize_responses_request_payload_preserves_backend_codex_image_generation_with_function_tools():
     function_tool = {
         "type": "function",
         "name": "lookup_weather",
@@ -469,11 +469,32 @@ def test_normalize_responses_request_payload_strips_backend_codex_image_generati
     request = proxy_request_policy.normalize_responses_request_payload(
         payload,
         openai_compat=True,
-        codex_tool_compat=True,
     )
 
-    assert request.tools == [function_tool]
+    assert request.tools == [{"type": "image_generation", "output_format": "png"}, function_tool]
     assert payload["tools"] == [{"type": "image_generation", "output_format": "png"}, function_tool]
+
+
+def test_normalize_responses_request_payload_preserves_backend_codex_image_generation_tools():
+    image_tool = {"type": "image_generation", "output_format": "png"}
+    function_tool = {
+        "type": "function",
+        "name": "lookup_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }
+    payload: dict[str, JsonValue] = {
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [],
+        "tools": [image_tool, function_tool],
+    }
+
+    request = proxy_request_policy.normalize_responses_request_payload(
+        payload,
+        openai_compat=True,
+    )
+
+    assert request.tools == [image_tool, function_tool]
 
 
 def test_normalize_responses_request_payload_without_codex_compat_preserves_image_generation():
@@ -487,7 +508,6 @@ def test_normalize_responses_request_payload_without_codex_compat_preserves_imag
     request = proxy_request_policy.normalize_responses_request_payload(
         payload,
         openai_compat=True,
-        codex_tool_compat=False,
     )
 
     assert request.tools == [{"type": "image_generation", "output_format": "png"}]
@@ -506,7 +526,6 @@ def test_normalize_responses_request_payload_preserves_explicit_image_generation
     request = proxy_request_policy.normalize_responses_request_payload(
         payload,
         openai_compat=True,
-        codex_tool_compat=True,
     )
 
     assert request.tools == [image_tool]
@@ -526,14 +545,13 @@ def test_normalize_responses_request_payload_preserves_required_image_generation
     request = proxy_request_policy.normalize_responses_request_payload(
         payload,
         openai_compat=True,
-        codex_tool_compat=True,
     )
 
     assert request.tools == [image_tool]
     assert request.tool_choice == "required"
 
 
-def test_normalize_responses_request_payload_strips_required_image_generation_advertisement_with_function_tool():
+def test_normalize_responses_request_payload_preserves_required_image_generation_with_function_tool():
     image_tool = {"type": "image_generation", "output_format": "png"}
     function_tool = {
         "type": "function",
@@ -553,10 +571,9 @@ def test_normalize_responses_request_payload_strips_required_image_generation_ad
     request = proxy_request_policy.normalize_responses_request_payload(
         payload,
         openai_compat=True,
-        codex_tool_compat=True,
     )
 
-    assert request.tools == [function_tool]
+    assert request.tools == [image_tool, function_tool]
     assert request.tool_choice == "required"
 
 
