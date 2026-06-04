@@ -4,6 +4,7 @@ import { isEmailLabel } from "@/components/blur-email";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { AccountAliasForm } from "@/features/accounts/components/account-alias-form";
 import { AccountActions } from "@/features/accounts/components/account-actions";
+import { AccountProxyBinding } from "@/features/accounts/components/account-proxy-binding";
 import { AccountTokenInfo } from "@/features/accounts/components/account-token-info";
 import { AccountUsagePanel } from "@/features/accounts/components/account-usage-panel";
 import type {
@@ -11,6 +12,7 @@ import type {
   AccountSummary,
 } from "@/features/accounts/schemas";
 import { useAccountTrends } from "@/features/accounts/hooks/use-accounts";
+import type { AccountProxyBindingRequest, UpstreamProxyAdmin } from "@/features/settings/schemas";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
 import { formatSlug } from "@/utils/formatters";
 
@@ -30,6 +32,8 @@ export type AccountDetailProps = {
     routingPolicy: AccountRoutingPolicy,
   ) => void;
   onSecurityWorkAuthorizedChange: (accountId: string, enabled: boolean) => void;
+  upstreamProxyAdmin?: UpstreamProxyAdmin | null;
+  onProxyBindingSave?: (accountId: string, payload: AccountProxyBindingRequest) => Promise<unknown>;
 };
 
 export function AccountDetail({
@@ -45,6 +49,8 @@ export function AccountDetail({
   onLimitWarmupChange,
   onRoutingPolicyChange,
   onSecurityWorkAuthorizedChange,
+  upstreamProxyAdmin = null,
+  onProxyBindingSave,
 }: AccountDetailProps) {
   const { data: trends } = useAccountTrends(account?.accountId ?? null);
   const blurred = usePrivacyStore((s) => s.blurred);
@@ -115,6 +121,14 @@ export function AccountDetail({
       </div>
 
       <AccountAliasForm account={account} busy={busy} onSetAlias={onSetAlias} />
+      {onProxyBindingSave ? (
+        <AccountProxyBinding
+          account={account}
+          admin={upstreamProxyAdmin}
+          busy={busy}
+          onSave={onProxyBindingSave}
+        />
+      ) : null}
       <AccountUsagePanel account={account} trends={trends} />
       <AccountTokenInfo account={account} />
       <AccountActions

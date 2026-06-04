@@ -31,6 +31,8 @@ const LIMIT_WARMUP_DEFAULTS = {
 const BASE_SETTINGS: DashboardSettings = {
   stickyThreadsEnabled: false,
   upstreamStreamTransport: "default",
+  upstreamProxyRoutingEnabled: false,
+  upstreamProxyDefaultPoolId: null,
   preferEarlierResetAccounts: true,
   preferEarlierResetWindow: "secondary",
   routingStrategy: "usage_weighted",

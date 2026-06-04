@@ -32,6 +32,17 @@ vi.mock("@/features/accounts/hooks/use-oauth", () => ({
   })),
 }));
 
+vi.mock("@/features/settings/hooks/use-settings", () => ({
+  useUpstreamProxyAdmin: vi.fn(() => ({
+    upstreamProxyQuery: { data: null, error: null },
+    accountBindingMutation: {
+      isPending: false,
+      error: null,
+      mutateAsync: vi.fn(),
+    },
+  })),
+}));
+
 const { useAccounts } = await import("@/features/accounts/hooks/use-accounts");
 const mockedUseAccounts = useAccounts as unknown as ReturnType<typeof vi.fn>;
 

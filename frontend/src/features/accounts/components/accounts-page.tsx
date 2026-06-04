@@ -14,6 +14,7 @@ import { AuthExportDialog } from "@/features/accounts/components/auth-export-dia
 import { useAccounts } from "@/features/accounts/hooks/use-accounts";
 import { sortAccountsForDisplay } from "@/features/accounts/sorting";
 import { useOauth } from "@/features/accounts/hooks/use-oauth";
+import { useUpstreamProxyAdmin } from "@/features/settings/hooks/use-settings";
 import { useAccountQuotaDisplayStore } from "@/hooks/use-account-quota-display";
 import type { AccountAuthExportResponse } from "@/features/accounts/schemas";
 import { getErrorMessageOrNull } from "@/utils/errors";
@@ -38,6 +39,7 @@ export function AccountsPage() {
     routingPolicyMutation,
     exportAuthMutation,
   } = useAccounts();
+  const { upstreamProxyQuery, accountBindingMutation } = useUpstreamProxyAdmin();
   const oauth = useOauth();
 
   const importDialog = useDialogState();
@@ -98,7 +100,8 @@ export function AccountsPage() {
     deleteMutation.isPending ||
     routingPolicyMutation.isPending ||
     exportAuthMutation.isPending ||
-    updateMutation.isPending;
+    updateMutation.isPending ||
+    accountBindingMutation.isPending;
 
   const mutationError =
     getErrorMessageOrNull(importMutation.error) ||
@@ -109,7 +112,9 @@ export function AccountsPage() {
     getErrorMessageOrNull(deleteMutation.error) ||
     getErrorMessageOrNull(routingPolicyMutation.error) ||
     getErrorMessageOrNull(exportAuthMutation.error) ||
-    getErrorMessageOrNull(updateMutation.error);
+    getErrorMessageOrNull(updateMutation.error) ||
+    getErrorMessageOrNull(upstreamProxyQuery.error) ||
+    getErrorMessageOrNull(accountBindingMutation.error);
 
   return (
     <div className="animate-fade-in-up space-y-6">
@@ -170,6 +175,10 @@ export function AccountsPage() {
                 accountId,
                 securityWorkAuthorized: enabled,
               })
+            }
+            upstreamProxyAdmin={upstreamProxyQuery.data ?? null}
+            onProxyBindingSave={(accountId, payload) =>
+              accountBindingMutation.mutateAsync({ accountId, payload })
             }
           />
         </div>

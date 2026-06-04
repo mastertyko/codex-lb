@@ -20,6 +20,8 @@ const ADDITIONAL_QUOTA_DEFAULTS = {
 const baseSettings = {
   stickyThreadsEnabled: true,
   upstreamStreamTransport: "default" as const,
+  upstreamProxyRoutingEnabled: false,
+  upstreamProxyDefaultPoolId: null,
   preferEarlierResetAccounts: false,
   preferEarlierResetWindow: "secondary" as const,
   routingStrategy: "usage_weighted" as const,

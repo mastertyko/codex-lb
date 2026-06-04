@@ -43,8 +43,8 @@ import {
 	RequestLogSchema,
 	RequestLogsResponseSchema,
 } from "@/features/dashboard/schemas";
-import type { DashboardSettings } from "@/features/settings/schemas";
-import { DashboardSettingsSchema } from "@/features/settings/schemas";
+import type { DashboardSettings, UpstreamProxyAdmin } from "@/features/settings/schemas";
+import { DashboardSettingsSchema, UpstreamProxyAdminSchema } from "@/features/settings/schemas";
 import type {
 	QuotaPlannerDecision,
 	QuotaPlannerForecast,
@@ -72,6 +72,7 @@ export type {
 	RequestLogsResponse,
 	RequestLogFilterOptions,
 	DashboardSettings,
+	UpstreamProxyAdmin,
 	OauthStartResponse,
 	OauthStatusResponse,
 	ApiKey,
@@ -412,6 +413,8 @@ export function createDashboardSettings(
 	return DashboardSettingsSchema.parse({
 		stickyThreadsEnabled: true,
 		upstreamStreamTransport: "default",
+		upstreamProxyRoutingEnabled: false,
+		upstreamProxyDefaultPoolId: null,
 		preferEarlierResetAccounts: false,
 		preferEarlierResetWindow: "secondary",
 		routingStrategy: "usage_weighted",
@@ -512,6 +515,36 @@ export function createQuotaPlannerWarmupActionResponse(
 		reason: "synthetic_traffic_disabled",
 		requestId: null,
 		executedAt: null,
+		...overrides,
+	});
+}
+
+export function createUpstreamProxyAdmin(
+	overrides: Partial<UpstreamProxyAdmin> = {},
+): UpstreamProxyAdmin {
+	return UpstreamProxyAdminSchema.parse({
+		routingEnabled: false,
+		defaultPoolId: null,
+		endpoints: [
+			{
+				id: "ep_primary",
+				name: "Primary proxy",
+				scheme: "http",
+				host: "proxy-primary.test",
+				port: 8080,
+				username: "operator",
+				isActive: true,
+			},
+		],
+		pools: [
+			{
+				id: "pool_primary",
+				name: "Primary pool",
+				isActive: true,
+				endpointIds: ["ep_primary"],
+			},
+		],
+		bindings: [],
 		...overrides,
 	});
 }

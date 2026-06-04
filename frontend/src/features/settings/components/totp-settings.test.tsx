@@ -33,6 +33,8 @@ const ADDITIONAL_QUOTA_DEFAULTS = {
 const baseSettings = {
   stickyThreadsEnabled: true,
   upstreamStreamTransport: "default" as const,
+  upstreamProxyRoutingEnabled: false,
+  upstreamProxyDefaultPoolId: null,
   preferEarlierResetAccounts: false,
   preferEarlierResetWindow: "secondary" as const,
   routingStrategy: "usage_weighted" as const,
@@ -136,6 +138,8 @@ describe("TotpSettings", () => {
     const saveSettings: Record<string, unknown> = { ...baseSettings };
     delete saveSettings.additionalQuotaPolicies;
     delete saveSettings.totpConfigured;
+    delete saveSettings.upstreamProxyRoutingEnabled;
+    delete saveSettings.upstreamProxyDefaultPoolId;
 
     renderWithClient(<TotpSettings settings={baseSettings} onSave={onSave} />);
 

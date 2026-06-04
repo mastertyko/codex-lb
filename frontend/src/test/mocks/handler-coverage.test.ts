@@ -60,6 +60,11 @@ const EXPECTED_ENDPOINTS = [
 	// settings
 	"GET /api/settings",
 	"PUT /api/settings",
+	"GET /api/settings/upstream-proxy",
+	"POST /api/settings/upstream-proxy/endpoints",
+	"POST /api/settings/upstream-proxy/pools",
+	"POST /api/settings/upstream-proxy/pools/:poolId/members",
+	"PUT /api/settings/upstream-proxy/accounts/:accountId/binding",
 	"GET /api/sticky-sessions",
 	"POST /api/sticky-sessions/delete",
 	"POST /api/sticky-sessions/delete-filtered",

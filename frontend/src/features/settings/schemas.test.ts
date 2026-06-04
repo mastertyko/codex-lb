@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   DashboardSettingsSchema,
   SettingsUpdateRequestSchema,
+  UpstreamProxyAdminSchema,
 } from "@/features/settings/schemas";
 
 describe("DashboardSettingsSchema", () => {
@@ -10,6 +11,8 @@ describe("DashboardSettingsSchema", () => {
     const parsed = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       upstreamStreamTransport: "default",
+      upstreamProxyRoutingEnabled: true,
+      upstreamProxyDefaultPoolId: "pool_1",
       preferEarlierResetAccounts: false,
       routingStrategy: "relative_availability",
       preferEarlierResetWindow: "secondary",
@@ -36,6 +39,8 @@ describe("DashboardSettingsSchema", () => {
 
     expect(parsed.stickyThreadsEnabled).toBe(true);
     expect(parsed.upstreamStreamTransport).toBe("default");
+    expect(parsed.upstreamProxyRoutingEnabled).toBe(true);
+    expect(parsed.upstreamProxyDefaultPoolId).toBe("pool_1");
     expect(parsed.routingStrategy).toBe("relative_availability");
     expect(parsed.preferEarlierResetWindow).toBe("secondary");
     expect(parsed.relativeAvailabilityPower).toBe(2);
@@ -64,6 +69,8 @@ describe("DashboardSettingsSchema", () => {
     });
 
     expect(parsed.upstreamStreamTransport).toBe("default");
+    expect(parsed.upstreamProxyRoutingEnabled).toBe(false);
+    expect(parsed.upstreamProxyDefaultPoolId).toBeNull();
     expect(parsed.routingStrategy).toBe("usage_weighted");
     expect(parsed.singleAccountId).toBeNull();
     expect(parsed.openaiCacheAffinityMaxAgeSeconds).toBe(300);
@@ -121,6 +128,8 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = SettingsUpdateRequestSchema.parse({
       stickyThreadsEnabled: false,
       upstreamStreamTransport: "websocket",
+      upstreamProxyRoutingEnabled: true,
+      upstreamProxyDefaultPoolId: null,
       preferEarlierResetAccounts: true,
       routingStrategy: "relative_availability",
       preferEarlierResetWindow: "secondary",
@@ -151,6 +160,8 @@ describe("SettingsUpdateRequestSchema", () => {
     expect(parsed.warmupModel).toBe("gpt-5.4-nano");
     expect(parsed.upstreamStreamTransport).toBe("websocket");
     expect(parsed.preferEarlierResetWindow).toBe("secondary");
+    expect(parsed.upstreamProxyRoutingEnabled).toBe(true);
+    expect(parsed.upstreamProxyDefaultPoolId).toBeNull();
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.routingStrategy).toBe("relative_availability");
     expect(parsed.relativeAvailabilityPower).toBe(1.5);
@@ -179,6 +190,8 @@ describe("SettingsUpdateRequestSchema", () => {
     });
 
     expect(parsed.upstreamStreamTransport).toBeUndefined();
+    expect(parsed.upstreamProxyRoutingEnabled).toBeUndefined();
+    expect(parsed.upstreamProxyDefaultPoolId).toBeUndefined();
     expect(parsed.importWithoutOverwrite).toBeUndefined();
     expect(parsed.totpRequiredOnLogin).toBeUndefined();
     expect(parsed.apiKeyAuthEnabled).toBeUndefined();
@@ -234,5 +247,39 @@ describe("SettingsUpdateRequestSchema", () => {
         limitWarmupPrompt: "p".repeat(513),
       }).success,
     ).toBe(false);
+  });
+});
+
+describe("UpstreamProxyAdminSchema", () => {
+  it("parses upstream proxy admin state", () => {
+    const parsed = UpstreamProxyAdminSchema.parse({
+      routingEnabled: true,
+      defaultPoolId: "pool_1",
+      endpoints: [
+        {
+          id: "ep_1",
+          name: "Proxy A",
+          scheme: "http",
+          host: "proxy.test",
+          port: 8080,
+          username: null,
+          isActive: true,
+        },
+      ],
+      pools: [
+        {
+          id: "pool_1",
+          name: "Pool A",
+          isActive: true,
+          endpointIds: ["ep_1"],
+        },
+      ],
+      bindings: [{ accountId: "acc_1", poolId: "pool_1", isActive: true }],
+    });
+
+    expect(parsed.routingEnabled).toBe(true);
+    expect(parsed.endpoints[0]?.host).toBe("proxy.test");
+    expect(parsed.pools[0]?.endpointIds).toEqual(["ep_1"]);
+    expect(parsed.bindings[0]?.accountId).toBe("acc_1");
   });
 });
