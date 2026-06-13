@@ -353,45 +353,42 @@ def normalize_responses_request_payload(
     payload: dict[str, JsonValue],
     *,
     openai_compat: bool,
-    codex_tool_compat: bool = False,
 ) -> ResponsesRequest:
-    effective_payload = _sanitize_backend_codex_tool_advertisements(payload) if codex_tool_compat else payload
     if openai_compat:
-        responses = V1ResponsesRequest.model_validate(effective_payload).to_responses_request()
+        responses = V1ResponsesRequest.model_validate(payload).to_responses_request()
     else:
-        responses = ResponsesRequest.model_validate(effective_payload)
+        responses = ResponsesRequest.model_validate(payload)
     enforce_strict_text_format(responses)
     enforce_strict_function_tools_format(responses.tools)
     return responses
 
 
-def _sanitize_backend_codex_tool_advertisements(payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
-    tools_value = payload.get("tools")
-    if not is_json_list(tools_value):
-        return payload
-    if _explicitly_requests_image_generation(payload.get("tool_choice"), tools_value):
-        return payload
+def strip_terminal_compaction_trigger_input(payload: ResponsesRequest) -> list[JsonValue] | None:
+    input_value = payload.input
+    if not is_json_list(input_value):
+        return None
 
-    sanitized_tools: list[JsonValue] = []
-    removed_any = False
-    for tool in tools_value:
-        if is_json_mapping(tool) and tool.get("type") == "image_generation":
-            removed_any = True
+    stripped_input: list[JsonValue] = []
+    trigger_seen = False
+    last_index = len(input_value) - 1
+
+    for index, item in enumerate(input_value):
+        if not (is_json_mapping(item) and item.get("type") == "compaction_trigger"):
+            stripped_input.append(item)
             continue
-        sanitized_tools.append(tool)
 
-    if not removed_any:
-        return payload
+        if trigger_seen or index != last_index:
+            raise ClientPayloadError(
+                "compaction_trigger must appear exactly once as the final top-level input item",
+                param="input",
+                code="invalid_request_error",
+                error_type="invalid_request_error",
+            )
+        trigger_seen = True
 
-    sanitized_payload = dict(payload)
-    sanitized_payload["tools"] = sanitized_tools
-    return sanitized_payload
-
-
-def _explicitly_requests_image_generation(tool_choice: JsonValue | None, tools: list[JsonValue]) -> bool:
-    if tool_choice == "required":
-        return all(is_json_mapping(tool) and tool.get("type") == "image_generation" for tool in tools)
-    return is_json_mapping(tool_choice) and tool_choice.get("type") == "image_generation"
+    if not trigger_seen:
+        return None
+    return stripped_input
 
 
 def enforce_strict_text_format(request: ResponsesRequest) -> None:

@@ -22,6 +22,7 @@ class AccountUsageTrend(DashboardModel):
 class AccountUsage(DashboardModel):
     primary_remaining_percent: float | None = None
     secondary_remaining_percent: float | None = None
+    monthly_remaining_percent: float | None = None
 
 
 class AccountRequestUsage(DashboardModel):
@@ -64,12 +65,14 @@ class AccountAdditionalQuota(DashboardModel):
     limit_name: str
     metered_feature: str
     display_label: str | None = None
+    routing_policy: str = Field(default="inherit", pattern=r"^(inherit|normal|burn_first|preserve)$")
     primary_window: AccountAdditionalWindow | None = None
     secondary_window: AccountAdditionalWindow | None = None
 
 
 class AccountSummary(DashboardModel):
     account_id: str
+    chatgpt_account_id: str | None = None
     email: str
     alias: str | None = None
     display_name: str
@@ -77,19 +80,28 @@ class AccountSummary(DashboardModel):
     workspace_label: str | None = None
     seat_type: str | None = None
     plan_type: str
+    routing_policy: str = Field(default="normal", pattern=r"^(normal|burn_first|preserve)$")
     status: str
+    security_work_authorized: bool = False
     usage: AccountUsage | None = None
     reset_at_primary: datetime | None = None
     reset_at_secondary: datetime | None = None
+    reset_at_monthly: datetime | None = None
     window_minutes_primary: int | None = None
     window_minutes_secondary: int | None = None
+    window_minutes_monthly: int | None = None
     last_refresh_at: datetime | None = None
     capacity_credits_primary: float | None = None
     remaining_credits_primary: float | None = None
     capacity_credits_secondary: float | None = None
     remaining_credits_secondary: float | None = None
+    capacity_credits_monthly: float | None = None
+    remaining_credits_monthly: float | None = None
     request_usage: AccountRequestUsage | None = None
     additional_quotas: list[AccountAdditionalQuota] = Field(default_factory=list)
+    credits_has: bool | None = None
+    credits_unlimited: bool | None = None
+    credits_balance: float | None = None
     deactivation_reason: str | None = None
     auth: AccountAuthStatus | None = None
     limit_warmup_enabled: bool = False
@@ -143,6 +155,14 @@ class AccountOpenCodeAuthExportResponse(DashboardModel):
     auth_json: OpenCodeAuthJson
 
 
+class AccountUpdateRequest(DashboardModel):
+    security_work_authorized: bool | None = None
+
+
+class AccountUpdateResponse(DashboardModel):
+    status: str
+
+
 class AccountPauseResponse(DashboardModel):
     status: str
 
@@ -158,6 +178,15 @@ class AccountLimitWarmupUpdateRequest(DashboardModel):
 class AccountLimitWarmupUpdateResponse(DashboardModel):
     status: str
     enabled: bool
+
+
+class AccountRoutingPolicyUpdateRequest(DashboardModel):
+    routing_policy: str = Field(pattern=r"^(normal|burn_first|preserve)$")
+
+
+class AccountRoutingPolicyUpdateResponse(DashboardModel):
+    account_id: str
+    routing_policy: str
 
 
 class AccountDeleteResponse(DashboardModel):

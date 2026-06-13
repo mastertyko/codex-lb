@@ -58,6 +58,17 @@ export const DashboardMetricsSchema = z.object({
   topError: z.string().nullable(),
 });
 
+export const DashboardMetricsComparisonPreviousSchema = z.object({
+  requests: z.number(),
+  tokens: z.number(),
+  costUsd: z.number(),
+});
+
+export const DashboardMetricsComparisonSchema = z.object({
+  canCompare: z.boolean(),
+  previous: DashboardMetricsComparisonPreviousSchema,
+});
+
 export const TrendPointSchema = z.object({
   t: z.string().datetime({ offset: true }),
   v: z.number(),
@@ -115,6 +126,7 @@ export const DashboardOverviewSchema = z.object({
     secondaryWindow: UsageSummaryWindowSchema.nullable(),
     cost: UsageCostSchema,
     metrics: DashboardMetricsSchema.nullable(),
+    comparison: DashboardMetricsComparisonSchema.optional(),
   }),
   windows: z.object({
     primary: UsageWindowSchema,
@@ -144,13 +156,15 @@ export const RequestLogSchema = z.object({
   requestedAt: z.string().datetime({ offset: true }),
   accountId: z.string().nullable(),
   planType: z.string().nullable().optional().default(null),
-  apiKeyName: z.string().nullable(),
+  apiKeyName: z.string().nullable().optional().default(null),
   apiKeyId: z.string().nullable().optional().default(null),
   requestId: z.string(),
   requestKind: z.enum(["normal", "warmup", "limit_warmup"]).optional().default("normal"),
   model: z.string(),
   source: z.string().nullable().optional().default(null),
   transport: z.string().nullable().optional().default(null),
+  useragent: z.string().nullable().optional().default(null),
+  useragentGroup: z.string().nullable().optional().default(null),
   serviceTier: z.string().nullable().optional().default(null),
   requestedServiceTier: z.string().nullable().optional().default(null),
   actualServiceTier: z.string().nullable().optional().default(null),
@@ -209,6 +223,7 @@ export const FilterStateSchema = z.object({
 });
 
 export type DashboardMetrics = z.infer<typeof DashboardMetricsSchema>;
+export type DashboardMetricsComparison = z.infer<typeof DashboardMetricsComparisonSchema>;
 export type DashboardOverview = z.infer<typeof DashboardOverviewSchema>;
 export type DashboardProjections = z.infer<typeof DashboardProjectionsSchema>;
 export type DashboardOverviewTimeframe = z.infer<typeof DashboardOverviewTimeframeSchema>;

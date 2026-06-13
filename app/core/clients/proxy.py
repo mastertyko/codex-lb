@@ -34,7 +34,6 @@ import aiohttp
 from aiohttp import hdrs
 from aiohttp.client_ws import DEFAULT_WS_CLIENT_TIMEOUT, WebSocketDataQueue
 from aiohttp.http_websocket import WS_KEY, WebSocketReader, WebSocketWriter
-from curl_cffi.const import CurlWsFlag
 from multidict import CIMultiDict
 
 from app.core.clients.codex import (
@@ -374,7 +373,7 @@ class _CodexSSEContent:
 
     def iter_chunked(self, size: int) -> "SSEChunkIteratorProtocol":
         del size
-        return cast(SSEChunkIteratorProtocol, self._response.aiter_content())
+        return cast(SSEChunkIteratorProtocol, self._response.content.iter_chunked(1024))
 
 
 class _CodexSSEResponse:
@@ -1397,20 +1396,26 @@ async def _stream_codex_websocket_events(
             timeout_seconds = min(timeout_seconds, remaining)
 
         try:
-            data, flags = await asyncio.wait_for(websocket.recv(), timeout=timeout_seconds)
+            msg = await asyncio.wait_for(websocket.receive(), timeout=timeout_seconds)
         except asyncio.TimeoutError as exc:
             if deadline is not None and deadline - time.monotonic() <= 0:
                 raise
             raise StreamIdleTimeoutError() from exc
 
-        if flags & int(CurlWsFlag.CLOSE):
+        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
             break
-        if flags & int(CurlWsFlag.TEXT):
-            text = data.decode("utf-8", errors="replace") if isinstance(data, bytes) else str(data)
-        elif isinstance(data, bytes):
-            text = data.decode("utf-8", errors="replace")
+        if msg.type == aiohttp.WSMsgType.ERROR:
+            exc = websocket.exception()
+            if exc is None and isinstance(msg.data, BaseException):
+                exc = msg.data
+            exc = exc or aiohttp.ClientError("Upstream websocket error")
+            raise CodexTransportError(codex_transport_error_message("websocket stream", None, exc)) from exc
+        if msg.type == aiohttp.WSMsgType.TEXT:
+            text = msg.data if isinstance(msg.data, str) else str(msg.data)
+        elif msg.type == aiohttp.WSMsgType.BINARY:
+            text = msg.data.decode("utf-8", errors="replace") if isinstance(msg.data, bytes) else str(msg.data)
         else:
-            text = str(data)
+            text = str(msg.data) if msg.data is not None else ""
         text_bytes = text.encode("utf-8")
         if len(text_bytes) > max_event_bytes:
             raise StreamEventTooLargeError(len(text_bytes), max_event_bytes)
@@ -1501,7 +1506,7 @@ async def _stream_responses_via_websocket(
                     route=route,
                     headers=headers,
                     timeout=connect_timeout_seconds,
-                    max_message_size=max_event_bytes,
+                    max_msg_size=max_event_bytes,
                 )
                 websocket = result.websocket
                 websocket_context = result.context
@@ -1513,7 +1518,7 @@ async def _stream_responses_via_websocket(
                     route=route,
                     headers=headers,
                     timeout=connect_timeout_seconds,
-                    max_message_size=max_event_bytes,
+                    max_msg_size=max_event_bytes,
                 )
                 websocket = (
                     await websocket_context.__aenter__()
@@ -2051,6 +2056,8 @@ async def _resolve_global_ips(host: str, *, timeout_seconds: float) -> list[str]
         if not sockaddr:
             return None
         addr = sockaddr[0]
+        if not isinstance(addr, str):
+            return None
         ip = _parse_ip_literal(addr)
         if ip is None:
             return None
@@ -2229,7 +2236,7 @@ async def _stream_responses_with_session(
                     "json": payload_dict,
                     "headers": current_headers,
                     "timeout": remaining_request_timeout or request_total_timeout,
-                    "stream": True,
+                    "buffer_response": False,
                 }
                 request_with_metadata = getattr(active_codex_client, "request_with_route_metadata", None)
                 if callable(request_with_metadata):
@@ -2496,10 +2503,12 @@ async def _stream_responses_with_session(
                         error_message = exc.message or str(exc)
                     if error_code is None:
                         error_code = "upstream_error"
+                    response_error_code = cast(str, error_code)
+                    response_error_message = cast(str, error_message)
                     if raise_for_status:
                         raise ProxyResponseError(exc.status, error_payload) from exc
                     yield format_sse_event(
-                        response_failed_event(error_code, error_message, response_id=get_request_id())
+                        response_failed_event(response_error_code, response_error_message, response_id=get_request_id())
                     )
                     return
 
@@ -2548,7 +2557,11 @@ async def _stream_responses_with_session(
         error_code = "upstream_unavailable"
         error_message = "Upstream circuit breaker is open"
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+            response_failed_event(
+                "upstream_unavailable",
+                "Upstream circuit breaker is open",
+                response_id=get_request_id(),
+            ),
         )
         return
     except CodexTransportError as exc:
@@ -2559,8 +2572,9 @@ async def _stream_responses_with_session(
             operation="stream",
             exc=exc,
         )
+        response_error_message = cast(str, error_message)
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
         )
         return
     except aiohttp.ClientError as exc:
@@ -2571,8 +2585,9 @@ async def _stream_responses_with_session(
             operation="stream",
             exc=exc,
         )
+        response_error_message = cast(str, error_message)
         yield format_sse_event(
-            response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+            response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
         )
         return
     except asyncio.CancelledError:
@@ -2590,8 +2605,9 @@ async def _stream_responses_with_session(
                 if route is not None
                 else str(exc) or "Request to upstream timed out"
             )
+            response_error_message = cast(str, error_message)
             yield format_sse_event(
-                response_failed_event("upstream_unavailable", error_message, response_id=get_request_id()),
+                response_failed_event("upstream_unavailable", response_error_message, response_id=get_request_id()),
             )
             return
         now = time.monotonic()
@@ -2624,10 +2640,11 @@ async def _stream_responses_with_session(
                 if route is not None
                 else str(exc) or "Request to upstream timed out"
             )
+            response_error_message = cast(str, error_message)
             yield format_sse_event(
                 response_failed_event(
                     "upstream_unavailable",
-                    error_message,
+                    response_error_message,
                     response_id=get_request_id(),
                 ),
             )
@@ -2650,7 +2667,10 @@ async def _stream_responses_with_session(
             operation="stream",
             exc=exc,
         )
-        yield format_sse_event(response_failed_event("upstream_error", error_message, response_id=get_request_id()))
+        response_error_message = cast(str, error_message)
+        yield format_sse_event(
+            response_failed_event("upstream_error", response_error_message, response_id=get_request_id())
+        )
         return
     else:
         if not seen_terminal:

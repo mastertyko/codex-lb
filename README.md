@@ -91,6 +91,8 @@ docker run -d --name codex-lb \
 
 Point any OpenAI-compatible client at codex-lb. If [API key auth](#api-key-authentication) is enabled, pass a key from the dashboard as a Bearer token.
 
+Model availability is discovered from the upstream Codex model catalog and can vary by account plan, workspace, rollout, and upstream deprecation state. Prefer the live `GET /v1/models` or `GET /backend-api/codex/models` response over a copied static table when configuring clients or API-key model allowlists.
+
 | Logo | Client | Endpoint | Config |
 |---|--------|----------|--------|
 | <img src="https://avatars.githubusercontent.com/u/14957082?s=200" width="32" alt="OpenAI"> | **Codex CLI** | `http://127.0.0.1:2455/backend-api/codex` | `~/.codex/config.toml` |
@@ -318,6 +320,8 @@ opencode
 Set the env var or replace `${CODEX_LB_API_KEY}` with a key from the dashboard. If API key auth is disabled,
 local requests can omit the key, but non-local requests are still rejected until proxy authentication is configured.
 
+The `/v1` route is the simplest OpenAI-compatible setup. If your OpenClaw build uses a Codex-native provider path such as `openai-codex-responses` and needs Codex-style usage/accounting behavior, point that provider at `http://127.0.0.1:2455/backend-api/codex` instead. For third-party Codex-compatible backends, the client must allow opaque bearer-token passthrough and should only send `chatgpt-account-id` when it actually decoded one from an official ChatGPT/Codex token.
+
 </details>
 
 <details>
@@ -366,6 +370,30 @@ The protected proxy routes covered by this setting are:
 
 Environment variables with `CODEX_LB_` prefix or `.env.local`. See [`.env.example`](.env.example).
 SQLite is the default database backend; PostgreSQL is optional via `CODEX_LB_DATABASE_URL` (for example `postgresql+asyncpg://...`).
+
+The Docker Compose `postgres` profile uses the Postgres 18 image and mounts the named data volume at
+`/var/lib/postgresql`, the parent of the image's versioned `PGDATA` directory.
+
+Existing Postgres 16 compose volumes must be upgraded before the Postgres 18 container starts:
+
+```bash
+docker compose --profile postgres stop postgres
+docker run --rm -v codex-lb-postgres-data:/var/lib/postgresql -v "$PWD:/backup" alpine \
+  tar -C /var/lib/postgresql -czf /backup/codex-lb-postgres-data-before-pg18.tgz .
+docker compose --profile postgres-upgrade run --rm postgres-upgrade
+docker compose --profile postgres up -d postgres
+```
+
+The `postgres-upgrade` profile runs `pg_upgrade` in one-shot mode against the same named volume and exits after the
+data directory has been upgraded to the Postgres 18 layout. Because that helper mounts and rewrites the operator's
+database volume, Compose pins the helper image by digest; refresh and review the digest deliberately when changing the
+helper image tag. Keep the backup until the application has started and `codex-lb-db check` succeeds against the
+upgraded database.
+
+The normal `postgres` service refuses to start when it detects the old root-level `PG_VERSION` file from a pre-18
+Compose volume. If that guard fires, run the `postgres-upgrade` profile above before starting Postgres again.
+It also refuses nested `/var/lib/postgresql/data` directories that still report a pre-18 major version, because those
+layouts need an explicit pg_upgrade before the Postgres 18 container can safely open them.
 
 ### Dashboard authentication modes
 
@@ -440,6 +468,8 @@ Open [localhost:2455](http://localhost:2455) → Add account → Done.
 The Helm chart auto-configures HTTP `/responses` owner handoff for multi-replica installs using a headless-service DNS name per pod. The default cluster domain is `cluster.local`; set Helm `clusterDomain` if your cluster uses a different suffix. Override `config.sessionBridgeAdvertiseBaseUrl` only if pods must be reached through a different internal address.
 
 For external database, production config, ingress, observability, and more see the [Helm chart README](deploy/helm/codex-lb/README.md).
+
+Fast Mode and service-tier behavior is documented in [Responses API compatibility context](openspec/specs/responses-api-compat/context.md#fast-mode-and-service-tiers).
 
 ## Development
 
@@ -536,6 +566,14 @@ Thanks goes to these wonderful people ([emoji key](https://allcontributors.org/e
     <tr>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/1llu5ion"><img src="https://avatars.githubusercontent.com/u/23450032?v=4?s=100" width="100px;" alt="Nataprom"/><br /><sub><b>Nataprom</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=1llu5ion" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=1llu5ion" title="Tests">⚠️</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/Iweisc"><img src="https://avatars.githubusercontent.com/u/179300695?v=4?s=100" width="100px;" alt="Iweisc"/><br /><sub><b>Iweisc</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=Iweisc" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=Iweisc" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ramhaidar"><img src="https://avatars.githubusercontent.com/u/49301219?v=4?s=100" width="100px;" alt="ram/haidar"/><br /><sub><b>ram/haidar</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=ramhaidar" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://rtx09x.github.io/"><img src="https://avatars.githubusercontent.com/u/187954595?v=4?s=100" width="100px;" alt="Rudra Tiwari"/><br /><sub><b>Rudra Tiwari</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=Rtx09x" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/wuchao05"><img src="https://avatars.githubusercontent.com/u/97175999?v=4?s=100" width="100px;" alt="Wu Chao"/><br /><sub><b>Wu Chao</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=wuchao05" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/zwd0313"><img src="https://avatars.githubusercontent.com/u/159164983?v=4?s=100" width="100px;" alt="zwd0313"/><br /><sub><b>zwd0313</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=zwd0313" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jhordanjw123"><img src="https://avatars.githubusercontent.com/u/123907587?v=4?s=100" width="100px;" alt="jhordanjw123"/><br /><sub><b>jhordanjw123</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=jhordanjw123" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=jhordanjw123" title="Tests">⚠️</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/mastertyko"><img src="https://avatars.githubusercontent.com/u/11311479?v=4?s=100" width="100px;" alt="mastertyko"/><br /><sub><b>mastertyko</b></sub></a><br /><a href="https://github.com/Soju06/codex-lb/commits?author=mastertyko" title="Code">💻</a> <a href="https://github.com/Soju06/codex-lb/commits?author=mastertyko" title="Tests">⚠️</a></td>
     </tr>
   </tbody>
 </table>

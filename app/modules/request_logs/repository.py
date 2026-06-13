@@ -133,6 +133,32 @@ class RequestLogsRepository:
         ]
 
     async def aggregate_activity_since(self, since: datetime) -> RequestActivityAggregate:
+        stmt = self._aggregate_activity_stmt(since)
+        result = await self._session.execute(stmt)
+        row = result.one()
+        return RequestActivityAggregate(
+            request_count=int(row.request_count),
+            error_count=int(row.error_count),
+            input_tokens=int(row.input_tokens),
+            output_tokens=int(row.output_tokens),
+            cached_input_tokens=int(row.cached_input_tokens),
+            cost_usd=float(row.cost_usd or 0.0),
+        )
+
+    async def aggregate_activity_between(self, since: datetime, until: datetime) -> RequestActivityAggregate:
+        stmt = self._aggregate_activity_stmt(since, until)
+        result = await self._session.execute(stmt)
+        row = result.one()
+        return RequestActivityAggregate(
+            request_count=int(row.request_count),
+            error_count=int(row.error_count),
+            input_tokens=int(row.input_tokens),
+            output_tokens=int(row.output_tokens),
+            cached_input_tokens=int(row.cached_input_tokens),
+            cost_usd=float(row.cost_usd or 0.0),
+        )
+
+    def _aggregate_activity_stmt(self, since: datetime, until: datetime | None = None):
         stmt = select(
             func.count().label("request_count"),
             func.coalesce(
@@ -147,18 +173,23 @@ class RequestLogsRepository:
             RequestLog.requested_at >= since,
             self._exclude_warmup_clause(),
         )
-        result = await self._session.execute(stmt)
-        row = result.one()
-        return RequestActivityAggregate(
-            request_count=int(row.request_count),
-            error_count=int(row.error_count),
-            input_tokens=int(row.input_tokens),
-            output_tokens=int(row.output_tokens),
-            cached_input_tokens=int(row.cached_input_tokens),
-            cost_usd=float(row.cost_usd or 0.0),
-        )
+        if until is not None:
+            stmt = stmt.where(RequestLog.requested_at < until)
+        return stmt
 
     async def top_error_since(self, since: datetime) -> str | None:
+        stmt = self._top_error_stmt(since)
+        result = await self._session.execute(stmt)
+        row = result.first()
+        return str(row[0]) if row and row[0] else None
+
+    async def top_error_between(self, since: datetime, until: datetime) -> str | None:
+        stmt = self._top_error_stmt(since, until)
+        result = await self._session.execute(stmt)
+        row = result.first()
+        return str(row[0]) if row and row[0] else None
+
+    def _top_error_stmt(self, since: datetime, until: datetime | None = None):
         stmt = (
             select(RequestLog.error_code, func.count(RequestLog.id).label("error_count"))
             .where(
@@ -171,9 +202,15 @@ class RequestLogsRepository:
             .order_by(func.count(RequestLog.id).desc(), RequestLog.error_code.asc())
             .limit(1)
         )
+        if until is not None:
+            stmt = stmt.where(RequestLog.requested_at < until)
+        return stmt
+
+    async def earliest_activity_at(self) -> datetime | None:
+        stmt = select(func.min(RequestLog.requested_at)).where(self._exclude_warmup_clause())
         result = await self._session.execute(stmt)
-        row = result.first()
-        return str(row[0]) if row and row[0] else None
+        value = result.scalar_one_or_none()
+        return value if isinstance(value, datetime) else None
 
     async def add_log(
         self,
@@ -199,6 +236,8 @@ class RequestLogsRepository:
         session_id: str | None = None,
         plan_type: str | None = None,
         source: str | None = None,
+        useragent: str | None = None,
+        useragent_group: str | None = None,
         failure_phase: str | None = None,
         failure_detail: str | None = None,
         failure_exception_type: str | None = None,
@@ -217,15 +256,21 @@ class RequestLogsRepository:
             resolved_plan_type = plan_type
             if resolved_plan_type is None and account_id:
                 resolved_plan_type = await self._resolve_account_plan_type(account_id)
+            resolved_useragent = useragent if not isinstance(useragent, str) or useragent.strip() else None
+            resolved_useragent_group = (
+                useragent_group if not isinstance(useragent_group, str) or useragent_group.strip() else None
+            )
             log = RequestLog(
                 account_id=account_id,
                 api_key_id=api_key_id,
                 session_id=session_id,
                 request_id=resolved_request_id,
-                request_kind=request_kind,
                 model=model,
                 plan_type=resolved_plan_type,
                 transport=transport,
+                request_kind=request_kind,
+                useragent=resolved_useragent,
+                useragent_group=resolved_useragent_group,
                 service_tier=service_tier,
                 requested_service_tier=requested_service_tier,
                 actual_service_tier=actual_service_tier,

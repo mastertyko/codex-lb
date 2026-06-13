@@ -9,14 +9,22 @@ import {
   listAccounts,
   pauseAccount,
   reactivateAccount,
+  probeAccount,
   setAccountAlias,
+  updateAccount,
   updateAccountLimitWarmup,
+  updateAccountRoutingPolicy,
 } from "@/features/accounts/api";
+import type { AccountRoutingPolicy } from "@/features/accounts/schemas";
 
-function invalidateAccountRelatedQueries(queryClient: ReturnType<typeof useQueryClient>) {
+function invalidateAccountRelatedQueries(queryClient: ReturnType<typeof useQueryClient>, accountId?: string) {
   void queryClient.invalidateQueries({ queryKey: ["accounts", "list"] });
+  void queryClient.invalidateQueries({ queryKey: ["accounts", "trends"] });
   void queryClient.invalidateQueries({ queryKey: ["dashboard", "overview"] });
   void queryClient.invalidateQueries({ queryKey: ["dashboard", "projections"] });
+  if (accountId) {
+    void queryClient.invalidateQueries({ queryKey: ["accounts", "trends", accountId] });
+  }
 }
 
 /**
@@ -84,6 +92,18 @@ export function useAccountMutations() {
     },
   });
 
+  const probeMutation = useMutation({
+    mutationFn: ({ accountId, model }: { accountId: string; model?: string }) =>
+      probeAccount(accountId, model ? { model } : undefined),
+    onSuccess: (_data, variables) => {
+      toast.success("Account probed");
+      invalidateAccountRelatedQueries(queryClient, variables.accountId);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Probe failed");
+    },
+  });
+
   const limitWarmupMutation = useMutation({
     mutationFn: ({ accountId, enabled }: { accountId: string; enabled: boolean }) =>
       updateAccountLimitWarmup(accountId, enabled),
@@ -93,6 +113,25 @@ export function useAccountMutations() {
     },
     onError: (error: Error) => {
       toast.error(error.message || "Limit warm-up update failed");
+    },
+  });
+
+  const routingPolicyMutation = useMutation({
+    mutationFn: ({
+      accountId,
+      routingPolicy,
+    }: {
+      accountId: string;
+      routingPolicy: AccountRoutingPolicy;
+    }) => updateAccountRoutingPolicy(accountId, routingPolicy),
+    onSuccess: (data) => {
+      const label =
+        data.routingPolicy === "normal" ? "normal" : data.routingPolicy.replace("_", "-");
+      toast.success(`Account routing policy set to ${label}`);
+      invalidateAccountRelatedQueries(queryClient);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Routing policy update failed");
     },
   });
 
@@ -106,14 +145,29 @@ export function useAccountMutations() {
     },
   });
 
+  const updateMutation = useMutation({
+    mutationFn: ({ accountId, securityWorkAuthorized }: { accountId: string; securityWorkAuthorized: boolean }) =>
+      updateAccount(accountId, { securityWorkAuthorized }),
+    onSuccess: () => {
+      toast.success("Account updated");
+      invalidateAccountRelatedQueries(queryClient);
+    },
+    onError: (error: Error) => {
+      toast.error(error.message || "Update failed");
+    },
+  });
+
   return {
     importMutation,
     pauseMutation,
     resumeMutation,
     setAliasMutation,
     deleteMutation,
+    probeMutation,
     exportAuthMutation,
     limitWarmupMutation,
+    routingPolicyMutation,
+    updateMutation,
   };
 }
 

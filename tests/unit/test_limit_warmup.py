@@ -173,6 +173,8 @@ class FakeRequestLogsRepo:
         session_id: str | None = None,
         plan_type: str | None = None,
         source: str | None = None,
+        useragent: str | None = None,
+        useragent_group: str | None = None,
         failure_phase: str | None = None,
         failure_detail: str | None = None,
         failure_exception_type: str | None = None,
@@ -210,6 +212,8 @@ class FakeRequestLogsRepo:
                 "session_id": session_id,
                 "plan_type": plan_type,
                 "source": source,
+                "useragent": useragent,
+                "useragent_group": useragent_group,
                 "failure_phase": failure_phase,
                 "failure_detail": failure_detail,
                 "failure_exception_type": failure_exception_type,
@@ -224,6 +228,65 @@ class FakeRequestLogsRepo:
                 "upstream_proxy_fail_closed_reason": upstream_proxy_fail_closed_reason,
             }
         )
+
+
+@pytest.mark.asyncio
+async def test_fake_request_logs_repo_accepts_useragent_fields() -> None:
+    repo = FakeRequestLogsRepo()
+
+    await repo.add_log(
+        account_id=None,
+        request_id="req_limit_warmup_contract",
+        model="gpt-5.1",
+        input_tokens=1,
+        output_tokens=2,
+        latency_ms=3,
+        status="success",
+        error_code=None,
+        useragent="codex-lb-limit-warmup",
+        useragent_group="internal",
+    )
+
+    assert repo.logs == [
+        {
+            "account_id": None,
+            "request_id": "req_limit_warmup_contract",
+            "model": "gpt-5.1",
+            "input_tokens": 1,
+            "output_tokens": 2,
+            "latency_ms": 3,
+            "status": "success",
+            "error_code": None,
+            "latency_first_token_ms": None,
+            "error_message": None,
+            "requested_at": None,
+            "cached_input_tokens": None,
+            "reasoning_tokens": None,
+            "reasoning_effort": None,
+            "service_tier": None,
+            "requested_service_tier": None,
+            "actual_service_tier": None,
+            "transport": None,
+            "api_key_id": None,
+            "session_id": None,
+            "plan_type": None,
+            "source": None,
+            "failure_phase": None,
+            "failure_detail": None,
+            "failure_exception_type": None,
+            "upstream_status_code": None,
+            "upstream_error_code": None,
+            "bridge_stage": None,
+            "request_kind": "normal",
+            "upstream_proxy_route_mode": None,
+            "upstream_proxy_pool_id": None,
+            "upstream_proxy_endpoint_id": None,
+            "upstream_proxy_fallback_used": None,
+            "upstream_proxy_fail_closed_reason": None,
+            "useragent": "codex-lb-limit-warmup",
+            "useragent_group": "internal",
+        }
+    ]
 
 
 class FakeSender:
@@ -493,6 +556,7 @@ async def test_reset_confirmed_candidate_sends_one_warmup() -> None:
     assert len(sender.calls) == 1
     assert len(repo.rows) == 1
     assert repo.rows[0].status == "succeeded"
+    assert logs.logs[0]["source"] == "limit_warmup"
     assert logs.logs[0]["request_kind"] == "warmup"
 
 

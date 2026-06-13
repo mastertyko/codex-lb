@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronUp, Plus, Search, Upload } from "lucide-react";
+import { ChevronDown, ChevronUp, Plus, Search } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
@@ -11,13 +11,19 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { AccountListItem } from "@/features/accounts/components/account-list-item";
+import { AddAccountDialog } from "@/features/accounts/components/add-account-dialog";
 import { WindowsOauthHelp } from "@/features/accounts/components/windows-oauth-help";
 import type { AccountSummary } from "@/features/accounts/schemas";
-import { sortAccountsForDisplay } from "@/features/accounts/sorting";
+import {
+  ACCOUNT_SORT_OPTIONS,
+  DEFAULT_ACCOUNT_SORT_MODE,
+  sortAccountsForDisplay,
+  type AccountSortMode,
+} from "@/features/accounts/sorting";
 import { useAccountQuotaDisplayStore } from "@/hooks/use-account-quota-display";
 import { formatSlug } from "@/utils/formatters";
 
-const STATUS_FILTER_OPTIONS = ["all", "active", "paused", "rate_limited", "quota_exceeded", "deactivated"];
+const STATUS_FILTER_OPTIONS = ["all", "active", "paused", "rate_limited", "quota_exceeded", "reauth_required", "deactivated"];
 
 export type AccountListProps = {
   accounts: AccountSummary[];
@@ -25,6 +31,8 @@ export type AccountListProps = {
   onSelect: (accountId: string) => void;
   onOpenImport: () => void;
   onOpenOauth: () => void;
+  sortMode?: AccountSortMode;
+  onSortModeChange?: (sortMode: AccountSortMode) => void;
 };
 
 export function AccountList({
@@ -33,15 +41,19 @@ export function AccountList({
   onSelect,
   onOpenImport,
   onOpenOauth,
+  sortMode,
+  onSortModeChange,
 }: AccountListProps) {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [helpOpen, setHelpOpen] = useState(false);
+  const [chooserOpen, setChooserOpen] = useState(false);
   const quotaDisplay = useAccountQuotaDisplayStore((s) => s.quotaDisplay);
+  const activeSortMode = sortMode ?? DEFAULT_ACCOUNT_SORT_MODE;
 
   const filtered = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    return sortAccountsForDisplay(accounts, quotaDisplay).filter((account) => {
+    return sortAccountsForDisplay(accounts, quotaDisplay, activeSortMode).filter((account) => {
       if (statusFilter !== "all" && account.status !== statusFilter) {
         return false;
       }
@@ -56,12 +68,12 @@ export function AccountList({
         account.planType.toLowerCase().includes(needle)
       );
     });
-  }, [accounts, quotaDisplay, search, statusFilter]);
+  }, [accounts, quotaDisplay, search, statusFilter, activeSortMode]);
 
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2">
-        <div className="relative min-w-0 flex-1">
+      <div className="grid grid-cols-2 gap-2">
+        <div className="relative col-span-2 min-w-0">
           <Search className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground/60" aria-hidden />
           <Input
             placeholder="Search accounts..."
@@ -71,7 +83,11 @@ export function AccountList({
           />
         </div>
         <Select value={statusFilter} onValueChange={setStatusFilter}>
-          <SelectTrigger size="sm" className="w-32 shrink-0">
+          <SelectTrigger
+            size="sm"
+            className="w-full min-w-0"
+            aria-label="Filter accounts by status"
+          >
             <SelectValue placeholder="Status" />
           </SelectTrigger>
           <SelectContent>
@@ -82,17 +98,25 @@ export function AccountList({
             ))}
           </SelectContent>
         </Select>
-      </div>
-
-      <div className="flex gap-2">
-        <Button type="button" size="sm" variant="outline" onClick={onOpenImport} className="h-8 flex-1 gap-1.5 text-xs">
-          <Upload className="h-3.5 w-3.5" />
-          Import
-        </Button>
-        <Button type="button" size="sm" onClick={onOpenOauth} className="h-8 flex-1 gap-1.5 text-xs">
-          <Plus className="h-3.5 w-3.5" />
-          Add Account
-        </Button>
+        <Select
+          value={activeSortMode}
+          onValueChange={(nextMode) => onSortModeChange?.(nextMode as AccountSortMode)}
+        >
+          <SelectTrigger
+            size="sm"
+            className="w-full min-w-0"
+            aria-label="Sort accounts"
+          >
+            <SelectValue placeholder="Sort accounts" />
+          </SelectTrigger>
+          <SelectContent>
+            {ACCOUNT_SORT_OPTIONS.map((option) => (
+              <SelectItem key={option.value} value={option.value}>
+                {option.label}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </div>
 
       <div>
@@ -127,7 +151,22 @@ export function AccountList({
             />
           ))
         )}
+        <button
+          type="button"
+          onClick={() => setChooserOpen(true)}
+          className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed p-3 text-xs font-medium text-muted-foreground transition-colors outline-none hover:bg-muted/40 hover:text-foreground focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]"
+        >
+          <Plus className="h-3.5 w-3.5" />
+          Add account
+        </button>
       </div>
+
+      <AddAccountDialog
+        open={chooserOpen}
+        onOpenChange={setChooserOpen}
+        onImport={onOpenImport}
+        onAddAccount={onOpenOauth}
+      />
     </div>
   );
 }

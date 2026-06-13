@@ -1,4 +1,4 @@
-import { del, get, post, put } from "@/lib/api-client";
+import { del, get, patch, post, put } from "@/lib/api-client";
 
 import {
   AccountActionResponseSchema,
@@ -8,8 +8,13 @@ import {
   AccountImportResponseSchema,
   AccountLimitWarmupUpdateRequestSchema,
   AccountLimitWarmupUpdateResponseSchema,
+  AccountUpdateRequestSchema,
   AccountsResponseSchema,
+  AccountRoutingPolicyUpdateRequestSchema,
+  AccountRoutingPolicyUpdateResponseSchema,
   AccountTrendsResponseSchema,
+  AccountProbeRequestSchema,
+  AccountProbeResponseSchema,
   ManualOauthCallbackRequestSchema,
   ManualOauthCallbackResponseSchema,
   OauthCompleteRequestSchema,
@@ -19,6 +24,7 @@ import {
   OauthStatusResponseSchema,
   RuntimeConnectAddressResponseSchema,
 } from "@/features/accounts/schemas";
+import type { AccountRoutingPolicy } from "@/features/accounts/schemas";
 
 const ACCOUNTS_BASE_PATH = "/api/accounts";
 const OAUTH_BASE_PATH = "/api/oauth";
@@ -58,6 +64,15 @@ export function setAccountAlias(accountId: string, alias: string | null) {
   );
 }
 
+export function updateAccount(accountId: string, payload: unknown) {
+  const validated = AccountUpdateRequestSchema.parse(payload);
+  return patch(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}`,
+    AccountActionResponseSchema,
+    { body: validated },
+  );
+}
+
 export function updateAccountLimitWarmup(accountId: string, enabled: boolean) {
   const payload = AccountLimitWarmupUpdateRequestSchema.parse({ enabled });
   return put(
@@ -67,10 +82,31 @@ export function updateAccountLimitWarmup(accountId: string, enabled: boolean) {
   );
 }
 
+export function updateAccountRoutingPolicy(
+  accountId: string,
+  routingPolicy: AccountRoutingPolicy,
+) {
+  const payload = AccountRoutingPolicyUpdateRequestSchema.parse({ routingPolicy });
+  return put(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/routing-policy`,
+    AccountRoutingPolicyUpdateResponseSchema,
+    { body: payload },
+  );
+}
+
 export function getAccountTrends(accountId: string) {
   return get(
     `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/trends`,
     AccountTrendsResponseSchema,
+  );
+}
+
+export function probeAccount(accountId: string, payload?: unknown) {
+  const validated = payload === undefined ? undefined : AccountProbeRequestSchema.parse(payload);
+  return post(
+    `${ACCOUNTS_BASE_PATH}/${encodeURIComponent(accountId)}/probe`,
+    AccountProbeResponseSchema,
+    validated ? { body: validated } : undefined,
   );
 }
 
@@ -107,6 +143,7 @@ export function completeOauth(payload?: unknown) {
     body: validated,
   });
 }
+
 export function submitManualOauthCallback(payload: unknown) {
   const validated = ManualOauthCallbackRequestSchema.parse(payload);
   return post(`${OAUTH_BASE_PATH}/manual-callback`, ManualOauthCallbackResponseSchema, {

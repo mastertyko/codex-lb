@@ -48,7 +48,10 @@ from app.modules.accounts.schemas import (
 )
 from app.modules.limit_warmup.repository import LimitWarmupRepository
 from app.modules.proxy.account_cache import get_account_selection_cache
-from app.modules.usage.additional_quota_keys import get_additional_display_label_for_quota_key
+from app.modules.usage.additional_quota_keys import (
+    get_additional_display_label_for_quota_key,
+    get_additional_quota_routing_policy,
+)
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.updater import AdditionalUsageRepositoryPort, UsageUpdater
 
@@ -72,6 +75,10 @@ class InvalidAuthJsonError(Exception):
 
 class AccountNotProbableError(Exception):
     """Raised when an account is in a status that disallows probing."""
+
+
+class AccountStateTransitionError(Exception):
+    """Raised when an operator action is not valid for the account state."""
 
 
 class AccountsService:
@@ -99,6 +106,7 @@ class AccountsService:
         account_id_set = set(account_ids)
         primary_usage = await self._usage_repo.latest_by_account(window="primary") if self._usage_repo else {}
         secondary_usage = await self._usage_repo.latest_by_account(window="secondary") if self._usage_repo else {}
+        monthly_usage = await self._usage_repo.latest_by_account(window="monthly") if self._usage_repo else {}
         request_usage_rows = await self._repo.list_request_usage_summary_by_account(account_ids)
         limit_warmups_by_account = (
             await self._limit_warmup_repo.latest_by_account(account_ids) if self._limit_warmup_repo else {}
@@ -115,6 +123,7 @@ class AccountsService:
         additional_quotas_by_account: dict[str, list[AccountAdditionalQuota]] = {}
         additional_usage_repo = cast(AdditionalUsageRepository | None, self._additional_usage_repo)
         if additional_usage_repo:
+            additional_quota_routing_overrides = await self._repo.additional_quota_routing_policy_overrides()
             quota_keys = await additional_usage_repo.list_quota_keys(account_ids=account_ids)
             for quota_key in quota_keys:
                 primary_entries = await additional_usage_repo.latest_by_account(quota_key, "primary")
@@ -132,6 +141,10 @@ class AccountsService:
                             metered_feature=reference_entry.metered_feature,
                             display_label=get_additional_display_label_for_quota_key(quota_key)
                             or reference_entry.limit_name,
+                            routing_policy=get_additional_quota_routing_policy(
+                                quota_key,
+                                overrides=additional_quota_routing_overrides,
+                            ),
                             primary_window=AccountAdditionalWindow(
                                 used_percent=primary_entry.used_percent,
                                 reset_at=primary_entry.reset_at,
@@ -155,6 +168,7 @@ class AccountsService:
             accounts=accounts,
             primary_usage=primary_usage,
             secondary_usage=secondary_usage,
+            monthly_usage=monthly_usage,
             request_usage_by_account=request_usage_by_account,
             additional_quotas_by_account=additional_quotas_by_account,
             limit_warmups_by_account=limit_warmups_by_account,
@@ -267,7 +281,7 @@ class AccountsService:
 
         email = claims.email or DEFAULT_EMAIL
         raw_account_id = claims.account_id
-        account_id = generate_unique_account_id(raw_account_id, email, claims.workspace_id)
+        account_id = generate_unique_account_id(raw_account_id, email, claims.workspace_id, claims.workspace_label)
         plan_type = coerce_account_plan_type(claims.plan_type, DEFAULT_PLAN)
         last_refresh = to_utc_naive(auth.last_refresh_at) if auth.last_refresh_at else utcnow()
 
@@ -303,19 +317,70 @@ class AccountsService:
         )
 
     async def reactivate_account(self, account_id: str) -> bool:
-        result = await self._repo.update_status(account_id, AccountStatus.ACTIVE, None, None, blocked_at=None)
+        account = await self._repo.get_by_id(account_id)
+        if account is None:
+            return False
+        if account.status == AccountStatus.REAUTH_REQUIRED:
+            raise AccountStateTransitionError("Account requires re-authentication and cannot be reactivated directly")
+        result = await self._repo.update_status_if_current(
+            account_id,
+            AccountStatus.ACTIVE,
+            None,
+            None,
+            blocked_at=None,
+            expected_status=account.status,
+            expected_deactivation_reason=account.deactivation_reason,
+            expected_reset_at=account.reset_at,
+            expected_blocked_at=account.blocked_at,
+        )
+        if not result:
+            raise AccountStateTransitionError("Account state changed; retry the operation")
         if result:
             get_account_selection_cache().invalidate()
         return result
 
     async def pause_account(self, account_id: str) -> bool:
-        result = await self._repo.update_status(account_id, AccountStatus.PAUSED, None, None, blocked_at=None)
+        account = await self._repo.get_by_id(account_id)
+        if account is None:
+            return False
+        if account.status in (AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
+            raise AccountStateTransitionError(f"Account is {account.status.value} and cannot be paused")
+        result = await self._repo.update_status_if_current(
+            account_id,
+            AccountStatus.PAUSED,
+            None,
+            None,
+            blocked_at=None,
+            expected_status=account.status,
+            expected_deactivation_reason=account.deactivation_reason,
+            expected_reset_at=account.reset_at,
+            expected_blocked_at=account.blocked_at,
+        )
+        if not result:
+            raise AccountStateTransitionError("Account state changed; retry the operation")
+        if result:
+            get_account_selection_cache().invalidate()
+        return result
+
+    async def update_account(self, account_id: str, *, security_work_authorized: bool | None = None) -> bool:
+        result = False
+        if security_work_authorized is not None:
+            result = await self._repo.update_security_work_authorized(account_id, security_work_authorized)
         if result:
             get_account_selection_cache().invalidate()
         return result
 
     async def set_limit_warmup_enabled(self, account_id: str, enabled: bool) -> bool:
-        return await self._repo.update_limit_warmup_enabled(account_id, enabled)
+        result = await self._repo.update_limit_warmup_enabled(account_id, enabled)
+        if result:
+            get_account_selection_cache().invalidate()
+        return result
+
+    async def set_routing_policy(self, account_id: str, routing_policy: str) -> bool:
+        result = await self._repo.update_routing_policy(account_id, routing_policy)
+        if result:
+            get_account_selection_cache().invalidate()
+        return result
 
     async def delete_account(self, account_id: str, *, delete_history: bool = False) -> bool:
         result = await self._repo.delete(account_id, delete_history=delete_history)
@@ -378,7 +443,7 @@ class AccountsService:
         account = await self._repo.get_by_id(account_id)
         if account is None:
             return None
-        if account.status in (AccountStatus.PAUSED, AccountStatus.DEACTIVATED):
+        if account.status in (AccountStatus.PAUSED, AccountStatus.REAUTH_REQUIRED, AccountStatus.DEACTIVATED):
             raise AccountNotProbableError(f"Account is {account.status.value} and cannot be probed")
 
         primary_before, secondary_before = await self._latest_usage_percents(account_id)

@@ -3,23 +3,27 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import time
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 from urllib.parse import parse_qs, urlparse
 
 import pytest
+from fastapi.responses import JSONResponse
 
 import app.modules.oauth.service as oauth_module
 from app.core.auth import generate_unique_account_id
-from app.core.clients.oauth import DeviceCode, OAuthTokens
+from app.core.clients.oauth import DeviceCode, OAuthError, OAuthTokens
 from app.core.crypto import TokenEncryptor
 from app.core.upstream_proxy import UpstreamProxyRouteError
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.oauth import api as oauth_api_module
+from app.modules.oauth.schemas import ManualCallbackRequest
 
 pytestmark = pytest.mark.integration
 
@@ -33,6 +37,100 @@ def _encode_jwt(payload: dict) -> str:
 def _oauth_state_token(authorization_url: str) -> str:
     parsed = urlparse(authorization_url)
     return parse_qs(parsed.query)["state"][0]
+
+
+@pytest.mark.asyncio
+async def test_manual_callback_api_sanitizes_unexpected_exception():
+    class FailingOauthService:
+        async def manual_callback(self, callback_url: str, flow_id: str | None = None):
+            raise RuntimeError("Traceback (most recent call last): password=super-secret")
+
+    response = cast(
+        JSONResponse,
+        await oauth_api_module.manual_callback(
+            ManualCallbackRequest(callback_url="http://localhost:1455/?code=c&state=s"),
+            context=cast(Any, SimpleNamespace(service=FailingOauthService())),
+        ),
+    )
+
+    assert response.status_code == 500
+    payload = json.loads(bytes(response.body))
+    assert payload == {
+        "error": {
+            "code": "manual_callback_failed",
+            "message": "An internal error occurred.",
+        }
+    }
+    assert "super-secret" not in bytes(response.body).decode()
+
+
+@pytest.mark.asyncio
+async def test_manual_callback_api_preserves_oauth_error():
+    class FailingOauthService:
+        async def manual_callback(self, callback_url: str, flow_id: str | None = None):
+            raise OAuthError("invalid_grant", "Authorization code expired", status_code=400)
+
+    response = cast(
+        JSONResponse,
+        await oauth_api_module.manual_callback(
+            ManualCallbackRequest(callback_url="http://localhost:1455/?code=c&state=s"),
+            context=cast(Any, SimpleNamespace(service=FailingOauthService())),
+        ),
+    )
+
+    assert response.status_code == 502
+    assert json.loads(bytes(response.body)) == {
+        "error": {
+            "code": "invalid_grant",
+            "message": "Authorization code expired",
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_manual_callback_service_sanitizes_unexpected_exception(monkeypatch, caplog):
+    await oauth_module._OAUTH_STORE.reset()
+    caplog.set_level(logging.ERROR, logger=oauth_module.logger.name)
+    async with oauth_module._OAUTH_STORE.lock:
+        oauth_module._OAUTH_STORE.remember_flow_locked(
+            oauth_module.OAuthState(
+                flow_id="flow-1",
+                status="pending",
+                method="browser",
+                state_token="state-1",
+                code_verifier="verifier-1",
+            )
+        )
+
+    async def fake_oauth_route():
+        return None
+
+    async def fake_exchange_authorization_code(**_kwargs):
+        raise RuntimeError("Unexpected error: /home/app/password.txt")
+
+    monkeypatch.setattr(oauth_module, "_oauth_route", fake_oauth_route)
+    monkeypatch.setattr(oauth_module, "exchange_authorization_code", fake_exchange_authorization_code)
+    service = oauth_module.OauthService(cast(AccountsRepository, SimpleNamespace()))
+
+    response = await service.manual_callback("http://localhost:1455/?code=code-1&state=state-1", flow_id="flow-1")
+
+    assert response.status == "error"
+    assert response.error_message == "An internal error occurred."
+    assert "RuntimeError" in caplog.text
+    assert "password.txt" not in caplog.text
+    assert "/home/app" not in caplog.text
+    assert "Traceback" not in caplog.text
+    async with oauth_module._OAUTH_STORE.lock:
+        flow = oauth_module._OAUTH_STORE.get_flow_locked("flow-1")
+        assert flow is not None
+        assert flow.error_message == "An internal error occurred."
+
+
+def test_oauth_error_html_escapes_message():
+    html = oauth_module._error_html("bad <script>alert('x')</script>")
+
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in html
 
 
 @pytest.mark.asyncio
@@ -249,6 +347,106 @@ async def test_device_oauth_reauth_reuses_existing_row_for_same_chatgpt_identity
 
 
 @pytest.mark.asyncio
+async def test_device_oauth_flow_heals_deactivated_account_when_import_without_overwrite_enabled(
+    async_client,
+    monkeypatch,
+):
+    await oauth_module._OAUTH_STORE.reset()
+
+    settings = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "importWithoutOverwrite": True,
+            "totpRequiredOnLogin": False,
+        },
+    )
+    assert settings.status_code == 200
+    assert settings.json()["importWithoutOverwrite"] is True
+
+    email = "device-reauth@example.com"
+    raw_account_id = "acc_device_reauth"
+    account_id = generate_unique_account_id(raw_account_id, email)
+
+    encryptor = TokenEncryptor()
+    existing = Account(
+        id=account_id,
+        chatgpt_account_id=raw_account_id,
+        email=email,
+        plan_type="plus",
+        routing_policy="preserve",
+        access_token_encrypted=encryptor.encrypt("old-access"),
+        refresh_token_encrypted=encryptor.encrypt("old-refresh"),
+        id_token_encrypted=encryptor.encrypt("old-id"),
+        last_refresh=utcnow(),
+        status=AccountStatus.DEACTIVATED,
+        deactivation_reason="refresh_failed",
+    )
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        await repo.upsert(existing, merge_by_email=False)
+
+    async def fake_device_code(**_):
+        return DeviceCode(
+            verification_url="https://auth.openai.com/codex/device",
+            user_code="ABCD-EFGH",
+            device_auth_id="dev_reauth",
+            interval_seconds=1,
+            expires_in_seconds=30,
+        )
+
+    async def fake_exchange_device_token(**_):
+        payload = {
+            "email": email,
+            "chatgpt_account_id": raw_account_id,
+            "https://api.openai.com/auth": {"chatgpt_plan_type": "pro"},
+        }
+        return OAuthTokens(
+            access_token="new-access-token",
+            refresh_token="new-refresh-token",
+            id_token=_encode_jwt(payload),
+        )
+
+    async def fake_sleep(_: float) -> None:
+        return None
+
+    monkeypatch.setattr(oauth_module, "request_device_code", fake_device_code)
+    monkeypatch.setattr(oauth_module, "exchange_device_token", fake_exchange_device_token)
+    monkeypatch.setattr(oauth_module, "_async_sleep", fake_sleep)
+
+    start = await async_client.post("/api/oauth/start", json={"forceMethod": "device"})
+    assert start.status_code == 200
+
+    complete = await async_client.post("/api/oauth/complete", json={})
+    assert complete.status_code == 200
+    assert complete.json()["status"] == "pending"
+
+    await asyncio.sleep(0)
+
+    payload = None
+    for _ in range(20):
+        status = await async_client.get("/api/oauth/status")
+        assert status.status_code == 200
+        payload = status.json()
+        if payload["status"] == "success":
+            break
+        await asyncio.sleep(0.05)
+    assert payload and payload["status"] == "success"
+
+    accounts = await async_client.get("/api/accounts")
+    assert accounts.status_code == 200
+    data = [account for account in accounts.json()["accounts"] if account["email"] == email]
+    assert len(data) == 1
+    healed = data[0]
+    assert healed["accountId"] == account_id
+    assert healed["status"] == "active"
+    assert healed["deactivationReason"] is None
+    assert healed["planType"] == "pro"
+    assert healed["routingPolicy"] == "preserve"
+
+
+@pytest.mark.asyncio
 async def test_oauth_persist_tokens_invalidates_routing_caches_after_identity_merge(monkeypatch):
     repo = AsyncMock()
     service = oauth_module.OauthService(repo)
@@ -289,10 +487,55 @@ async def test_oauth_persist_tokens_invalidates_routing_caches_after_identity_me
         )
     )
 
-    repo.upsert.assert_awaited_once()
+    repo.upsert.assert_not_awaited()
+    repo.upsert_account_slot.assert_awaited_once()
+    assert repo.upsert_account_slot.await_args.kwargs == {
+        "preserve_unknown_workspace_duplicates": False,
+        "preserve_identity_slots": True,
+    }
     assert account_cache.invalidated is True
     assert api_key_cache.cleared is True
     assert poller.bumped == ["api_key"]
+
+
+@pytest.mark.asyncio
+async def test_oauth_persist_tokens_uses_slot_upsert_for_label_only_workspace(monkeypatch):
+    repo = AsyncMock()
+    service = oauth_module.OauthService(repo)
+    monkeypatch.setattr(
+        oauth_module,
+        "get_account_selection_cache",
+        lambda: SimpleNamespace(invalidate=lambda: None),
+        raising=False,
+    )
+    monkeypatch.setattr(oauth_module, "get_api_key_cache", lambda: SimpleNamespace(clear=lambda: None), raising=False)
+    monkeypatch.setattr(oauth_module, "get_cache_invalidation_poller", lambda: None, raising=False)
+
+    payload = {
+        "email": "label-workspace@example.com",
+        "chatgpt_account_id": "acc_label_workspace",
+        "https://api.openai.com/auth": {
+            "workspace_label": "Label Only Workspace",
+            "chatgpt_plan_type": "plus",
+        },
+    }
+
+    await service._persist_tokens(
+        OAuthTokens(
+            access_token="access-token",
+            refresh_token="refresh-token",
+            id_token=_encode_jwt(payload),
+        )
+    )
+
+    repo.upsert.assert_not_awaited()
+    repo.upsert_account_slot.assert_awaited_once()
+    saved_account = repo.upsert_account_slot.await_args.args[0]
+    assert saved_account.workspace_label == "Label Only Workspace"
+    assert repo.upsert_account_slot.await_args.kwargs == {
+        "preserve_unknown_workspace_duplicates": False,
+        "preserve_identity_slots": True,
+    }
 
 
 @pytest.mark.asyncio

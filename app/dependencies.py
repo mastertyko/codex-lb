@@ -31,6 +31,9 @@ from app.modules.oauth.service import OauthService
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.service import ProxyService
 from app.modules.proxy.sticky_repository import StickySessionsRepository
+from app.modules.quota_planner.repository import QuotaPlannerRepository
+from app.modules.reports.repository import ReportsRepository
+from app.modules.reports.service import ReportsService
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.request_logs.service import RequestLogsService
 from app.modules.settings.repository import SettingsRepository
@@ -93,6 +96,12 @@ class RequestLogsContext:
 
 
 @dataclass(slots=True)
+class QuotaPlannerContext:
+    session: AsyncSession
+    repository: QuotaPlannerRepository
+
+
+@dataclass(slots=True)
 class SettingsContext:
     session: AsyncSession
     repository: SettingsRepository
@@ -119,6 +128,13 @@ class StickySessionsContext:
     repository: StickySessionsRepository
     settings_repository: SettingsRepository
     service: StickySessionsService
+
+
+@dataclass(slots=True)
+class ReportsContext:
+    session: AsyncSession
+    repository: ReportsRepository
+    service: ReportsService
 
 
 def get_accounts_context(
@@ -184,6 +200,7 @@ async def _proxy_repo_context() -> AsyncIterator[ProxyRepositories]:
             sticky_sessions=StickySessionsRepository(session),
             api_keys=ApiKeysRepository(session),
             additional_usage=AdditionalUsageRepository(session),
+            quota_planner=QuotaPlannerRepository(session),
         )
 
 
@@ -238,6 +255,13 @@ def get_request_logs_context(
     return RequestLogsContext(session=session, repository=repository, service=service)
 
 
+def get_quota_planner_context(
+    session: AsyncSession = Depends(get_session),
+) -> QuotaPlannerContext:
+    repository = QuotaPlannerRepository(session)
+    return QuotaPlannerContext(session=session, repository=repository)
+
+
 def get_settings_context(
     session: AsyncSession = Depends(get_session),
 ) -> SettingsContext:
@@ -274,3 +298,11 @@ def get_sticky_sessions_context(
         settings_repository=settings_repository,
         service=service,
     )
+
+
+def get_reports_context(
+    session: AsyncSession = Depends(get_session),
+) -> ReportsContext:
+    repository = ReportsRepository(session)
+    service = ReportsService(repository)
+    return ReportsContext(session=session, repository=repository, service=service)

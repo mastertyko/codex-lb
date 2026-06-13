@@ -81,6 +81,7 @@ def test_known_unsupported_upstream_fields_are_stripped():
         "safety_identifier": "safe_123",
         "temperature": 0.2,
         "top_p": 0.9,
+        "truncation": "auto",
         "user": "cursor-user",
         "custom_field": "kept",
     }
@@ -93,6 +94,7 @@ def test_known_unsupported_upstream_fields_are_stripped():
     assert "safety_identifier" not in dumped
     assert "temperature" not in dumped
     assert "top_p" not in dumped
+    assert "truncation" not in dumped
     assert "user" not in dumped
     assert dumped["custom_field"] == "kept"
 
@@ -531,6 +533,132 @@ def test_v1_system_message_moves_to_instructions():
 
     assert request.instructions == "sys"
     assert request.input == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_responses_input_system_message_moves_to_instructions():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "primary",
+        "input": [
+            {"type": "message", "role": "system", "content": [{"type": "input_text", "text": "sys"}]},
+            {"type": "message", "role": "developer", "content": "dev"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ],
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.instructions == "primary\nsys\ndev"
+    assert request.input == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_responses_input_system_message_keeps_user_text_parts():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "primary",
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "sys"}],
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "hello"},
+                    {"type": "input_file", "file_id": "file_123"},
+                ],
+            },
+        ],
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.instructions == "primary\nsys"
+    assert request.input == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "hello"},
+                {"type": "input_file", "file_id": "file_123"},
+            ],
+        }
+    ]
+
+
+def test_responses_input_system_message_preserves_non_text_parts():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "primary",
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": [
+                    {"type": "input_text", "text": "sys"},
+                    {"type": "input_file", "file_id": "file_123"},
+                    {"type": "input_image", "image_url": "sediment://file_456"},
+                ],
+            },
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ],
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.instructions == "primary\nsys"
+    assert request.input == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_file", "file_id": "file_123"},
+                {"type": "input_image", "image_url": "sediment://file_456"},
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+    assert extract_input_file_ids(request.input) == {"file_123", "file_456"}
+    assert [ref.file_id for ref in extract_input_image_file_references(request.input)] == ["file_456"]
+
+
+def test_responses_input_developer_message_preserves_single_non_text_part():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "primary",
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": {"type": "input_file", "file_id": "file_123"},
+            }
+        ],
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.instructions == "primary"
+    assert request.input == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": {"type": "input_file", "file_id": "file_123"},
+        }
+    ]
+    assert extract_input_file_ids(request.input) == {"file_123"}
+
+
+def test_responses_compact_input_system_message_moves_to_instructions():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "primary",
+        "input": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "compact me"},
+        ],
+    }
+    request = ResponsesCompactRequest.model_validate(payload)
+
+    assert request.instructions == "primary\nsys"
+    assert request.input == [{"role": "user", "content": "compact me"}]
 
 
 def test_v1_instructions_merge():

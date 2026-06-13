@@ -36,6 +36,14 @@ describe("useAccounts", () => {
 
     await result.current.pauseMutation.mutateAsync(firstAccountId as string);
     await result.current.resumeMutation.mutateAsync(firstAccountId as string);
+    await result.current.probeMutation.mutateAsync({
+      accountId: firstAccountId as string,
+    });
+    const routingPolicyResult = await result.current.routingPolicyMutation.mutateAsync({
+      accountId: firstAccountId as string,
+      routingPolicy: "preserve",
+    });
+    expect(routingPolicyResult.routingPolicy).toBe("preserve");
 
     const imported = await result.current.importMutation.mutateAsync(
       new File(["{}"], "auth.json", { type: "application/json" }),
@@ -44,6 +52,10 @@ describe("useAccounts", () => {
 
     await waitFor(() => {
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["accounts", "list"] });
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["accounts", "trends"] });
+      expect(invalidateSpy).toHaveBeenCalledWith({
+        queryKey: ["accounts", "trends", firstAccountId],
+      });
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["dashboard", "overview"] });
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["dashboard", "projections"] });
     });
@@ -64,6 +76,7 @@ describe("useAccounts", () => {
     await result.current.exportAuthMutation.mutateAsync(firstAccountId as string);
 
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["accounts", "list"] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["accounts", "trends"] });
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["dashboard", "overview"] });
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ["dashboard", "projections"] });
   });
