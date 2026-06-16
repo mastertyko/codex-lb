@@ -39,6 +39,7 @@ from app.core.utils.request_id import get_request_id
 
 _WEBSOCKET_HOP_BY_HOP_HEADERS = {
     "accept",
+    "accept-encoding",
     "connection",
     "content-type",
     "cookie",
@@ -49,6 +50,7 @@ _WEBSOCKET_HOP_BY_HOP_HEADERS = {
     "upgrade",
 }
 _RESPONSES_WEBSOCKET_BETA_HEADER = "responses_websockets=2026-02-06"
+_RESPONSES_WEBSOCKET_INCOMPATIBLE_BETA_HEADERS = frozenset({"responses=experimental"})
 
 
 @dataclass(slots=True)
@@ -296,7 +298,7 @@ def _build_upstream_websocket_headers(
     access_token: str,
     account_id: str | None,
 ) -> dict[str, str]:
-    headers = {key: value for key, value in inbound.items() if key.lower() != "cookie"}
+    headers = {key: value for key, value in inbound.items() if key.lower() not in _WEBSOCKET_HOP_BY_HOP_HEADERS}
     lower_keys = {key.lower() for key in headers}
     if "x-request-id" not in lower_keys and "request-id" not in lower_keys:
         request_id = get_request_id()
@@ -312,7 +314,11 @@ def _build_upstream_websocket_headers(
 def _ensure_responses_websocket_beta_header(headers: dict[str, str]) -> None:
     header_key = next((key for key in headers if key.lower() == "openai-beta"), "openai-beta")
     current_value = headers.get(header_key, "")
-    beta_tokens = [token.strip() for token in current_value.split(",") if token.strip()]
+    beta_tokens = [
+        token.strip()
+        for token in current_value.split(",")
+        if token.strip() and token.strip().lower() not in _RESPONSES_WEBSOCKET_INCOMPATIBLE_BETA_HEADERS
+    ]
     if _RESPONSES_WEBSOCKET_BETA_HEADER.lower() not in {token.lower() for token in beta_tokens}:
         beta_tokens.append(_RESPONSES_WEBSOCKET_BETA_HEADER)
     headers[header_key] = ", ".join(beta_tokens)
