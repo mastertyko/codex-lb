@@ -132,12 +132,20 @@ async def _assert_guest_write_denied(client: AsyncClient) -> None:
     assert blocked_limit_warmup.status_code == 403
     assert blocked_limit_warmup.json()["error"]["code"] == "read_only_access"
 
+    blocked_usage_reset = await client.post("/api/accounts/missing/usage-reset-credits/consume")
+    assert blocked_usage_reset.status_code == 403
+    assert blocked_usage_reset.json()["error"]["code"] == "read_only_access"
+
     blocked_proxy_endpoint = await client.post(
         "/api/settings/upstream-proxy/endpoints",
         json={"name": "Guest Proxy", "scheme": "http", "host": "proxy.internal", "port": 8080},
     )
     assert blocked_proxy_endpoint.status_code == 403
     assert blocked_proxy_endpoint.json()["error"]["code"] == "read_only_access"
+
+    blocked_proxy_probe = await client.post("/api/settings/upstream-proxy/endpoints/missing-endpoint/test")
+    assert blocked_proxy_probe.status_code == 403
+    assert blocked_proxy_probe.json()["error"]["code"] == "read_only_access"
 
     blocked_proxy_pool = await client.post(
         "/api/settings/upstream-proxy/pools",

@@ -59,6 +59,10 @@ def _model(slug: str) -> UpstreamModel:
     )
 
 
+def _model_with_support(slug: str, *, supported_in_api: bool) -> UpstreamModel:
+    return replace(_model(slug), supported_in_api=supported_in_api)
+
+
 @pytest.mark.asyncio
 async def test_initial_snapshot_is_none():
     registry = ModelRegistry(ttl_seconds=60.0)
@@ -155,7 +159,7 @@ def test_bootstrap_models_include_representative_upstream_metadata():
     assert spark.context_window == 128_000
     assert spark.input_modalities == ("text",)
     assert spark.default_reasoning_level == "high"
-    assert spark.supported_in_api is False
+    assert spark.supported_in_api is True
     assert spark.minimal_client_version == "0.100.0"
 
     auto_review = models["codex-auto-review"]
@@ -182,6 +186,166 @@ async def test_update_merges_models_across_plans():
     assert set(snapshot.models.keys()) == {"shared", "plus-only", "pro-only"}
     assert snapshot.plan_models["plus"] == frozenset({"shared", "plus-only"})
     assert snapshot.plan_models["pro"] == frozenset({"shared", "pro-only"})
+
+
+@pytest.mark.asyncio
+async def test_update_unions_service_tiers_across_plans():
+    # Issue #1100: an account/plan without Fast entitlement returns empty
+    # service-tier metadata for a shared slug. Last-writer-wins would let that
+    # empty list erase Fast from the shared catalog; the merge must union it so
+    # Fast stays visible while any account supports it.
+    fast = replace(
+        _model("gpt-5.5"),
+        raw={
+            "service_tiers": [{"slug": "fast"}, {"slug": "default"}],
+            "additional_speed_tiers": ["fast"],
+            "default_service_tier": "fast",
+        },
+    )
+    no_fast = replace(
+        _model("gpt-5.5"),
+        raw={"service_tiers": [], "additional_speed_tiers": []},
+    )
+
+    registry = ModelRegistry(ttl_seconds=60.0)
+    # "pro" (Fast) first, "plus" (no Fast) last so last-writer-wins would drop Fast.
+    await registry.update({"pro": [fast], "plus": [no_fast]})
+
+    snapshot = registry.get_snapshot()
+    assert snapshot is not None
+    merged = snapshot.models["gpt-5.5"]
+    service_tiers = merged.raw["service_tiers"]
+    speed_tiers = merged.raw["additional_speed_tiers"]
+    assert isinstance(service_tiers, list)
+    assert isinstance(speed_tiers, list)
+    tier_slugs = {entry["slug"] for entry in service_tiers if isinstance(entry, dict)}
+    assert "fast" in tier_slugs
+    assert "fast" in speed_tiers
+    assert merged.raw["default_service_tier"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_update_preserves_non_default_service_tier_default():
+    fast = replace(
+        _model("gpt-5.5"),
+        raw={
+            "service_tiers": [{"slug": "fast"}, {"slug": "default"}],
+            "additional_speed_tiers": ["fast"],
+            "default_service_tier": "fast",
+        },
+    )
+    default_only = replace(
+        _model("gpt-5.5"),
+        raw={
+            "service_tiers": [{"slug": "default"}],
+            "additional_speed_tiers": [],
+            "default_service_tier": "default",
+        },
+    )
+
+    registry = ModelRegistry(ttl_seconds=60.0)
+    await registry.update({"pro": [fast], "plus": [default_only]})
+
+    snapshot = registry.get_snapshot()
+    assert snapshot is not None
+    merged = snapshot.models["gpt-5.5"]
+    assert merged.raw["default_service_tier"] == "fast"
+
+
+@pytest.mark.asyncio
+async def test_plan_types_for_model_service_tier_tracks_tier_plans():
+    fast = replace(
+        _model("gpt-5.5"),
+        raw={
+            "service_tiers": [{"id": "priority", "name": "Fast"}],
+            "additional_speed_tiers": ["fast"],
+            "default_service_tier": "priority",
+        },
+    )
+    no_fast = replace(
+        _model("gpt-5.5"),
+        raw={
+            "service_tiers": [{"slug": "default"}],
+            "additional_speed_tiers": [],
+            "default_service_tier": "default",
+        },
+    )
+
+    registry = ModelRegistry(ttl_seconds=60.0)
+    await registry.update({"pro": [fast], "plus": [no_fast]})
+
+    assert registry.plan_types_for_model("gpt-5.5") == frozenset({"pro", "plus"})
+    assert registry.plan_types_for_model_service_tier("gpt-5.5", "priority") == frozenset({"pro"})
+    assert registry.plan_types_for_model_service_tier("gpt-5.5", "fast") == frozenset({"pro"})
+    assert registry.plan_types_for_model_service_tier("gpt-5.5", "default") == frozenset({"plus"})
+
+
+@pytest.mark.asyncio
+async def test_account_ids_for_model_service_tier_tracks_account_catalogs():
+    fast = replace(
+        _model("gpt-5.5"),
+        raw={"service_tiers": [{"slug": "fast"}], "additional_speed_tiers": ["fast"]},
+    )
+    no_fast = replace(_model("gpt-5.5"), raw={"service_tiers": [{"slug": "default"}]})
+
+    registry = ModelRegistry(ttl_seconds=60.0)
+    await registry.update(
+        {"pro": [fast]},
+        per_account_results={
+            "account-fast": ("pro", [fast]),
+            "account-default": ("pro", [no_fast]),
+        },
+    )
+
+    assert registry.account_ids_for_model_service_tier("gpt-5.5", "priority") == frozenset({"account-fast"})
+    assert registry.account_ids_for_model_service_tier("gpt-5.5", "fast") == frozenset({"account-fast"})
+    assert registry.account_ids_for_model_service_tier("gpt-5.5", "default") == frozenset({"account-default"})
+
+
+@pytest.mark.asyncio
+async def test_account_ids_for_model_service_tier_preserves_missing_active_accounts():
+    fast = replace(_model("gpt-5.5"), raw={"service_tiers": [{"slug": "fast"}], "additional_speed_tiers": ["fast"]})
+    no_fast = replace(_model("gpt-5.5"), raw={"service_tiers": [{"slug": "default"}]})
+
+    registry = ModelRegistry(ttl_seconds=60.0)
+    await registry.update(
+        {"pro": [fast]},
+        per_account_results={
+            "account-fast": ("pro", [fast]),
+            "account-default": ("pro", [no_fast]),
+        },
+        active_account_plans={"account-fast": "pro", "account-default": "pro"},
+    )
+
+    await registry.update(
+        {"pro": [no_fast]},
+        per_account_results={"account-default": ("pro", [no_fast])},
+        active_account_plans={"account-fast": "pro", "account-default": "pro"},
+    )
+
+    assert registry.account_ids_for_model_service_tier("gpt-5.5", "priority") == frozenset({"account-fast"})
+    assert registry.account_ids_for_model_service_tier("gpt-5.5", "default") == frozenset({"account-default"})
+
+
+@pytest.mark.asyncio
+async def test_update_does_not_duplicate_shared_service_tiers():
+    # Two accounts that both support Fast must not produce duplicate tier entries.
+    fast = replace(
+        _model("gpt-5.5"),
+        raw={"service_tiers": [{"slug": "fast"}], "additional_speed_tiers": ["fast"]},
+    )
+    priority = replace(
+        _model("gpt-5.5"),
+        raw={"service_tiers": [{"id": "priority", "name": "Fast"}], "additional_speed_tiers": ["priority"]},
+    )
+    registry = ModelRegistry(ttl_seconds=60.0)
+    await registry.update({"pro": [fast], "plus": [priority]})
+
+    snapshot = registry.get_snapshot()
+    assert snapshot is not None
+    merged = snapshot.models["gpt-5.5"]
+    assert merged.raw["service_tiers"] == [{"id": "priority", "name": "Fast"}]
+    assert merged.raw["additional_speed_tiers"] == ["priority"]
 
 
 @pytest.mark.asyncio
@@ -255,6 +419,17 @@ def test_ttl_must_be_positive():
         ModelRegistry(ttl_seconds=0)
     with pytest.raises(ValueError, match="positive"):
         ModelRegistry(ttl_seconds=-1.0)
+
+
+def test_is_public_model_requires_supported_in_api_true():
+    from app.core.openai.model_registry import is_public_model
+
+    public = _model_with_support("model-public", supported_in_api=True)
+    hidden = _model_with_support("model-hidden", supported_in_api=False)
+
+    assert is_public_model(public, None)
+    assert not is_public_model(hidden, None)
+    assert not is_public_model(hidden, {"model-hidden", "model-public"})
 
 
 @pytest.mark.asyncio

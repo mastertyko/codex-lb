@@ -16,6 +16,12 @@ const UpstreamStreamTransportSchema = z.enum([
   "http",
   "websocket",
 ]);
+const HttpDownstreamTransportPolicySchema = z.enum([
+  "smart",
+  "always_http",
+  "always_websocket",
+  "pinned",
+]);
 const LimitWarmupWindowsSchema = z.enum([
   "primary",
   "secondary",
@@ -37,12 +43,21 @@ const LimitWarmupModelSchema = z.string().min(1).max(128);
 const LimitWarmupPromptSchema = z.string().min(1).max(512);
 const WeeklyPaceWorkingDaysValueSchema = z.string().regex(/^[0-6](,[0-6])*$/);
 const WeeklyPaceWorkingDaysSchema = WeeklyPaceWorkingDaysValueSchema.default("0,1,2,3,4,5,6");
+const WeeklyPaceSmoothingMinutesSchema = z.union([
+  z.literal(15),
+  z.literal(30),
+  z.literal(60),
+  z.literal(120),
+  z.literal(240),
+]);
 
 export const DashboardSettingsSchema = z
   .object({
     stickyThreadsEnabled: z.boolean(),
     upstreamStreamTransport:
       UpstreamStreamTransportSchema.optional().default("default"),
+    httpDownstreamTransportPolicy:
+      HttpDownstreamTransportPolicySchema.optional().default("smart"),
     upstreamProxyRoutingEnabled: z.boolean().optional().default(false),
     upstreamProxyDefaultPoolId: z.string().nullable().optional().default(null),
     preferEarlierResetAccounts: z.boolean(),
@@ -81,11 +96,18 @@ export const DashboardSettingsSchema = z
     totpRequiredOnLogin: z.boolean(),
     totpConfigured: z.boolean(),
     apiKeyAuthEnabled: z.boolean(),
+    hideUpstreamQuotaFromApiKeys: z.boolean().optional().default(false),
     limitWarmupEnabled: z.boolean().optional().default(false),
     limitWarmupWindows: LimitWarmupWindowsSchema.optional().default("both"),
     limitWarmupModel: LimitWarmupModelSchema.optional().default("auto"),
     limitWarmupPrompt: LimitWarmupPromptSchema.optional().default("Say OK."),
     limitWarmupCooldownSeconds: z.number().int().min(60).optional().default(3600),
+    limitWarmupExhaustedThresholdPercent: z
+      .number()
+      .positive()
+      .max(100)
+      .optional()
+      .default(99),
     limitWarmupMinAvailablePercent: z
       .number()
       .positive()
@@ -93,8 +115,10 @@ export const DashboardSettingsSchema = z
       .optional()
       .default(100),
     weeklyPaceWorkingDays: WeeklyPaceWorkingDaysSchema,
+    weeklyPaceSmoothingMinutes: WeeklyPaceSmoothingMinutesSchema.optional().default(30),
     guestAccessEnabled: z.boolean().optional().default(false),
     guestPasswordConfigured: z.boolean().optional().default(false),
+    limitWarmupStaggeredIdleEnabled: z.boolean().optional().default(false),
   })
   .transform((settings) => {
     const legacyProvided = settings.stickyReallocationBudgetThresholdPct !== undefined;
@@ -122,6 +146,7 @@ export const DashboardSettingsSchema = z
 export const SettingsUpdateRequestSchema = z.object({
   stickyThreadsEnabled: z.boolean().optional(),
   upstreamStreamTransport: UpstreamStreamTransportSchema.optional(),
+  httpDownstreamTransportPolicy: HttpDownstreamTransportPolicySchema.optional(),
   upstreamProxyRoutingEnabled: z.boolean().optional(),
   upstreamProxyDefaultPoolId: z.string().nullable().optional(),
   preferEarlierResetAccounts: z.boolean().optional(),
@@ -142,14 +167,18 @@ export const SettingsUpdateRequestSchema = z.object({
   importWithoutOverwrite: z.boolean().optional(),
   totpRequiredOnLogin: z.boolean().optional(),
   apiKeyAuthEnabled: z.boolean().optional(),
+  hideUpstreamQuotaFromApiKeys: z.boolean().optional(),
   limitWarmupEnabled: z.boolean().optional(),
   limitWarmupWindows: LimitWarmupWindowsSchema.optional(),
   limitWarmupModel: LimitWarmupModelSchema.optional(),
   limitWarmupPrompt: LimitWarmupPromptSchema.optional(),
   limitWarmupCooldownSeconds: z.number().int().min(60).optional(),
+  limitWarmupExhaustedThresholdPercent: z.number().positive().max(100).optional(),
   limitWarmupMinAvailablePercent: z.number().positive().max(100).optional(),
   weeklyPaceWorkingDays: WeeklyPaceWorkingDaysValueSchema.optional(),
+  weeklyPaceSmoothingMinutes: WeeklyPaceSmoothingMinutesSchema.optional(),
   guestAccessEnabled: z.boolean().optional(),
+  limitWarmupStaggeredIdleEnabled: z.boolean().optional(),
 });
 
 type ParsedDashboardSettings = z.infer<typeof DashboardSettingsSchema>;
@@ -195,6 +224,14 @@ export const UpstreamProxyEndpointCreateRequestSchema = z.object({
   isActive: z.boolean().optional().default(true),
 });
 
+export const UpstreamProxyEndpointTestResponseSchema = z.object({
+  endpointId: z.string(),
+  ok: z.boolean(),
+  statusCode: z.number().int().nullable().optional(),
+  elapsedMs: z.number().int().nullable().optional(),
+  error: z.string().nullable().optional(),
+});
+
 export const UpstreamProxyPoolSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -236,6 +273,7 @@ export const UpstreamProxyAdminSchema = z.object({
 
 export type UpstreamProxyEndpoint = z.infer<typeof UpstreamProxyEndpointSchema>;
 export type UpstreamProxyEndpointCreateRequest = z.infer<typeof UpstreamProxyEndpointCreateRequestSchema>;
+export type UpstreamProxyEndpointTestResponse = z.infer<typeof UpstreamProxyEndpointTestResponseSchema>;
 export type UpstreamProxyPool = z.infer<typeof UpstreamProxyPoolSchema>;
 export type UpstreamProxyPoolCreateRequest = z.infer<typeof UpstreamProxyPoolCreateRequestSchema>;
 export type UpstreamProxyPoolMemberRequest = z.infer<typeof UpstreamProxyPoolMemberRequestSchema>;

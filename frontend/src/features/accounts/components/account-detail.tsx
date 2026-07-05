@@ -13,6 +13,7 @@ import { AccountUsagePanel } from "@/features/accounts/components/account-usage-
 import type {
   AccountRoutingPolicy,
   AccountSummary,
+  AccountUsageResetCredits,
 } from "@/features/accounts/schemas";
 import { useAccountTrends } from "@/features/accounts/hooks/use-accounts";
 import type { AccountProxyBindingRequest, UpstreamProxyAdmin } from "@/features/settings/schemas";
@@ -27,10 +28,12 @@ export type AccountDetailProps = {
   onPause: (accountId: string) => void;
   onResume: (accountId: string) => void;
   onProbe: (accountId: string) => void;
+  onResetUsage: (accountId: string) => void;
   onSetAlias: (accountId: string, alias: string | null) => Promise<unknown>;
   onDelete: (accountId: string) => void;
   onReauth: () => void;
   onExportAuth: (accountId: string) => void;
+  onResetCredit: (accountId: string) => void;
   onLimitWarmupChange: (accountId: string, enabled: boolean) => void;
   onRoutingPolicyChange: (
     accountId: string,
@@ -39,6 +42,9 @@ export type AccountDetailProps = {
   onSecurityWorkAuthorizedChange: (accountId: string, enabled: boolean) => void;
   upstreamProxyAdmin?: UpstreamProxyAdmin | null;
   onProxyBindingSave?: (accountId: string, payload: AccountProxyBindingRequest) => Promise<unknown>;
+  resetCredits?: AccountUsageResetCredits | null;
+  resetCreditsLoading?: boolean;
+  resetCreditsUnavailable?: boolean;
 };
 
 export function AccountDetail({
@@ -49,15 +55,20 @@ export function AccountDetail({
   onPause,
   onResume,
   onProbe,
+  onResetUsage,
   onSetAlias,
   onDelete,
   onReauth,
   onExportAuth,
+  onResetCredit,
   onLimitWarmupChange,
   onRoutingPolicyChange,
   onSecurityWorkAuthorizedChange,
   upstreamProxyAdmin = null,
   onProxyBindingSave,
+  resetCredits = null,
+  resetCreditsLoading = false,
+  resetCreditsUnavailable = false,
 }: AccountDetailProps) {
   const { data: trends } = useAccountTrends(account?.accountId ?? null);
   const blurred = usePrivacyStore((s) => s.blurred);
@@ -89,11 +100,15 @@ export function AccountDetail({
   const idSuffix = showAccountId ? ` (${compactId})` : "";
   const workspaceLabel = account.chatgptAccountId || account.workspaceLabel || account.workspaceId || "Personal / unknown workspace";
   const seatLabel = account.seatType ? ` | ${formatSlug(account.seatType)}` : "";
+  const operatorRecoveryAction =
+    account.status === "reauth_required" || account.status === "deactivated";
+  const usageResetDisabled =
+    busy || readOnly || account.status === "paused" || operatorRecoveryAction || (resetCredits?.availableCount ?? 0) <= 0;
 
   return (
     <div
       key={account.accountId}
-      className="animate-fade-in-up space-y-4 rounded-xl border bg-card p-5"
+      className="animate-fade-in-up min-w-0 space-y-4 rounded-xl border bg-card p-4 sm:p-5"
     >
       {/* Account header */}
       <div>
@@ -136,7 +151,15 @@ export function AccountDetail({
           onSave={onProxyBindingSave}
         />
       ) : null}
-      <AccountUsagePanel account={account} trends={trends} />
+      <AccountUsagePanel
+        account={account}
+        trends={trends}
+        resetCredits={resetCredits}
+        resetCreditsLoading={resetCreditsLoading}
+        resetCreditsUnavailable={resetCreditsUnavailable}
+        resetDisabled={usageResetDisabled}
+        onReset={onResetUsage}
+      />
       <AccountTokenInfo account={account} />
       <AccountActions
         account={account}
@@ -148,6 +171,7 @@ export function AccountDetail({
         onDelete={onDelete}
         onReauth={onReauth}
         onExportAuth={onExportAuth}
+        onResetCredit={onResetCredit}
         onLimitWarmupChange={onLimitWarmupChange}
         onRoutingPolicyChange={onRoutingPolicyChange}
         onSecurityWorkAuthorizedChange={onSecurityWorkAuthorizedChange}
@@ -245,7 +269,7 @@ function AccountNameField({
   }
 
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex min-w-0 items-center gap-1.5">
       <h2 className="min-w-0 truncate text-base font-semibold">
         {labelIsEmail ? (
           <>

@@ -25,6 +25,7 @@ from app.db.models import (
 )
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.proxy.account_cache import is_account_routing_unavailable
 from app.modules.proxy.load_balancer import (
     ADDITIONAL_QUOTA_DATA_UNAVAILABLE,
     ADDITIONAL_QUOTA_EXHAUSTED,
@@ -1134,6 +1135,118 @@ async def test_select_account_uses_canonical_quota_key_for_upstream_limit_alias(
 
 
 @pytest.mark.asyncio
+async def test_select_account_filters_requested_service_tier_plans(monkeypatch) -> None:
+    plus = _make_account("acc-tier-plus", "tier-plus@example.com")
+    plus.plan_type = "plus"
+    pro = _make_account("acc-tier-pro", "tier-pro@example.com")
+    pro.plan_type = "pro"
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    usage_repo = StubUsageRepository(
+        primary={
+            plus.id: UsageHistory(
+                id=61,
+                account_id=plus.id,
+                recorded_at=now,
+                window="primary",
+                used_percent=1.0,
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+            ),
+            pro.id: UsageHistory(
+                id=62,
+                account_id=pro.id,
+                recorded_at=now,
+                window="primary",
+                used_percent=2.0,
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+            ),
+        },
+        secondary={},
+    )
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(
+            plan_types_for_model=lambda _model: frozenset({"plus", "pro"}),
+            account_ids_for_model_service_tier=lambda _model, _tier: None,
+            plan_types_for_model_service_tier=lambda _model, tier: (
+                frozenset({"pro"}) if tier == "priority" else frozenset({"plus", "pro"})
+            ),
+        ),
+    )
+
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            StubAccountsRepository([plus, pro]),
+            usage_repo,
+            StubStickySessionsRepository(),
+        )
+    )
+    selection = await balancer.select_account(model="gpt-5.5", service_tier="priority")
+
+    assert selection.account is not None
+    assert selection.account.id == pro.id
+
+
+@pytest.mark.asyncio
+async def test_select_account_filters_requested_service_tier_accounts(monkeypatch) -> None:
+    no_fast = _make_account("acc-tier-pro-default", "tier-pro-default@example.com")
+    no_fast.plan_type = "pro"
+    fast = _make_account("acc-tier-pro-fast", "tier-pro-fast@example.com")
+    fast.plan_type = "pro"
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    usage_repo = StubUsageRepository(
+        primary={
+            no_fast.id: UsageHistory(
+                id=63,
+                account_id=no_fast.id,
+                recorded_at=now,
+                window="primary",
+                used_percent=1.0,
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+            ),
+            fast.id: UsageHistory(
+                id=64,
+                account_id=fast.id,
+                recorded_at=now,
+                window="primary",
+                used_percent=2.0,
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+            ),
+        },
+        secondary={},
+    )
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(
+            plan_types_for_model=lambda _model: frozenset({"pro"}),
+            account_ids_for_model_service_tier=lambda _model, tier: (
+                frozenset({fast.id}) if tier == "priority" else None
+            ),
+            plan_types_for_model_service_tier=lambda _model, _tier: frozenset({"pro"}),
+        ),
+    )
+
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            StubAccountsRepository([no_fast, fast]),
+            usage_repo,
+            StubStickySessionsRepository(),
+        )
+    )
+    selection = await balancer.select_account(model="gpt-5.5", service_tier="priority")
+
+    assert selection.account is not None
+    assert selection.account.id == fast.id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("additional_limit_name", ["codex_other", "GPT-5.3-Codex-Spark"])
 async def test_select_account_accepts_legacy_additional_limit_aliases(additional_limit_name: str) -> None:
     account = _make_account(f"acc-additional-{additional_limit_name}")
@@ -1544,6 +1657,34 @@ async def test_record_errors_does_not_restore_terminal_status(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_mark_permanent_failure_marks_account_routing_unavailable() -> None:
+    account = _make_account("acc-permanent-routing-unavailable", "permanent-routing@example.com")
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    await balancer.mark_permanent_failure(account, "refresh_token_expired")
+
+    assert account.status == AccountStatus.REAUTH_REQUIRED
+    assert is_account_routing_unavailable(account.id) is True
+
+
+@pytest.mark.asyncio
+async def test_mark_rate_limit_does_not_mark_account_routing_unavailable() -> None:
+    account = _make_account("acc-rate-limit-stays-routable", "rate-limit-routing@example.com")
+    accounts_repo = StubAccountsRepository([account])
+    usage_repo = StubUsageRepository(primary={}, secondary={})
+    sticky_repo = StubStickySessionsRepository()
+    balancer = LoadBalancer(lambda: _repo_factory(accounts_repo, usage_repo, sticky_repo))
+
+    await balancer.mark_rate_limit(account, {"message": "Try again in 1s"})
+
+    assert account.status == AccountStatus.RATE_LIMITED
+    assert is_account_routing_unavailable(account.id) is False
+
+
+@pytest.mark.asyncio
 async def test_select_account_does_not_hold_runtime_lock_during_input_loading(monkeypatch) -> None:
     accounts_started = asyncio.Event()
     release_accounts = asyncio.Event()
@@ -1657,10 +1798,11 @@ async def test_select_account_does_not_open_repo_before_runtime_lock(monkeypatch
     async def fake_load_selection_inputs(
         *,
         model: str | None,
+        service_tier: str | None = None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
     ):
-        del model, additional_limit_name, account_ids
+        del model, service_tier, additional_limit_name, account_ids
         return load_balancer_module._SelectionInputs(
             accounts=[account],
             latest_primary={account.id: primary_entry},
@@ -1910,6 +2052,7 @@ async def test_select_account_reloads_inputs_after_version_conflict(monkeypatch)
     async def counted_load_selection_inputs(
         *,
         model: str | None,
+        service_tier: str | None = None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
     ):
@@ -1917,6 +2060,7 @@ async def test_select_account_reloads_inputs_after_version_conflict(monkeypatch)
         load_calls += 1
         return await original_load_selection_inputs(
             model=model,
+            service_tier=service_tier,
             additional_limit_name=additional_limit_name,
             account_ids=account_ids,
         )
@@ -2050,6 +2194,7 @@ async def test_select_account_sticky_reloads_inputs_after_stale_selected_persist
     async def counted_load_selection_inputs(
         *,
         model: str | None,
+        service_tier: str | None = None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
     ):
@@ -2057,6 +2202,7 @@ async def test_select_account_sticky_reloads_inputs_after_stale_selected_persist
         load_calls += 1
         return await original_load_selection_inputs(
             model=model,
+            service_tier=service_tier,
             additional_limit_name=additional_limit_name,
             account_ids=account_ids,
         )
@@ -2134,6 +2280,7 @@ async def test_select_account_sticky_does_not_return_stale_selection_at_retry_ca
     async def counted_load_selection_inputs(
         *,
         model: str | None,
+        service_tier: str | None = None,
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
     ):
@@ -2141,6 +2288,7 @@ async def test_select_account_sticky_does_not_return_stale_selection_at_retry_ca
         load_calls += 1
         return await original_load_selection_inputs(
             model=model,
+            service_tier=service_tier,
             additional_limit_name=additional_limit_name,
             account_ids=account_ids,
         )
@@ -2349,6 +2497,9 @@ async def test_select_account_respects_registry_plan_filter_for_mapped_model(mon
                 models={},
                 model_plans={"gpt-5.3-codex-spark": frozenset({"pro"})},
                 plan_models={"pro": frozenset({"gpt-5.3-codex-spark"})},
+                model_service_tier_plans={},
+                model_service_tier_accounts={},
+                account_plans={},
                 fetched_at=0.0,
             ),
             plan_types_for_model=lambda _model: frozenset({"pro"}),
@@ -2466,6 +2617,9 @@ async def test_select_account_returns_plan_support_error_for_ungated_model(monke
                 models={},
                 model_plans={"gpt-5.3-codex": frozenset({"pro"})},
                 plan_models={"pro": frozenset({"gpt-5.3-codex"})},
+                model_service_tier_plans={},
+                model_service_tier_accounts={},
+                account_plans={},
                 fetched_at=0.0,
             ),
             plan_types_for_model=lambda _model: frozenset({"pro"}),
@@ -2505,6 +2659,9 @@ async def test_select_account_skips_plan_filter_when_registry_snapshot_lacks_mod
                 models={},
                 model_plans={"gpt-5.3-codex": frozenset({"pro"})},
                 plan_models={"pro": frozenset({"gpt-5.3-codex"})},
+                model_service_tier_plans={},
+                model_service_tier_accounts={},
+                account_plans={},
                 fetched_at=0.0,
             ),
             plan_types_for_model=lambda _model: frozenset(),

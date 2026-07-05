@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -62,6 +63,13 @@ def _postgres_async_engine_kwargs(url: str, *, background: bool) -> dict[str, ob
     return kwargs
 
 
+def _sqlite_file_async_engine_kwargs() -> dict[str, object]:
+    return {
+        "poolclass": NullPool,
+        "connect_args": {"timeout": _SQLITE_BUSY_TIMEOUT_SECONDS},
+    }
+
+
 def _database_pool_size(*, background: bool) -> int:
     if background:
         return _settings.database_background_pool_size or _settings.database_pool_size
@@ -102,10 +110,7 @@ if _is_sqlite_url(_settings.database_url):
         engine = create_async_engine(
             _settings.database_url,
             echo=False,
-            pool_size=_settings.database_pool_size,
-            max_overflow=_settings.database_max_overflow,
-            pool_timeout=_settings.database_pool_timeout_seconds,
-            connect_args={"timeout": _SQLITE_BUSY_TIMEOUT_SECONDS},
+            **_sqlite_file_async_engine_kwargs(),
         )
     _configure_sqlite_engine(engine.sync_engine, enable_wal=not is_sqlite_memory)
 else:
@@ -156,8 +161,12 @@ def _startup_sqlite_check_mode(raw_mode: str) -> SqliteIntegrityCheckMode | None
 
 
 async def _shielded(awaitable: Awaitable[object]) -> None:
-    with anyio.CancelScope(shield=True):
-        await awaitable
+    task = asyncio.ensure_future(awaitable)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
 
 
 async def _safe_rollback(session: AsyncSession) -> None:
@@ -174,6 +183,17 @@ async def _safe_close(session: AsyncSession) -> None:
         await _shielded(session.close())
     except BaseException:
         return
+
+
+async def close_session(session: AsyncSession) -> None:
+    if session.in_transaction():
+        await _safe_rollback(session)
+    await _safe_close(session)
+
+
+def detach_session_objects(session: AsyncSession) -> None:
+    """Detach loaded ORM rows that must outlive this session boundary."""
+    session.expunge_all()
 
 
 def _load_migration_entrypoints() -> tuple[
@@ -213,10 +233,7 @@ def init_background_db(url: str | None = None) -> None:
         _background_engine = create_async_engine(
             db_url,
             echo=False,
-            pool_size=_database_pool_size(background=True),
-            max_overflow=_database_max_overflow(background=True),
-            pool_timeout=_settings.database_pool_timeout_seconds,
-            connect_args={"timeout": _SQLITE_BUSY_TIMEOUT_SECONDS},
+            **_sqlite_file_async_engine_kwargs(),
         )
         _configure_sqlite_engine(_background_engine.sync_engine, enable_wal=not is_sqlite_memory)
     else:
@@ -243,9 +260,7 @@ async def get_background_session() -> AsyncIterator[AsyncSession]:
         await _safe_rollback(session)
         raise
     finally:
-        if session.in_transaction():
-            await _safe_rollback(session)
-        await _safe_close(session)
+        await close_session(session)
 
 
 @asynccontextmanager
@@ -269,9 +284,7 @@ async def get_session() -> AsyncIterator[AsyncSession]:
         await _safe_rollback(session)
         raise
     finally:
-        if session.in_transaction():
-            await _safe_rollback(session)
-        await _safe_close(session)
+        await close_session(session)
 
 
 async def init_db() -> None:

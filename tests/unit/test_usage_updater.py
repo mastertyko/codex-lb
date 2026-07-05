@@ -120,6 +120,45 @@ async def test_usage_refresh_scheduler_stop_cancels_inflight_singleflight_withou
     assert usage_updater_module._USAGE_REFRESH_SINGLEFLIGHT._inflight == {}
 
 
+def test_usage_refresh_scheduler_orders_accounts_and_skips_unrefreshable_statuses() -> None:
+    active_b = _make_account("acc_b", "workspace_b")
+    paused = _make_account("acc_paused", "workspace_paused")
+    paused.status = AccountStatus.PAUSED
+    deactivated = _make_account("acc_deactivated", "workspace_deactivated")
+    deactivated.status = AccountStatus.DEACTIVATED
+    reauth_required = _make_account("acc_reauth", "workspace_reauth")
+    reauth_required.status = AccountStatus.REAUTH_REQUIRED
+    active_a = _make_account("acc_a", "workspace_a")
+
+    ordered = refresh_scheduler_module._ordered_usage_refresh_accounts(
+        [active_b, paused, deactivated, reauth_required, active_a]
+    )
+
+    assert [account.id for account in ordered] == ["acc_a", "acc_b"]
+
+
+def test_usage_refresh_scheduler_splits_interval_across_accounts() -> None:
+    assert refresh_scheduler_module._usage_refresh_slice_seconds(120, 4) == 30.0
+    assert refresh_scheduler_module._usage_refresh_slice_seconds(120, 240) == 0.5
+    assert refresh_scheduler_module._usage_refresh_slice_seconds(120, 0) == 120.0
+
+
+def test_usage_refresh_scheduler_rotates_one_account_per_slice() -> None:
+    scheduler = refresh_scheduler_module.UsageRefreshScheduler(interval_seconds=120, enabled=True)
+    accounts = [_make_account("acc_a", "workspace_a"), _make_account("acc_b", "workspace_b")]
+
+    first, first_cycle_complete = scheduler._select_next_account(accounts)
+    second, second_cycle_complete = scheduler._select_next_account(accounts)
+    third, third_cycle_complete = scheduler._select_next_account(accounts)
+
+    assert first is accounts[0]
+    assert first_cycle_complete is False
+    assert second is accounts[1]
+    assert second_cycle_complete is True
+    assert third is accounts[0]
+    assert third_cycle_complete is False
+
+
 @dataclass(frozen=True, slots=True)
 class UsageEntry:
     account_id: str
@@ -488,6 +527,7 @@ async def test_force_refresh_bypasses_fresh_usage_cache(monkeypatch: pytest.Monk
     refresh_account.assert_awaited_once_with(
         account,
         usage_account_id=account.chatgpt_account_id,
+        access_token_override=None,
     )
     sync_account.assert_awaited_once_with(account)
     get_settings.cache_clear()
@@ -541,6 +581,7 @@ async def test_force_refresh_does_not_join_stale_refresh_singleflight(monkeypatc
     force_refresh_account.assert_awaited_once_with(
         account,
         usage_account_id=account.chatgpt_account_id,
+        access_token_override=None,
     )
     assert sync_account.await_count == 2
     sync_account.assert_awaited_with(account)
@@ -620,6 +661,7 @@ async def test_force_refresh_bypasses_auth_failure_cooldown(monkeypatch: pytest.
     refresh_account.assert_awaited_once_with(
         account,
         usage_account_id=account.chatgpt_account_id,
+        access_token_override=None,
     )
     sync_account.assert_awaited_once_with(account)
     assert usage_updater_module._is_usage_refresh_in_cooldown(account.id) is False
@@ -641,6 +683,33 @@ async def test_force_refresh_respects_usage_refresh_disabled(monkeypatch: pytest
 
     assert refreshed is False
     refresh_account.assert_not_awaited()
+    get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_can_ignore_usage_refresh_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "false")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+    updater = UsageUpdater(StubUsageRepository())
+    account = _make_account("acc_force_probe_disabled_override", "workspace_force_probe_disabled_override")
+    refresh_account = AsyncMock(
+        return_value=usage_updater_module.AccountRefreshResult(usage_written=True),
+    )
+    sync_account = AsyncMock()
+    monkeypatch.setattr(updater, "_refresh_account", refresh_account)
+    monkeypatch.setattr(updater, "_sync_account_from_repo", sync_account)
+
+    refreshed = await updater.force_refresh(account, ignore_refresh_disabled=True)
+
+    assert refreshed is True
+    refresh_account.assert_awaited_once_with(
+        account,
+        usage_account_id=account.chatgpt_account_id,
+        access_token_override=None,
+    )
+    sync_account.assert_awaited_once_with(account)
     get_settings.cache_clear()
 
 
@@ -685,6 +754,32 @@ async def test_usage_updater_includes_chatgpt_account_id_even_when_shared(monkey
     await updater.refresh_accounts([acc_a, acc_b, acc_c], latest_usage={})
 
     assert [call["account_id"] for call in calls] == [shared, shared, "workspace_unique"]
+
+
+@pytest.mark.asyncio
+async def test_force_refresh_uses_access_token_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    calls: list[dict[str, Any]] = []
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        calls.append({"access_token": access_token, "account_id": account_id})
+        return UsagePayload.model_validate({"plan_type": "plus"})
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=None)
+    account = _make_account("acc_override", "workspace_override")
+
+    refreshed = await updater.force_refresh(account, ignore_refresh_disabled=True, access_token_override="caller-token")
+
+    assert refreshed is False
+    assert calls == [{"access_token": "caller-token", "account_id": "workspace_override"}]
+    get_settings.cache_clear()
 
 
 @pytest.mark.asyncio
@@ -1414,6 +1509,173 @@ async def test_usage_refresh_skips_workspace_account_when_payload_omits_workspac
     assert account.plan_type == "business"
 
 
+@pytest.mark.asyncio
+async def test_usage_refresh_skips_workspace_account_when_payload_omits_workspace_and_paid_plan_differs(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token, account_id
+        return UsagePayload.model_validate(
+            {
+                "plan_type": "team",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 5 * 60 * 60,
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_workspace_paid_payload", "upstream_user", email="same@example.com")
+    account.workspace_id = "ws_team"
+    account.plan_type = "business"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.refresh_accounts([account], latest_usage={})
+
+    assert usage_repo.entries == []
+    assert accounts_repo.status_updates == []
+    assert accounts_repo.token_updates == []
+    assert account.workspace_id == "ws_team"
+    assert account.plan_type == "business"
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_applies_paid_plan_upgrade_without_workspace(monkeypatch) -> None:
+    """Regression for #1086: a Plus -> Pro upgrade on a workspace-less account
+    must be persisted instead of being skipped as an identity mismatch."""
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token, account_id
+        return UsagePayload.model_validate(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 5 * 60 * 60,
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_personal_upgrade", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "plus"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.refresh_accounts([account], latest_usage={})
+
+    assert usage_repo.entries != []
+    assert account.plan_type == "pro"
+    assert account.workspace_id is None
+
+
+@pytest.mark.asyncio
+async def test_usage_refresh_hydrates_unknown_plan_without_workspace(monkeypatch) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token, account_id
+        return UsagePayload.model_validate(
+            {
+                "plan_type": "pro",
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 5 * 60 * 60,
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_unknown_personal_upgrade", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "unknown"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.refresh_accounts([account], latest_usage={})
+
+    assert usage_repo.entries != []
+    assert account.plan_type == "pro"
+    assert account.workspace_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload_plan_type", ["free", "mystery"])
+async def test_usage_refresh_skips_unknown_plan_degrade_without_workspace(
+    monkeypatch,
+    payload_plan_type: str,
+) -> None:
+    monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
+    from app.core.config.settings import get_settings
+
+    get_settings.cache_clear()
+
+    async def stub_fetch_usage(*, access_token: str, account_id: str | None, **_: Any) -> UsagePayload:
+        del access_token, account_id
+        return UsagePayload.model_validate(
+            {
+                "plan_type": payload_plan_type,
+                "rate_limit": {
+                    "primary_window": {
+                        "used_percent": 10.0,
+                        "reset_at": 1736208000,
+                        "limit_window_seconds": 5 * 60 * 60,
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage)
+
+    usage_repo = StubUsageRepository(return_rows=True)
+    accounts_repo = StubAccountsRepository()
+    updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
+    account = _make_account("acc_unknown_personal_degrade", "upstream_user", email="same@example.com")
+    account.workspace_id = None
+    account.plan_type = "unknown"
+    accounts_repo.accounts_by_id[account.id] = account
+
+    await updater.refresh_accounts([account], latest_usage={})
+
+    assert usage_repo.entries == []
+    assert accounts_repo.token_updates == []
+    assert account.plan_type == "unknown"
+    assert account.workspace_id is None
+
+
 class StubAccountsRepository:
     def __init__(self) -> None:
         self.status_updates: list[dict[str, Any]] = []
@@ -1621,38 +1883,54 @@ async def test_usage_updater_does_not_deactivate_on_401(monkeypatch) -> None:
     assert len(accounts_repo.status_updates) == 0
 
 
+@pytest.mark.parametrize(
+    ("error_code", "message", "message_hint"),
+    [
+        (
+            "token_invalidated",
+            "Your authentication token has been invalidated. Please try signing in again.",
+            "invalidated",
+        ),
+        (
+            "app_session_terminated",
+            "Your session has been terminated. Please sign in again.",
+            "terminated",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_usage_updater_marks_token_invalidated_as_reauth_required(monkeypatch) -> None:
+async def test_usage_updater_marks_session_failures_as_reauth_required(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+    message: str,
+    message_hint: str,
+) -> None:
     monkeypatch.setenv("CODEX_LB_USAGE_REFRESH_ENABLED", "true")
     from app.core.clients.usage import UsageFetchError
     from app.core.config.settings import get_settings
 
     get_settings.cache_clear()
 
-    async def stub_fetch_usage_401_token_invalidated(**_: Any) -> UsagePayload:
-        raise UsageFetchError(
-            401,
-            "Your authentication token has been invalidated. Please try signing in again.",
-            code="token_invalidated",
-        )
+    async def stub_fetch_usage_401_session_failure(**_: Any) -> UsagePayload:
+        raise UsageFetchError(401, message, code=error_code)
 
-    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_401_token_invalidated)
+    monkeypatch.setattr("app.modules.usage.updater.fetch_usage", stub_fetch_usage_401_session_failure)
 
     usage_repo = StubUsageRepository()
     accounts_repo = StubAccountsRepository()
     updater = UsageUpdater(usage_repo, accounts_repo=accounts_repo)
 
-    acc = _make_account("acc_401_token_invalidated", "workspace_token_invalidated", email="reauth@example.com")
+    acc = _make_account(f"acc_401_{error_code}", f"workspace_{error_code}", email="reauth@example.com")
     accounts_repo.accounts_by_id[acc.id] = acc
 
     await updater.refresh_accounts([acc], latest_usage={})
 
     assert len(accounts_repo.status_updates) == 1
     update = accounts_repo.status_updates[0]
-    assert update["account_id"] == "acc_401_token_invalidated"
+    assert update["account_id"] == f"acc_401_{error_code}"
     assert update["status"] == AccountStatus.REAUTH_REQUIRED
     assert "401" in update["deactivation_reason"]
-    assert "invalidated" in update["deactivation_reason"]
+    assert message_hint in update["deactivation_reason"]
     assert acc.status == AccountStatus.REAUTH_REQUIRED
 
 

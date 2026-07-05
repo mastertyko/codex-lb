@@ -351,6 +351,14 @@ async def test_dashboard_projections_weekly_credit_pace_excludes_inactive_and_st
         usage_repo = UsageRepository(session)
 
         await accounts_repo.upsert(_make_account("acc_active_fresh", "fresh@example.com", plan_type="pro"))
+        await accounts_repo.upsert(
+            _make_account(
+                "acc_quota_exceeded_fresh",
+                "quota@example.com",
+                plan_type="pro",
+                status=AccountStatus.QUOTA_EXCEEDED,
+            )
+        )
         await accounts_repo.upsert(_make_account("acc_active_stale", "stale@example.com", plan_type="pro"))
         await accounts_repo.upsert(
             _make_account(
@@ -360,10 +368,26 @@ async def test_dashboard_projections_weekly_credit_pace_excludes_inactive_and_st
                 status=AccountStatus.DEACTIVATED,
             )
         )
+        await accounts_repo.upsert(
+            _make_account(
+                "acc_reauth_fresh",
+                "reauth@example.com",
+                plan_type="pro",
+                status=AccountStatus.REAUTH_REQUIRED,
+            )
+        )
 
         await usage_repo.add_entry(
             "acc_active_fresh",
             20.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(minutes=1),
+        )
+        await usage_repo.add_entry(
+            "acc_quota_exceeded_fresh",
+            100.0,
             window="secondary",
             window_minutes=10080,
             reset_at=reset_at,
@@ -385,20 +409,28 @@ async def test_dashboard_projections_weekly_credit_pace_excludes_inactive_and_st
             reset_at=reset_at,
             recorded_at=fixed_now - timedelta(minutes=1),
         )
+        await usage_repo.add_entry(
+            "acc_reauth_fresh",
+            100.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(minutes=1),
+        )
 
     response = await async_client.get("/api/dashboard/projections")
     assert response.status_code == 200
     payload = response.json()
 
     pace = payload["weeklyCreditPace"]
-    assert pace["accountCount"] == 1
+    assert pace["accountCount"] == 2
     assert pace["staleAccountCount"] == 1
-    assert pace["inactiveAccountCount"] == 1
-    assert pace["totalFullCredits"] == pytest.approx(50_400.0)
-    assert pace["actualUsedPercent"] == pytest.approx(20.0)
+    assert pace["inactiveAccountCount"] == 2
+    assert pace["totalFullCredits"] == pytest.approx(100_800.0)
+    assert pace["actualUsedPercent"] == pytest.approx(60.0)
     assert pace["scheduledUsedPercent"] == pytest.approx(42.857, abs=0.01)
-    assert pace["scheduleGapCredits"] == 0
-    assert pace["status"] == "behind"
+    assert pace["scheduleGapCredits"] == pytest.approx(17_280.0, abs=1.0)
+    assert pace["status"] == "ahead"
 
 
 @pytest.mark.asyncio
@@ -455,6 +487,101 @@ async def test_dashboard_projections_weekly_credit_pace_forecast_uses_recent_slo
     assert pace["paceMultiplier"] == pytest.approx(0.0)
     assert pace["pauseForBreakEvenHours"] is None
     assert pace["status"] == "ahead"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_projections_weekly_credit_pace_smooths_displayed_gap(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixed_now = datetime(2026, 5, 18, 12, 0, 0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: fixed_now)
+    reset_at = int(naive_utc_to_epoch(fixed_now + timedelta(days=5, hours=18)))
+
+    settings_response = await async_client.put("/api/settings", json={"weeklyPaceSmoothingMinutes": 240})
+    assert settings_response.status_code == 200
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_smoothed", "smoothed@example.com", plan_type="pro"))
+        await usage_repo.add_entry(
+            "acc_smoothed",
+            0.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(hours=3),
+        )
+        await usage_repo.add_entry(
+            "acc_smoothed",
+            24.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=reset_at,
+            recorded_at=fixed_now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/dashboard/projections")
+    assert response.status_code == 200
+    payload = response.json()
+
+    pace = payload["weeklyCreditPace"]
+    assert pace["paceGapSmoothingMinutes"] == 240
+    assert pace["actualUsedPercent"] == pytest.approx(24.0)
+    assert pace["deltaPercent"] == pytest.approx(6.142, abs=0.01)
+    assert pace["scheduleGapCredits"] == pytest.approx(3_096.0, abs=1.0)
+    assert pace["smoothedDeltaPercent"] == pytest.approx(-5.857, abs=0.01)
+    assert pace["smoothedScheduleGapCredits"] == 0
+
+
+@pytest.mark.asyncio
+async def test_dashboard_projections_weekly_credit_pace_smoothing_resets_with_quota_window(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    fixed_now = datetime(2026, 5, 18, 12, 0, 0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: fixed_now)
+    previous_reset_at = int(naive_utc_to_epoch(fixed_now - timedelta(minutes=5)))
+    current_reset_at = int(naive_utc_to_epoch(fixed_now + timedelta(days=7)))
+
+    settings_response = await async_client.put("/api/settings", json={"weeklyPaceSmoothingMinutes": 15})
+    assert settings_response.status_code == 200
+
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+
+        await accounts_repo.upsert(_make_account("acc_reset_smooth", "reset-smooth@example.com", plan_type="pro"))
+        await usage_repo.add_entry(
+            "acc_reset_smooth",
+            99.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=previous_reset_at,
+            recorded_at=fixed_now - timedelta(minutes=10),
+        )
+        await usage_repo.add_entry(
+            "acc_reset_smooth",
+            0.0,
+            window="secondary",
+            window_minutes=10080,
+            reset_at=current_reset_at,
+            recorded_at=fixed_now - timedelta(minutes=1),
+        )
+
+    response = await async_client.get("/api/dashboard/projections")
+    assert response.status_code == 200
+    payload = response.json()
+
+    pace = payload["weeklyCreditPace"]
+    assert pace["actualUsedPercent"] == pytest.approx(0.0)
+    assert pace["smoothedDeltaPercent"] == pytest.approx(pace["deltaPercent"])
+    assert pace["smoothedScheduleGapCredits"] == 0
+    assert pace["status"] == "on_track"
 
 
 @pytest.mark.asyncio

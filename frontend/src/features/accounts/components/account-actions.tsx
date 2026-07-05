@@ -4,6 +4,7 @@ import {
   Pause,
   Play,
   RefreshCw,
+  RotateCcw,
   Route,
   ShieldCheck,
   Trash2,
@@ -23,6 +24,7 @@ import type {
   AccountRoutingPolicy,
   AccountSummary,
 } from "@/features/accounts/schemas";
+import { formatSingleUnitRemaining } from "@/utils/formatters";
 
 export type AccountActionsProps = {
   account: AccountSummary;
@@ -34,6 +36,7 @@ export type AccountActionsProps = {
   onDelete: (accountId: string) => void;
   onReauth: () => void;
   onExportAuth: (accountId: string) => void;
+  onResetCredit: (accountId: string) => void;
   onSecurityWorkAuthorizedChange: (accountId: string, enabled: boolean) => void;
   onLimitWarmupChange: (accountId: string, enabled: boolean) => void;
   onRoutingPolicyChange: (
@@ -52,6 +55,7 @@ export function AccountActions({
   onDelete,
   onReauth,
   onExportAuth,
+  onResetCredit,
   onSecurityWorkAuthorizedChange,
   onLimitWarmupChange,
   onRoutingPolicyChange,
@@ -60,12 +64,22 @@ export function AccountActions({
     account.status === "reauth_required" || account.status === "deactivated";
   const probeDisabled =
     busy || readOnly || account.status === "paused" || showOperatorRecoveryAction;
+  const resetCountdown = account.resetCreditNearestExpiresAt
+    ? formatSingleUnitRemaining(account.resetCreditNearestExpiresAt)
+    : null;
+  const availableResetCredits = account.availableResetCredits ?? 0;
+  const hasResetCredits = availableResetCredits > 0;
+  const resetCreditDisabled =
+    busy ||
+    readOnly ||
+    account.status === "paused" ||
+    showOperatorRecoveryAction;
 
   return (
     <div className="space-y-3 border-t pt-4">
       {!showOperatorRecoveryAction ? (
-        <div className="flex flex-wrap items-center gap-3 rounded-md border bg-muted/30 p-3">
-          <div className="flex min-w-36 items-center gap-2 text-sm font-medium">
+        <div className="flex flex-col gap-2 rounded-md border bg-muted/30 p-3 sm:flex-row sm:items-center sm:gap-3">
+          <div className="flex min-w-0 items-center gap-2 text-sm font-medium sm:min-w-36">
             <Route className="h-4 w-4 text-muted-foreground" />
             Routing policy
           </div>
@@ -82,7 +96,7 @@ export function AccountActions({
             <SelectTrigger
               aria-label="Routing policy"
               size="sm"
-              className="h-8 min-w-32 flex-1 text-xs"
+              className="h-8 w-full min-w-0 text-xs sm:min-w-32 sm:flex-1"
             >
               <SelectValue />
             </SelectTrigger>
@@ -97,7 +111,7 @@ export function AccountActions({
 
       <label
         htmlFor={`security-work-authorized-${account.accountId}`}
-        className="flex items-center justify-between gap-3 rounded-md border px-3 py-2"
+        className="flex min-w-0 items-center justify-between gap-3 rounded-md border px-3 py-2"
       >
         <span className="flex min-w-0 items-center gap-2 text-xs font-medium">
           <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
@@ -105,6 +119,7 @@ export function AccountActions({
         </span>
         <Switch
           id={`security-work-authorized-${account.accountId}`}
+          className="shrink-0"
           checked={account.securityWorkAuthorized ?? false}
           disabled={busy || readOnly}
           onCheckedChange={(checked) =>
@@ -190,6 +205,33 @@ export function AccountActions({
           <Download className="h-3.5 w-3.5" />
           Export
         </Button>
+
+        {hasResetCredits ? (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            className="relative h-8 gap-1.5 pr-8 text-xs"
+            onClick={() => onResetCredit(account.accountId)}
+            disabled={resetCreditDisabled}
+          >
+            <RotateCcw className="h-3.5 w-3.5" />
+            {`Reset (${availableResetCredits})`}
+            {resetCountdown ? (
+              <span
+                aria-hidden="true"
+                className={[
+                  "pointer-events-none absolute -top-1 right-1 text-[10px] tabular-nums",
+                  resetCountdown.expiringSoon
+                    ? "text-destructive"
+                    : "text-muted-foreground",
+                ].join(" ")}
+              >
+                {resetCountdown.label}
+              </span>
+            ) : null}
+          </Button>
+        ) : null}
 
         <Button
           type="button"

@@ -103,7 +103,7 @@ When an HTTP bridge session receives an anonymous upstream `previous_response_no
 - **AND** the downstream error code is not `previous_response_not_found`
 
 ### Requirement: WebSocket full-resend previous-response misses retry without stale anchor
-When a direct WebSocket `response.create` request includes both `previous_response_id` and a full resend payload, the service MUST retain a safe replay body without `previous_response_id`. If upstream rejects the anchor with `previous_response_not_found` before `response.created`, the service MUST reconnect and replay the retained full payload as a fresh turn instead of forwarding the raw upstream invalid-request error.
+When a direct WebSocket `response.create` request includes both `previous_response_id` and a self-contained full resend payload, the service MUST retain a safe replay body without `previous_response_id`. If upstream rejects the anchor with `previous_response_not_found` before `response.created`, the service MUST reconnect and replay the retained full payload as a fresh turn instead of forwarding the raw upstream invalid-request error. A payload that only carries incremental tool outputs for tool calls that are not also present in the same request is not self-contained and MUST NOT be replayed as a fresh turn without `previous_response_id`.
 
 #### Scenario: full-resend WebSocket follow-up loses just-completed anchor
 - **WHEN** a WebSocket `/v1/responses` or `/backend-api/codex/responses` follow-up has `previous_response_id`
@@ -112,6 +112,13 @@ When a direct WebSocket `response.create` request includes both `previous_respon
 - **THEN** the service reconnects the upstream WebSocket
 - **AND** it replays the same request without `previous_response_id`
 - **AND** the downstream client receives the recovered response events, not the raw `previous_response_not_found` error
+
+#### Scenario: output-only WebSocket tool delta is not replayed as a fresh turn
+- **WHEN** a WebSocket `/v1/responses` or `/backend-api/codex/responses` follow-up has `previous_response_id`
+- **AND** the request payload carries `function_call_output`, `custom_tool_call_output`, or `apply_patch_call_output` items without their matching tool-call items in the same payload
+- **AND** upstream emits `previous_response_not_found` before assigning a response id
+- **THEN** the service MUST NOT replay that payload as a fresh turn without `previous_response_id`
+- **AND** the downstream client receives a retryable continuity failure rather than a fabricated fresh turn
 
 ### Requirement: Public Responses errors mask previous-response misses
 Public Responses endpoints MUST NOT return an OpenAI-shaped `previous_response_not_found` error to clients. If a lower layer still raises or collects that error, the API layer MUST rewrite it to a retryable `stream_incomplete` continuity failure and remove the missing response id from the public payload.
@@ -487,11 +494,12 @@ The service SHALL accept built-in Responses tool definitions on `/backend-api/co
 - **THEN** the proxy forwards those tool objects upstream instead of returning a local `invalid_request_error`
 
 ### Requirement: Compact requests drop tool-only fields
-The service SHALL remove `tools`, `tool_choice`, and `parallel_tool_calls` from compact request payloads before calling the upstream compact endpoint.
+The service SHALL remove `tools` and `tool_choice` from compact request payloads, and set `parallel_tool_calls` to `false`, before calling the upstream compact endpoint.
 
 #### Scenario: compact request reuses a full Responses payload shape
 - **WHEN** a client sends `/backend-api/codex/responses/compact` or `/v1/responses/compact` with `tools`, `tool_choice`, or `parallel_tool_calls`
-- **THEN** the proxy drops those fields before the upstream compact request
+- **THEN** the proxy drops `tools` and `tool_choice` before the upstream compact request
+- **AND** the proxy sends `parallel_tool_calls` as `false`
 - **AND** the compact request continues without a local or upstream `invalid_request_error` caused by `param="tools"`
 
 ### Requirement: Responses requests accept input_file content items with a file_id
@@ -527,7 +535,7 @@ When multiple `file_id`s are referenced and several are pinned, the most-recentl
 - **THEN** the proxy MUST follow the prompt-cache affinity for routing and MUST NOT use the file_id pin
 
 ### Requirement: Codex backend session_id preserves account affinity
-When a backend Codex Responses or compact request includes a non-empty accepted session header, the service MUST use that value as the routing affinity key for upstream account selection. If the request lacks a client-supplied `prompt_cache_key`, the service MUST derive and attach a stable `prompt_cache_key` before upstream forwarding so account affinity and upstream prompt-cache routing can coexist. Accepted session headers are `session_id`, `x-codex-session-id`, and `x-codex-conversation-id`, in that priority order.
+When a backend Codex Responses or compact request includes a non-empty accepted session header, the service MUST use that value as the routing affinity key for upstream account selection. If the request lacks a client-supplied `prompt_cache_key`, the service MUST derive and attach a stable `prompt_cache_key` before upstream forwarding so account affinity and upstream prompt-cache routing can coexist. Accepted session headers are `session_id`, `session-id`, `x-codex-session-id`, `x-codex-conversation-id`, and `thread-id`, in that priority order.
 
 #### Scenario: Backend Codex request derives prompt_cache_key before codex-session routing
 - **WHEN** `/backend-api/codex/responses` is called with `session_id` and without `prompt_cache_key`
@@ -562,6 +570,13 @@ When serving HTTP `/v1/responses` or HTTP `/backend-api/codex/responses`, the se
 - **WHEN** a forwarded hard-continuity bridge request reaches another non-owner replica
 - **THEN** the service MUST fail the request with a generic 5xx bridge-forward error
 - **AND** it MUST NOT attempt another owner handoff
+
+#### Scenario: local restart orphan is recovered by the replacement instance
+- **WHEN** a single local bridge instance is replaced while durable hard-continuity ownership still references the old instance id
+- **AND** the old owner has no distinct active forwarding endpoint from the current replacement instance
+- **THEN** the replacement instance MUST treat the row as restart-orphaned and may claim durable ownership locally
+- **AND** same-account takeover MUST preserve the latest persisted response anchor until a replacement response id is recorded
+- **AND** normal client retries MUST NOT be stranded waiting for the old instance lease to expire
 
 ### Requirement: Responses account selection accounts for in-flight pressure
 

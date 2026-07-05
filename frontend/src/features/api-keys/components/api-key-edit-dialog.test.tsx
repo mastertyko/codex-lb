@@ -1,6 +1,7 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { HttpResponse, http } from "msw";
+import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { LimitRuleCreate } from "@/features/api-keys/schemas";
@@ -12,6 +13,23 @@ import { ApiKeyEditDialog } from "./api-key-edit-dialog";
 import { hasLimitRuleChanges } from "./limit-rules-utils";
 
 describe("ApiKeyEditDialog", () => {
+  function ControlledApiKeyEditDialog({
+    apiKey = createApiKey({ allowedModels: [] }),
+  }: {
+    apiKey?: ReturnType<typeof createApiKey>;
+  }) {
+    const [open, setOpen] = useState(true);
+    return (
+      <ApiKeyEditDialog
+        open={open}
+        busy={false}
+        apiKey={apiKey}
+        onOpenChange={setOpen}
+        onSubmit={vi.fn().mockResolvedValue(undefined)}
+      />
+    );
+  }
+
   it("omits limits from payload when only name changes", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
@@ -71,6 +89,36 @@ describe("ApiKeyEditDialog", () => {
     expect(payload.isActive).toBe(false);
     expect("assignedAccountIds" in payload).toBe(false);
     expect("limits" in payload).toBe(false);
+  });
+
+  it("renders and clears the transport policy override", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const apiKey = createApiKey({ transportPolicyOverride: "always_http" });
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={apiKey}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "HTTP client routing" })).toHaveTextContent(
+      "Prefer request/response",
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "HTTP client routing" }));
+    await user.click(await screen.findByRole("option", { name: "Follow global default" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+
+    expect(onSubmit.mock.calls[0][0].transportPolicyOverride).toBeNull();
   });
 
   it("includes limits when actual limit values change", async () => {
@@ -177,6 +225,40 @@ describe("ApiKeyEditDialog", () => {
 
     const payload = onSubmit.mock.calls[0][0];
     expect(payload.assignedAccountIds).toEqual(["acc_primary", "acc_secondary"]);
+  });
+
+  it("keeps the dialog open when selecting portalled model and account menu items", async () => {
+    const user = userEvent.setup();
+    server.use(
+      http.get("/api/accounts", () =>
+        HttpResponse.json({
+          accounts: [
+            createAccountSummary(),
+            createAccountSummary({
+              accountId: "acc_secondary",
+              email: "secondary@example.com",
+              displayName: "secondary@example.com",
+            }),
+          ],
+        }),
+      ),
+    );
+
+    renderWithProviders(<ControlledApiKeyEditDialog />);
+
+    await user.click(await screen.findByRole("button", { name: "All models" }));
+    await user.click(await screen.findByRole("menuitemcheckbox", { name: "gpt-5.1" }));
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByRole("dialog", { name: "Edit API key" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "1 model selected" })).toBeInTheDocument();
+
+    await user.click(await screen.findByRole("button", { name: "All accounts" }));
+    await user.click(await screen.findByRole("menuitemcheckbox", { name: /primary@example\.com/i }));
+    await user.keyboard("{Escape}");
+
+    expect(await screen.findByRole("dialog", { name: "Edit API key" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "1 account selected" })).toBeInTheDocument();
   });
 
   it("omits assigned accounts when editing an unrelated field", async () => {

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import Integer, and_, cast, func, literal, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.utils.time import utcnow
+from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
     Account,
     QuotaPlannerDecision,
@@ -19,6 +19,21 @@ from app.db.session import sqlite_writer_section
 from app.modules.quota_planner.logic import PlannerSettings, encode_working_days, parse_working_days
 
 _SETTINGS_ID = 1
+
+
+def _to_db_naive_utc(value: datetime | None) -> datetime | None:
+    """Normalize a decision datetime for the timezone-naive DB columns.
+
+    ``QuotaPlannerDecision.scheduled_at`` / ``executed_at`` are timezone-naive
+    ``DateTime`` columns. Persisting timezone-aware instants into them fails on
+    Postgres/asyncpg ("can't subtract offset-naive and offset-aware datetimes").
+    Aware values are converted to UTC and stripped of ``tzinfo`` so the absolute
+    instant is preserved; naive values are returned unchanged.
+    """
+
+    if value is None:
+        return None
+    return to_utc_naive(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,8 +115,8 @@ class QuotaPlannerRepository:
             mode=mode,
             action=action,
             account_id=account_id,
-            scheduled_at=scheduled_at,
-            executed_at=executed_at,
+            scheduled_at=_to_db_naive_utc(scheduled_at),
+            executed_at=_to_db_naive_utc(executed_at),
             score=score,
             reason=reason,
             forecast_snapshot_hash=forecast_snapshot_hash,
@@ -138,7 +153,7 @@ class QuotaPlannerRepository:
         if reason is not None:
             values["reason"] = reason
         if executed_at is not None:
-            values["executed_at"] = executed_at
+            values["executed_at"] = _to_db_naive_utc(executed_at)
         if state_after_json is not None:
             values["state_after_json"] = state_after_json
         stmt = update(QuotaPlannerDecision).where(QuotaPlannerDecision.id == decision_id).values(**values)
@@ -160,6 +175,7 @@ class QuotaPlannerRepository:
         return row
 
     async def count_executed_warmups_since(self, since: datetime) -> int:
+        since = to_utc_naive(since)
         stmt = select(func.count(QuotaPlannerDecision.id)).where(
             and_(
                 QuotaPlannerDecision.action == "warmup",
@@ -170,6 +186,7 @@ class QuotaPlannerRepository:
         return int(await self._session.scalar(stmt) or 0)
 
     async def warmup_cost_since(self, since: datetime) -> float:
+        since = to_utc_naive(since)
         stmt = select(func.coalesce(func.sum(RequestLog.cost_usd), 0.0)).where(
             and_(
                 RequestLog.request_kind == "warmup",
@@ -215,7 +232,7 @@ class QuotaPlannerRepository:
     ) -> QuotaWindowObservation:
         row = QuotaWindowObservation(
             account_id=account_id,
-            observed_at=observed_at or utcnow(),
+            observed_at=_to_db_naive_utc(observed_at) or utcnow(),
             model=model,
             primary_remaining_percent=primary_remaining_percent,
             primary_reset_at=primary_reset_at,
@@ -236,7 +253,7 @@ class QuotaPlannerRepository:
         since: datetime | None = None,
         bucket_seconds: int = 900,
     ) -> list[DemandBin]:
-        since = since or (utcnow() - timedelta(days=28))
+        since = to_utc_naive(since) if since is not None else (utcnow() - timedelta(days=28))
         bind = self._session.get_bind()
         dialect = bind.dialect.name if bind else "sqlite"
         if dialect == "postgresql":
