@@ -6422,3 +6422,243 @@ def test_backend_responses_websocket_emits_response_failed_before_close_on_upstr
     assert log_calls[0]["request_id"] == "resp_ws_eof_retry"
     assert log_calls[0]["status"] == "error"
     assert log_calls[0]["error_code"] == "stream_incomplete"
+
+
+def test_backend_responses_websocket_replays_disconnect_after_created_before_visible_output(
+    app_instance,
+    monkeypatch,
+):
+    first_upstream = _FakeUpstreamWebSocket(
+        [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_ws_disconnect_first", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+            _FakeUpstreamMessage("error", error="no close frame received or sent"),
+        ]
+    )
+    second_upstream = _FakeUpstreamWebSocket(
+        [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_ws_disconnect_second", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.completed",
+                        "response": {
+                            "id": "resp_ws_disconnect_second",
+                            "status": "completed",
+                            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+        ]
+    )
+    connect_accounts: list[str] = []
+    excluded_account_ids_seen: list[set[str]] = []
+    handled_error_codes: list[tuple[str, str]] = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(
+        self,
+        headers,
+        *,
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset,
+        prefer_earlier_reset_window,
+        routing_strategy,
+        model,
+        request_state,
+        api_key,
+        client_send_lock,
+        websocket,
+    ):
+        del (
+            self,
+            headers,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset,
+            prefer_earlier_reset_window,
+            routing_strategy,
+            model,
+            api_key,
+            client_send_lock,
+            websocket,
+        )
+        excluded = set(getattr(request_state, "excluded_account_ids", set()))
+        excluded_account_ids_seen.append(excluded)
+        if "acct_ws_disconnect_1" in excluded:
+            connect_accounts.append("acct_ws_disconnect_2")
+            return SimpleNamespace(id="acct_ws_disconnect_2"), second_upstream
+        connect_accounts.append("acct_ws_disconnect_1")
+        return SimpleNamespace(id="acct_ws_disconnect_1"), first_upstream
+
+    async def fake_handle_stream_error(self, account, error, code):
+        del self, error
+        handled_error_codes.append((account.id, code))
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    monkeypatch.setattr(proxy_module.ProxyService, "_handle_stream_error", fake_handle_stream_error)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            created_event = json.loads(websocket.receive_text())
+            completed_event = json.loads(websocket.receive_text())
+
+    assert created_event["type"] == "response.created"
+    assert created_event["response"]["id"] == "resp_ws_disconnect_first"
+    assert completed_event["type"] == "response.completed"
+    assert completed_event["response"]["id"] == "resp_ws_disconnect_first"
+    assert completed_event["response"]["status"] == "completed"
+    assert connect_accounts == ["acct_ws_disconnect_1", "acct_ws_disconnect_2"]
+    assert excluded_account_ids_seen == [set(), {"acct_ws_disconnect_1"}]
+    assert handled_error_codes == [("acct_ws_disconnect_1", "stream_incomplete")]
+    assert first_upstream.closed is True
+    assert len(first_upstream.sent_text) == 1
+    assert len(second_upstream.sent_text) == 1
+    assert json.loads(first_upstream.sent_text[0]) == json.loads(second_upstream.sent_text[0])
+
+
+def test_backend_responses_websocket_direct_previous_response_disconnect_after_created_is_not_replayed(
+    app_instance,
+    monkeypatch,
+):
+    first_upstream = _FakeUpstreamWebSocket(
+        [
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_ws_prev_disconnect", "status": "in_progress"},
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+            _FakeUpstreamMessage("error", error="no close frame received or sent"),
+        ]
+    )
+    connect_accounts: list[str] = []
+    excluded_account_ids_seen: list[set[str]] = []
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(_authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(
+        self,
+        headers,
+        *,
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset,
+        prefer_earlier_reset_window,
+        routing_strategy,
+        model,
+        request_state,
+        api_key,
+        client_send_lock,
+        websocket,
+    ):
+        del (
+            self,
+            headers,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset,
+            prefer_earlier_reset_window,
+            routing_strategy,
+            model,
+            api_key,
+            client_send_lock,
+            websocket,
+        )
+        connect_accounts.append("acct_ws_prev_disconnect_1")
+        excluded_account_ids_seen.append(set(getattr(request_state, "excluded_account_ids", set())))
+        return SimpleNamespace(id="acct_ws_prev_disconnect_1"), first_upstream
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": "continue",
+        "previous_response_id": "resp_ws_prev_anchor",
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses") as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            created_event = json.loads(websocket.receive_text())
+            failed_event = json.loads(websocket.receive_text())
+
+    assert created_event["type"] == "response.created"
+    assert created_event["response"]["id"] == "resp_ws_prev_disconnect"
+    assert failed_event["type"] == "response.failed"
+    assert failed_event["response"]["id"] == "resp_ws_prev_disconnect"
+    assert failed_event["response"]["error"]["code"] == "stream_incomplete"
+    assert failed_event["response"]["error"]["message"] == (
+        "Upstream websocket closed before response.completed: no close frame received or sent"
+    )
+    assert connect_accounts == ["acct_ws_prev_disconnect_1"]
+    assert excluded_account_ids_seen == [set()]
+    assert len(first_upstream.sent_text) == 1

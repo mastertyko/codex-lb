@@ -1020,6 +1020,11 @@ class _WebSocketMixin:
                         pending_lock=pending_lock,
                     )
                     if replay_candidate is not None:
+                        await self._record_websocket_pre_visible_replay_failure(
+                            replay_candidate,
+                            account=account,
+                            error_message="Upstream websocket closed before response.completed",
+                        )
                         _facade().logger.info(
                             "Transparent websocket replay after upstream send failure request_id=%s",
                             replay_candidate.request_log_id or replay_candidate.request_id,
@@ -2508,6 +2513,11 @@ class _WebSocketMixin:
                     pending_lock=pending_lock,
                 )
                 if replay_request_state is not None:
+                    await self._record_websocket_pre_visible_replay_failure(
+                        replay_request_state,
+                        account=account,
+                        error_message=_upstream_websocket_disconnect_message(message),
+                    )
                     upstream_control.reconnect_requested = True
                     upstream_control.replay_request_state = replay_request_state
                     _facade().logger.info(
@@ -3414,6 +3424,33 @@ class _WebSocketMixin:
             error_code="upstream_request_timeout",
             error_message="Proxy request budget exhausted",
         )
+
+    async def _record_websocket_pre_visible_replay_failure(
+        self,
+        request_state: _WebSocketRequestState,
+        *,
+        account: Account | None,
+        error_message: str,
+    ) -> None:
+        proxy = cast(_WebSocketServiceProtocol, self)
+        _ = proxy
+        if account is None:
+            return
+        if not request_state.file_required_preferred_account:
+            request_state.excluded_account_ids.add(account.id)
+            if request_state.force_refresh_account_id == account.id:
+                request_state.force_refresh_account_id = None
+            if request_state.previous_response_id is None and request_state.preferred_account_id == account.id:
+                request_state.preferred_account_id = None
+        try:
+            await proxy._handle_stream_error(account, {"message": error_message}, "stream_incomplete")
+        except Exception:
+            _facade().logger.warning(
+                "Failed to record websocket replay health penalty account_id=%s error_code=%s",
+                account.id,
+                "stream_incomplete",
+                exc_info=True,
+            )
 
     async def _fail_pending_websocket_requests(
         self,
