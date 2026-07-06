@@ -13,4 +13,4 @@ Live Codex sessions can wait on long tool output and later send full context whi
 - Direct WebSocket `/backend-api/codex/responses` and `/v1/responses` continuity handling.
 - Request-log and account-health classification for direct WebSocket Codex prewarm requests.
 - Codex compact request timeout/logging behavior for `/backend-api/codex/responses/compact`.
-- No change to short previous-response continuations that lack a retry-safe full-context body.
+- Pre-created short previous-response WebSocket continuations may be replayed once on the same owner account only when no upstream `response.*` frame has been observed; continuations that have emitted `response.created` or later remain fail-closed unless a retry-safe full-context body is available.
