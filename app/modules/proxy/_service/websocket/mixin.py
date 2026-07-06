@@ -3681,11 +3681,11 @@ class _WebSocketMixin:
         _ = proxy
         if account is None:
             return
-        if not request_state.file_required_preferred_account:
+        if request_state.previous_response_id is None and not request_state.file_required_preferred_account:
             request_state.excluded_account_ids.add(account.id)
             if request_state.force_refresh_account_id == account.id:
                 request_state.force_refresh_account_id = None
-            if request_state.previous_response_id is None and request_state.preferred_account_id == account.id:
+            if request_state.preferred_account_id == account.id:
                 request_state.preferred_account_id = None
         try:
             await proxy._handle_stream_error(account, {"message": error_message}, "stream_incomplete")

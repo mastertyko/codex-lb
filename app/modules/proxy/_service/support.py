@@ -538,8 +538,10 @@ def _websocket_request_can_replay_before_visible_output(request_state: _WebSocke
         request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text is not None
     )
     precreated_pending = request_state.response_id is None and request_state.awaiting_response_created
-    if precreated_pending and request_state.previous_response_id is not None and not has_retry_safe_fresh_payload:
-        return False
+    # A direct previous_response_id request can be retried only while the
+    # upstream has not acknowledged it with any response.* frame. Once a
+    # response id is visible, replaying the same previous_response_id can fork
+    # continuity; before that point this is the only recoverable no-output EOF.
     created_only_pending = (
         request_state.response_id is not None
         and not request_state.awaiting_response_created
