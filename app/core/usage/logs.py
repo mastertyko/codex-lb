@@ -88,6 +88,33 @@ def calculated_cost_from_log(log: RequestLogLike, *, precision: int | None = Non
     return round(cost, precision)
 
 
+def calculated_cost_from_token_counts(
+    *,
+    model: str | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_input_tokens: int | None,
+    cache_write_input_tokens: int | None,
+    service_tier: str | None,
+) -> float | None:
+    if cache_write_input_tokens is None or not model or input_tokens is None or output_tokens is None:
+        return None
+    resolved = get_pricing_for_model(model, None, None)
+    if resolved is None:
+        return None
+    _, price = resolved
+    return calculate_cost_from_usage(
+        UsageTokens(
+            input_tokens=float(input_tokens),
+            output_tokens=float(output_tokens),
+            cached_input_tokens=float(cached_input_tokens or 0),
+            cache_write_input_tokens=float(cache_write_input_tokens),
+        ),
+        price,
+        service_tier=service_tier,
+    )
+
+
 def cost_from_log(log: RequestLogLike, *, precision: int | None = None) -> float | None:
     cost = log.cost_usd
     if cost is None:
@@ -103,6 +130,33 @@ def _totals_match(left: float | None, right: float | None, *, precision: int | N
     if precision is None:
         return left == right
     return abs(left - right) < (10 ** (-precision)) / 2
+
+
+def _is_cache_write_priced_model(model: str | None) -> bool:
+    if not isinstance(model, str):
+        return False
+    normalized = model.strip().lower()
+    return normalized == "gpt-5.6" or normalized.startswith("gpt-5.6-")
+
+
+def _is_model_source_log(log: RequestLogLike) -> bool:
+    return getattr(log, "model_source_id", None) is not None or getattr(log, "model_source_kind", None) is not None
+
+
+def _infer_combined_input_cost(
+    *,
+    persisted_total: float,
+    cached_input_usd: float | None,
+    output_usd: float | None,
+    precision: int | None,
+) -> float | None:
+    if cached_input_usd is None or output_usd is None:
+        return None
+    known_cost = cached_input_usd + output_usd
+    if persisted_total < known_cost:
+        return None
+    inferred = persisted_total - known_cost
+    return round(inferred, precision) if precision is not None else inferred
 
 
 def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None) -> UsageCostBreakdown:
@@ -164,6 +218,26 @@ def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None
     if persisted_cost is not None:
         persisted_raw_cost = cost_from_log(log)
         if not _totals_match(persisted_raw_cost, raw_total_usd, precision=precision):
+            if (
+                _is_cache_write_priced_model(log.model)
+                and not _is_model_source_log(log)
+                and persisted_raw_cost is not None
+                and raw_total_usd is not None
+                and persisted_raw_cost > raw_total_usd
+            ):
+                inferred_input_usd = _infer_combined_input_cost(
+                    persisted_total=persisted_cost,
+                    cached_input_usd=cached_input_usd,
+                    output_usd=output_usd,
+                    precision=precision,
+                )
+                if inferred_input_usd is not None:
+                    return UsageCostBreakdown(
+                        input_usd=inferred_input_usd,
+                        cached_input_usd=cached_input_usd,
+                        output_usd=output_usd,
+                        total_usd=persisted_cost,
+                    )
             return UsageCostBreakdown(
                 input_usd=None,
                 cached_input_usd=None,

@@ -27,6 +27,9 @@ EXPECTED_CORE_MODEL_PLANS = {
 }
 
 EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS = {
+    "gpt-5.6-sol": "0.144.0",
+    "gpt-5.6-terra": "0.144.0",
+    "gpt-5.6-luna": "0.144.0",
     "gpt-5.5": "0.124.0",
     "gpt-5.4": "0.98.0",
     "gpt-5.4-mini": "0.98.0",
@@ -34,6 +37,30 @@ EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS = {
     "gpt-5.3-codex-spark": "0.100.0",
     "gpt-5.2": "0.0.1",
     "codex-auto-review": "0.98.0",
+}
+
+EXPECTED_GPT56_PLANS = {
+    "business",
+    "edu",
+    "edu_plus",
+    "edu_pro",
+    "education",
+    "enterprise",
+    "enterprise_cbp_automation",
+    "enterprise_cbp_usage_based",
+    "finserv",
+    "free",
+    "free_workspace",
+    "go",
+    "hc",
+    "k12",
+    "plus",
+    "pro",
+    "prolite",
+    "quorum",
+    "sci",
+    "self_serve_business_usage_based",
+    "team",
 }
 
 
@@ -81,6 +108,8 @@ def test_plan_types_for_model_uses_bootstrap_when_uninitialized():
 
     assert registry.plan_types_for_model("gpt-5.4") == EXPECTED_CORE_MODEL_PLANS
     assert registry.plan_types_for_model("GPT-5.4") == EXPECTED_CORE_MODEL_PLANS
+    assert registry.plan_types_for_model("gpt-5.6") == EXPECTED_GPT56_PLANS
+    assert registry.plan_types_for_model("GPT-5.6-SOL") == EXPECTED_GPT56_PLANS
 
 
 @pytest.mark.asyncio
@@ -138,6 +167,11 @@ async def test_prefers_websockets_does_not_use_bootstrap_after_snapshot():
 def test_prefers_websockets_uses_bootstrap_fallback_when_uninitialized():
     registry = ModelRegistry(ttl_seconds=60.0)
 
+    assert registry.prefers_websockets("gpt-5.6") is True
+    assert registry.prefers_websockets("gpt-5.6-sol") is True
+    assert registry.prefers_websockets("gpt-5.6-terra") is True
+    assert registry.prefers_websockets("gpt-5.6-luna") is True
+    assert registry.prefers_websockets("gpt-5.6-sol-2026-07-09") is True
     assert registry.prefers_websockets("gpt-5.4") is True
     assert registry.prefers_websockets("gpt-5.4-2026") is True
     assert registry.prefers_websockets("gpt-5.3-codex") is True
@@ -180,6 +214,112 @@ def test_bootstrap_models_include_representative_upstream_metadata():
     assert auto_review.minimal_client_version == "0.98.0"
     assert auto_review.available_in_plans == EXPECTED_CORE_MODEL_PLANS
     assert models["gpt-5.3-codex"].available_in_plans == EXPECTED_CORE_MODEL_PLANS
+
+
+def test_bootstrap_gpt56_models_match_codex_native_metadata():
+    models = ModelRegistry(ttl_seconds=60.0).get_models_with_fallback()
+
+    expected = {
+        "gpt-5.6-sol": {
+            "display_name": "GPT-5.6-Sol",
+            "description": "Latest frontier agentic coding model.",
+            "default_reasoning_level": "low",
+            "priority": 1,
+            "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),
+            "multi_agent_version": "v2",
+        },
+        "gpt-5.6-terra": {
+            "display_name": "GPT-5.6-Terra",
+            "description": "Balanced agentic coding model for everyday work.",
+            "default_reasoning_level": "medium",
+            "priority": 2,
+            "efforts": ("low", "medium", "high", "xhigh", "max", "ultra"),
+            "multi_agent_version": "v2",
+        },
+        "gpt-5.6-luna": {
+            "display_name": "GPT-5.6-Luna",
+            "description": "Fast and affordable agentic coding model.",
+            "default_reasoning_level": "medium",
+            "priority": 3,
+            "efforts": ("low", "medium", "high", "xhigh", "max"),
+            "multi_agent_version": "v1",
+        },
+    }
+
+    for slug, contract in expected.items():
+        model = models[slug]
+        assert model.display_name == contract["display_name"]
+        assert model.description == contract["description"]
+        assert model.context_window == 372_000
+        assert model.minimal_client_version == "0.144.0"
+        assert model.default_reasoning_level == contract["default_reasoning_level"]
+        assert model.priority == contract["priority"]
+        assert tuple(level.effort for level in model.supported_reasoning_levels) == contract["efforts"]
+        assert model.prefer_websockets is True
+        assert model.support_verbosity is True
+        assert model.default_verbosity == "low"
+        assert model.supports_reasoning_summaries is True
+        assert model.supports_parallel_tool_calls is True
+        assert model.input_modalities == ("text", "image")
+        assert model.available_in_plans == EXPECTED_GPT56_PLANS
+        assert model.raw["max_context_window"] == 372_000
+        assert model.raw["additional_speed_tiers"] == ["fast"]
+        assert model.raw["service_tiers"] == [
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            }
+        ]
+        assert model.raw["default_service_tier"] is None
+        assert model.raw["apply_patch_tool_type"] == "freeform"
+        assert model.raw["web_search_tool_type"] == "text_and_image"
+        assert model.raw["supports_image_detail_original"] is True
+        assert model.raw["truncation_policy"] == {"mode": "tokens", "limit": 10_000}
+        assert model.raw["tool_mode"] == "code_mode_only"
+        assert model.raw["multi_agent_version"] == contract["multi_agent_version"]
+        assert model.raw["use_responses_lite"] is True
+        assert model.raw["include_skills_usage_instructions"] is False
+        assert model.raw["auto_review_model_override"] is None
+        assert model.raw["auto_compact_token_limit"] is None
+        assert model.raw["comp_hash"] == "3000"
+        assert model.raw["reasoning_summary_format"] == "experimental"
+        assert model.raw["default_reasoning_summary"] == "none"
+        assert model.raw["upgrade"] is None
+        assert model.raw["experimental_supported_tools"] == []
+        assert model.raw["supports_search_tool"] is True
+
+    assert models["gpt-5.6-sol"].raw["availability_nux"] == {
+        "message": (
+            "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, produce "
+            "polished documents, and take on your most ambitious work. Sol is highly capable at lower reasoning "
+            "efforts—try starting lower, then turn it up for harder jobs."
+        )
+    }
+    assert models["gpt-5.6-terra"].raw["availability_nux"] is None
+    assert models["gpt-5.6-luna"].raw["availability_nux"] is None
+
+
+@pytest.mark.asyncio
+async def test_gpt56_alias_registry_lookups_use_canonical_snapshot():
+    registry = ModelRegistry(ttl_seconds=60.0)
+    canonical = replace(
+        _model("gpt-5.6-sol"),
+        prefer_websockets=False,
+        raw={
+            "additional_speed_tiers": ["fast"],
+            "service_tiers": [{"id": "priority", "name": "Fast"}],
+        },
+    )
+    await registry.update(
+        {"pro": [canonical]},
+        per_account_results={"acc-sol": ("pro", [canonical])},
+    )
+
+    assert registry.plan_types_for_model("gpt-5.6") == frozenset({"pro"})
+    assert registry.plan_types_for_model_service_tier("gpt-5.6", "fast") == frozenset({"pro"})
+    assert registry.account_ids_for_model_service_tier("gpt-5.6", "fast") == frozenset({"acc-sol"})
+    assert registry.prefers_websockets("gpt-5.6") is False
 
 
 @pytest.mark.asyncio

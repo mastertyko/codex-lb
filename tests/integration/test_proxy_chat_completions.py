@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from typing import cast
 
 import pytest
 from starlette.responses import JSONResponse
@@ -179,6 +180,72 @@ async def test_v1_chat_completions_non_stream_forces_stream(async_client, monkey
 
     assert observed_stream["value"] is True
     assert body["object"] == "chat.completion"
+
+
+@pytest.mark.asyncio
+async def test_v1_chat_completions_gpt56_strips_platform_cache_controls_and_preserves_write_usage(
+    async_client,
+    monkeypatch,
+):
+    raw_account_id = "acc_chat_gpt56_cache"
+    auth_json = _make_auth_json(raw_account_id, "chat-gpt56-cache@example.com")
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    imported = await async_client.post("/api/accounts/import", files=files)
+    assert imported.status_code == 200
+
+    captured: dict[str, object] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del headers, access_token, account_id, base_url, raise_for_status
+        captured.update(payload.to_payload())
+        yield 'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_chat_gpt56_cache","status":"completed",'
+            '"usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,'
+            '"input_tokens_details":{"cached_tokens":20,"cache_write_tokens":30}}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "gpt-5.6-terra",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Stable prefix",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                            "client_only": "drop-me",
+                        }
+                    ],
+                }
+            ],
+            "prompt_cache_key": "chat-gpt56-cache-key",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "reasoning_effort": "max",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["model"] == "gpt-5.6-terra"
+    assert captured["reasoning"] == {"effort": "max"}
+    assert captured["prompt_cache_key"] == "chat-gpt56-cache-key"
+    assert "prompt_cache_options" not in captured
+    captured_input = cast(list[dict[str, object]], captured["input"])
+    content = captured_input[0]["content"]
+    assert content == [
+        {
+            "type": "input_text",
+            "text": "Stable prefix",
+        }
+    ]
+    usage = response.json()["usage"]
+    assert usage["prompt_tokens_details"]["cached_tokens"] == 20
+    assert usage["prompt_tokens_details"]["cache_write_tokens"] == 30
 
 
 @pytest.mark.asyncio

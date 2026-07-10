@@ -164,6 +164,7 @@ from app.modules.proxy.request_policy import (
     apply_api_key_enforcement_to_chat_payload,
     enforce_strict_function_tools_format,
     enforce_strict_text_format,
+    is_known_subscription_model_alias,
     normalize_responses_request_payload,
     openai_client_payload_error,
     openai_validation_error,
@@ -301,6 +302,9 @@ _CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS = 2.0
 _CURSOR_CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS = 15.0
 _CURSOR_CONTEXT_LIMIT_SYNTHETIC_USAGE_TOKENS: Final[int] = 1_000_000
 _V1_MAX_OUTPUT_TOKEN_OVERRIDES: Final[dict[str, int]] = {
+    "gpt-5.6-sol": 128_000,
+    "gpt-5.6-terra": 128_000,
+    "gpt-5.6-luna": 128_000,
     "gpt-5.4": 128_000,
     "gpt-5.5": 128_000,
     "gpt-5.4-mini": 128_000,
@@ -2951,7 +2955,7 @@ async def _select_chat_model_source(
 ) -> tuple[ModelSource, str] | None:
     assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
     exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
-    candidates = [candidate for candidate in (raw_model, model) if candidate]
+    candidates = _model_source_candidates(model, raw_model=raw_model)
     if not candidates:
         return None
     deduped_candidates = list(dict.fromkeys(candidates))
@@ -2989,7 +2993,7 @@ async def _select_responses_model_source(
 ) -> tuple[ModelSource, str] | None:
     assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
     exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
-    candidates = [candidate for candidate in (raw_model, model) if candidate]
+    candidates = _model_source_candidates(model, raw_model=raw_model)
     if not candidates:
         return None
     deduped_candidates = list(dict.fromkeys(candidates))
@@ -3016,6 +3020,16 @@ async def _select_responses_model_source(
         # its attributes after this session boundary.
         detach_session_objects(session)
         return (source, candidate) if source is not None else None
+
+
+def _model_source_candidates(model: str, *, raw_model: str | None) -> list[str]:
+    if (
+        raw_model is not None
+        and is_known_subscription_model_alias(raw_model)
+        and resolve_model_alias(raw_model) == model
+    ):
+        return [model]
+    return [candidate for candidate in (raw_model, model) if candidate]
 
 
 async def _select_audio_transcriptions_model_source(model: str, api_key: ApiKeyData | None) -> ModelSource | None:

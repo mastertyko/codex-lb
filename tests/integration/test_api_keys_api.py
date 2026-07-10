@@ -679,7 +679,7 @@ async def test_api_key_update_accepts_fast_service_tier_alias(async_client):
 
 
 @pytest.mark.asyncio
-async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, monkeypatch):
+async def test_api_key_enforces_model_and_max_reasoning_for_responses(async_client, monkeypatch):
     await _populate_test_registry()
     model_ids = sorted(_TEST_MODELS)
     forced_model = model_ids[0]
@@ -702,7 +702,7 @@ async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, 
             "name": "enforced-policy",
             "allowedModels": [forced_model],
             "enforcedModel": forced_model,
-            "enforcedReasoningEffort": "high",
+            "enforcedReasoningEffort": "max",
         },
     )
     assert created.status_code == 200
@@ -741,14 +741,14 @@ async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, 
         _ = [line async for line in response.aiter_lines() if line]
 
     assert seen["model"] == forced_model
-    assert seen["effort"] == "high"
+    assert seen["effort"] == "max"
 
     async with SessionLocal() as session:
         result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
         latest_log = result.scalars().first()
         assert latest_log is not None
     assert latest_log.model == forced_model
-    assert latest_log.reasoning_effort == "high"
+    assert latest_log.reasoning_effort == "max"
 
 
 @pytest.mark.asyncio
@@ -1460,11 +1460,11 @@ async def test_api_key_create_accepts_uppercase_enforced_reasoning(async_client)
         "/api/api-keys/",
         json={
             "name": "uppercase-enforcement",
-            "enforcedReasoningEffort": "HIGH",
+            "enforcedReasoningEffort": "MAX",
         },
     )
     assert created.status_code == 200
-    assert created.json()["enforcedReasoningEffort"] == "high"
+    assert created.json()["enforcedReasoningEffort"] == "max"
 
 
 @pytest.mark.asyncio
@@ -1481,11 +1481,33 @@ async def test_api_key_update_accepts_uppercase_enforced_reasoning(async_client)
     updated = await async_client.patch(
         f"/api/api-keys/{key_id}",
         json={
-            "enforcedReasoningEffort": "HIGH",
+            "enforcedReasoningEffort": "MAX",
         },
     )
     assert updated.status_code == 200
-    assert updated.json()["enforcedReasoningEffort"] == "high"
+    assert updated.json()["enforcedReasoningEffort"] == "max"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "patch"])
+async def test_api_key_write_rejects_native_only_ultra_reasoning(async_client, method):
+    if method == "post":
+        response = await async_client.post(
+            "/api/api-keys/",
+            json={"name": "native-only-reasoning", "enforcedReasoningEffort": "ultra"},
+        )
+    else:
+        created = await async_client.post(
+            "/api/api-keys/",
+            json={"name": "native-only-reasoning-update"},
+        )
+        assert created.status_code == 200
+        response = await async_client.patch(
+            f"/api/api-keys/{created.json()['id']}",
+            json={"enforcedReasoningEffort": "ultra"},
+        )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

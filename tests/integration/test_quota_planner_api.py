@@ -478,6 +478,131 @@ async def test_quota_planner_warm_now_executes_when_explicitly_gated(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_quota_planner_probe_parses_gpt56_cache_write_tokens(monkeypatch, db_setup):
+    del db_setup
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc-warm-cache-write-parser",
+        chatgpt_account_id="chatgpt-warm-cache-write-parser",
+        email="warm-cache-write-parser@example.test",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access"),
+        refresh_token_encrypted=encryptor.encrypt("refresh"),
+        id_token_encrypted=encryptor.encrypt("id"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+    )
+
+    async def fake_stream(*args, **kwargs):
+        del args, kwargs
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp-quota-cache-write",'
+            '"status":"completed","usage":{"input_tokens":100,"output_tokens":10,"total_tokens":110,'
+            '"input_tokens_details":{"cached_tokens":20,"cache_write_tokens":30}}}}\n\n'
+        )
+
+    monkeypatch.setattr("app.modules.quota_planner.warmup.stream_responses", fake_stream)
+
+    async with SessionLocal() as session:
+        usage = await QuotaWarmupService(session)._send_warmup_probe(
+            account=account,
+            model="gpt-5.6-sol",
+            request_id="req-quota-cache-write",
+        )
+
+    assert usage == WarmupUsage(
+        input_tokens=100,
+        output_tokens=10,
+        cached_input_tokens=20,
+        reasoning_tokens=None,
+        cache_write_input_tokens=30,
+    )
+
+
+@pytest.mark.asyncio
+async def test_quota_planner_warm_now_settles_and_logs_gpt56_cache_write_cost(monkeypatch, db_setup):
+    del db_setup
+    encryptor = TokenEncryptor()
+    finalized: list[tuple[str, dict[str, object]]] = []
+
+    async with SessionLocal() as session:
+        account = Account(
+            id="acc-warm-cache-write-settlement",
+            chatgpt_account_id="chatgpt-warm-cache-write-settlement",
+            email="warm-cache-write-settlement@example.test",
+            plan_type="plus",
+            access_token_encrypted=encryptor.encrypt("access"),
+            refresh_token_encrypted=encryptor.encrypt("refresh"),
+            id_token_encrypted=encryptor.encrypt("id"),
+            last_refresh=utcnow(),
+            status=AccountStatus.ACTIVE,
+        )
+        session.add(account)
+        repo = QuotaPlannerRepository(session)
+        await repo.upsert_settings(
+            PlannerSettings(
+                mode="auto",
+                allow_synthetic_traffic=True,
+                dry_run=False,
+                max_warmup_credits_per_day=1.0,
+                warmup_model_preference="gpt-5.6-sol",
+            )
+        )
+        service = QuotaWarmupService(session)
+
+        class FakeApiKeys:
+            async def enforce_limits_for_request(self, *args, **kwargs):
+                del args, kwargs
+                return SimpleNamespace(reservation_id="reservation-cache-write")
+
+            async def finalize_usage_reservation(self, reservation_id, **kwargs):
+                finalized.append((reservation_id, kwargs))
+
+        async def fake_send(self, *, account, model, request_id):
+            del self, account, model, request_id
+            return WarmupUsage(
+                input_tokens=100,
+                output_tokens=10,
+                cached_input_tokens=20,
+                reasoning_tokens=None,
+                cache_write_input_tokens=30,
+            )
+
+        async def noop_record_effect(self, account, model, *, source, confidence):
+            del self, account, model, source, confidence
+
+        monkeypatch.setattr(service, "_api_keys", FakeApiKeys())
+        monkeypatch.setattr(QuotaWarmupService, "_send_warmup_probe", fake_send)
+        monkeypatch.setattr(QuotaWarmupService, "_record_warmup_effect", noop_record_effect)
+
+        result = await service.warm_now(
+            account_id=account.id,
+            model="gpt-5.6-sol",
+            api_key_id="api-key-cache-write",
+            force_probe=True,
+        )
+
+        log = await session.scalar(select(RequestLog).where(RequestLog.request_id == result.request_id))
+
+    assert result.status == "executed"
+    assert finalized == [
+        (
+            "reservation-cache-write",
+            {
+                "model": "gpt-5.6-sol",
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "cached_input_tokens": 20,
+                "cache_write_input_tokens": 30,
+            },
+        )
+    ]
+    assert log is not None
+    expected_cost = ((50 * 5.0) + (20 * 0.5) + (30 * 6.25) + (10 * 30.0)) / 1_000_000
+    assert log.cost_usd == pytest.approx(expected_cost)
+
+
+@pytest.mark.asyncio
 async def test_quota_planner_warm_now_ignores_failed_effect_after_prior_observed(monkeypatch, async_client, db_setup):
     del db_setup
     encryptor = TokenEncryptor()

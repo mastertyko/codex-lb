@@ -11,7 +11,8 @@ AUTOMATION_SCHEDULE_TYPES = ("daily",)
 AUTOMATION_WEEKDAY_CODES = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 AUTOMATION_RUN_STATUSES = ("running", "success", "failed", "partial")
 AUTOMATION_RUN_TRIGGERS = ("scheduled", "manual")
-AUTOMATION_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+AUTOMATION_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+_AUTOMATION_REASONING_EFFORT_PATTERN = rf"(?i)^({'|'.join(AUTOMATION_REASONING_EFFORTS)})$"
 
 AutomationWeekday = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -42,7 +43,7 @@ class AutomationJobCreateRequest(DashboardModel):
     include_paused_accounts: bool = Field(default=False, alias="includePausedAccounts")
     schedule: AutomationScheduleRequest
     model: str = Field(min_length=1)
-    reasoning_effort: str | None = Field(default=None, pattern=r"(?i)^(minimal|low|medium|high|xhigh)$")
+    reasoning_effort: str | None = Field(default=None, pattern=_AUTOMATION_REASONING_EFFORT_PATTERN)
     prompt: str | None = Field(default=None, max_length=1000)
     account_ids: list[str] = Field(default_factory=list, max_length=128, alias="accountIds")
 
@@ -61,7 +62,7 @@ class AutomationJobUpdateRequest(DashboardModel):
     include_paused_accounts: bool | None = Field(default=None, alias="includePausedAccounts")
     schedule: AutomationScheduleRequest | None = None
     model: str | None = Field(default=None, min_length=1)
-    reasoning_effort: str | None = Field(default=None, pattern=r"(?i)^(minimal|low|medium|high|xhigh)$")
+    reasoning_effort: str | None = Field(default=None, pattern=_AUTOMATION_REASONING_EFFORT_PATTERN)
     prompt: str | None = Field(default=None, max_length=1000)
     account_ids: list[str] | None = Field(default=None, max_length=128, alias="accountIds")
 

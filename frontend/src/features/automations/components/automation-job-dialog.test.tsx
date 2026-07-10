@@ -308,7 +308,7 @@ describe("AutomationJobDialog", () => {
     expect(screen.getByLabelText("Prompt")).toHaveValue("new prompt");
   });
 
-  it("submits a user-selected reasoning effort on create", async () => {
+  it("submits max reasoning without advertising native-only ultra", async () => {
     server.use(
       http.get("/api/accounts", () =>
         HttpResponse.json({
@@ -336,7 +336,7 @@ describe("AutomationJobDialog", () => {
             id: "gpt-5.4",
             name: "GPT 5.4",
             sourceOnly: false,
-            supportedReasoningEfforts: ["low", "medium", "high"],
+            supportedReasoningEfforts: ["low", "medium", "high", "max"],
             defaultReasoningEffort: "medium",
           },
         ]}
@@ -348,13 +348,10 @@ describe("AutomationJobDialog", () => {
     );
 
     const nameInput = screen.getByLabelText("Name");
-    await user.type(nameInput, "Create automation with low reasoning");
+    await user.type(nameInput, "Create automation with max reasoning");
     await user.click(screen.getByLabelText("Reasoning effort"));
-    const lowOptionLabel = (await screen.findAllByText("Low")).find((node) => node.closest("[role='option']") !== null);
-    if (!lowOptionLabel) {
-      throw new Error("Visible Low reasoning option not found");
-    }
-    await user.click(lowOptionLabel.closest("[role='option']") as HTMLElement);
+    expect(screen.queryByRole("option", { name: "Ultra" })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("option", { name: "Max" }));
     await user.click(screen.getByRole("button", { name: "Create automation" }));
 
     await waitFor(() => {
@@ -362,9 +359,78 @@ describe("AutomationJobDialog", () => {
     });
 
     expect(onCreate.mock.calls[0][0]).toMatchObject({
-      name: "Create automation with low reasoning",
+      name: "Create automation with max reasoning",
       model: "gpt-5.4",
-      reasoningEffort: "low",
+      reasoningEffort: "max",
     });
+  });
+
+  it("updates an existing automation to max reasoning", async () => {
+    server.use(
+      http.get("/api/accounts", () =>
+        HttpResponse.json({
+          accounts: [
+            createAccountSummary({
+              accountId: "acc_primary",
+              email: "primary@example.com",
+              displayName: "Primary account",
+            }),
+          ],
+        }),
+      ),
+    );
+
+    const user = userEvent.setup();
+    const onUpdate = vi.fn().mockResolvedValue(undefined);
+    const editingJob: AutomationJob = {
+      id: "job_max_reasoning",
+      name: "Max reasoning job",
+      enabled: true,
+      includePausedAccounts: false,
+      schedule: {
+        type: "daily",
+        time: "05:00",
+        timezone: "UTC",
+        thresholdMinutes: 0,
+        days: ["mon", "tue", "wed", "thu", "fri"],
+      },
+      model: "gpt-5.6-sol",
+      reasoningEffort: "medium",
+      prompt: "ping",
+      accountScopeAll: false,
+      accountIds: ["acc_primary"],
+      nextRunAt: null,
+      lastRun: null,
+    };
+
+    renderWithProviders(
+      <AutomationJobDialog
+        open
+        busy={false}
+        editingJob={editingJob}
+        models={[
+          {
+            id: "gpt-5.6-sol",
+            name: "GPT-5.6 Sol",
+            sourceOnly: false,
+            supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+            defaultReasoningEffort: "low",
+          },
+        ]}
+        modelsLoading={false}
+        onOpenChange={vi.fn()}
+        onCreate={vi.fn().mockResolvedValue(undefined)}
+        onUpdate={onUpdate}
+      />,
+    );
+
+    await user.click(screen.getByLabelText("Reasoning effort"));
+    await user.click(await screen.findByRole("option", { name: "Max" }));
+    await user.click(screen.getByRole("button", { name: "Save changes" }));
+
+    await waitFor(() => {
+      expect(onUpdate).toHaveBeenCalledTimes(1);
+    });
+    expect(onUpdate.mock.calls[0][1].reasoningEffort).toBe("max");
   });
 });

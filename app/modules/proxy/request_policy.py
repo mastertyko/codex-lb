@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 
 from pydantic import ValidationError
 
 from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.exceptions import ProxyModelNotAllowed
 from app.core.openai.exceptions import ClientPayloadError
-from app.core.openai.model_registry import ModelRegistry, get_model_registry
+from app.core.openai.model_registry import ModelRegistry, get_model_registry, resolve_known_model_alias
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesReasoning, ResponsesRequest
 from app.core.openai.strict_schema import (
     validate_strict_function_tool_schema,
@@ -36,7 +37,15 @@ _DEFAULT_REASONING_EFFORT_FALLBACK = "low"
 # slug plus request fields, not those synthetic suffixes in the model name.
 # Keep this deliberately narrow: only strip known Cursor-style suffix tokens
 # from known GPT-5 base model slugs, and leave every other model untouched.
+_GPT56_ALIAS_BASE_MODELS: tuple[str, ...] = (
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.6",
+)
+_GPT56_CANONICAL_MODELS: frozenset[str] = frozenset(_GPT56_ALIAS_BASE_MODELS[:3])
 _GPT5_ALIAS_BASE_MODELS: tuple[str, ...] = (
+    *_GPT56_ALIAS_BASE_MODELS,
     "gpt-5.4-mini",
     "gpt-5.3-codex",
     "gpt-5.2-codex",
@@ -59,19 +68,24 @@ _MODEL_ALIAS_REASONING_TOKENS: dict[str, str] = {
     "xhigh": "high",
     "extra": "high",
 }
-_MODEL_ALIAS_REASONING_RANK: dict[str, int] = {"minimal": 0, "low": 1, "medium": 2, "high": 3}
+_GPT56_MODEL_ALIAS_REASONING_TOKENS: dict[str, str] = {
+    **_MODEL_ALIAS_REASONING_TOKENS,
+    "xhigh": "xhigh",
+    "max": "max",
+}
+_MODEL_ALIAS_REASONING_RANK: dict[str, int] = {
+    "minimal": 0,
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 4,
+    "max": 5,
+}
 _MODEL_ALIAS_SERVICE_TIER_TOKENS: dict[str, str] = {
     "fast": "priority",
     "priority": "priority",
 }
 _MODEL_ALIAS_IGNORED_TOKENS: frozenset[str] = frozenset({"reasoning", "thinking"})
-_MODEL_ALIAS_TOKENS: frozenset[str] = frozenset(
-    {
-        *tuple(_MODEL_ALIAS_REASONING_TOKENS),
-        *tuple(_MODEL_ALIAS_SERVICE_TIER_TOKENS),
-        *tuple(_MODEL_ALIAS_IGNORED_TOKENS),
-    }
-)
 
 # Service tier values codex-lb accepts at the API-key surface but that the
 # ChatGPT/Codex backend rejects with ``Unsupported service_tier: <value>``.
@@ -229,6 +243,14 @@ def resolve_model_alias(model: str | None) -> str | None:
     return alias[0]
 
 
+def is_known_subscription_model_alias(model: str | None) -> bool:
+    alias = _resolve_model_alias_parts(model)
+    if alias is None or not isinstance(model, str):
+        return False
+    canonical_model = alias[0]
+    return canonical_model in _GPT56_CANONICAL_MODELS and model.strip().lower() != canonical_model
+
+
 def normalize_upstream_model_alias(payload: ResponsesRequest | ResponsesCompactRequest) -> None:
     requested_model = payload.model
     alias = _resolve_model_alias_parts(requested_model)
@@ -281,24 +303,47 @@ def _resolve_model_alias_parts(model: str | None) -> tuple[str, str | None, str 
     if not normalized:
         return None
 
+    exact_alias = resolve_known_model_alias(normalized)
+    if exact_alias is not None:
+        return exact_alias, None, None
+
     for base_model in _GPT5_ALIAS_BASE_MODELS:
         prefix = f"{base_model}-"
         if not normalized.startswith(prefix):
             continue
         suffix = normalized[len(prefix) :]
         tokens = [token for token in suffix.split("-") if token]
-        if not tokens or any(token not in _MODEL_ALIAS_TOKENS for token in tokens):
+        reasoning_tokens = (
+            _GPT56_MODEL_ALIAS_REASONING_TOKENS
+            if base_model in _GPT56_ALIAS_BASE_MODELS
+            else _MODEL_ALIAS_REASONING_TOKENS
+        )
+        allowed_tokens = {
+            *reasoning_tokens,
+            *_MODEL_ALIAS_SERVICE_TIER_TOKENS,
+            *_MODEL_ALIAS_IGNORED_TOKENS,
+        }
+        if not tokens or any(token not in allowed_tokens for token in tokens):
             return None
-        return base_model, _resolve_alias_reasoning_effort(tokens), _resolve_alias_service_tier(tokens)
+        canonical_model = resolve_known_model_alias(base_model) or base_model
+        return (
+            canonical_model,
+            _resolve_alias_reasoning_effort(tokens, reasoning_tokens=reasoning_tokens),
+            _resolve_alias_service_tier(tokens),
+        )
 
     return None
 
 
-def _resolve_alias_reasoning_effort(tokens: list[str]) -> str | None:
+def _resolve_alias_reasoning_effort(
+    tokens: list[str],
+    *,
+    reasoning_tokens: Mapping[str, str],
+) -> str | None:
     selected: str | None = None
     selected_rank = -1
     for token in tokens:
-        effort = _MODEL_ALIAS_REASONING_TOKENS.get(token)
+        effort = reasoning_tokens.get(token)
         if effort is None:
             continue
         rank = _MODEL_ALIAS_REASONING_RANK[effort]

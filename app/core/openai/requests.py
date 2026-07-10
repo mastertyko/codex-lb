@@ -284,6 +284,8 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
     input_value = data.get("input")
     if not is_json_list(input_value):
         return data
+    if _is_responses_lite_input(input_value):
+        return data
 
     instruction_parts: list[str] = []
     input_items: list[JsonValue] = []
@@ -293,8 +295,7 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
         if item_mapping is None:
             input_items.append(item)
             continue
-        role = item_mapping.get("role")
-        if role not in ("system", "developer"):
+        if not _is_responses_instruction_message_item(item_mapping):
             input_items.append(item)
             continue
         instruction_text, preserved_content = _split_responses_instruction_item_content(item_mapping)
@@ -319,6 +320,29 @@ def _normalize_responses_input_instructions(data: JsonValue) -> JsonValue:
     normalized["instructions"] = merged_instructions
     normalized["input"] = input_items
     return normalized
+
+
+def _is_responses_lite_input(input_value: list[JsonValue]) -> bool:
+    # Responses Lite requests carry their tool bundle as an input item with
+    # type=additional_tools and deliberately place base instructions as a
+    # developer message in input (with empty top-level instructions). That
+    # shape is exactly what the lite upstream expects, so the instruction
+    # lift must leave the whole request untouched.
+    return any(
+        (mapping := _json_mapping_or_none(item)) is not None and mapping.get("type") == "additional_tools"
+        for item in input_value
+    )
+
+
+def _is_responses_instruction_message_item(item: Mapping[str, JsonValue]) -> bool:
+    role = item.get("role")
+    if role not in ("system", "developer"):
+        return False
+    item_type = item.get("type")
+    # Responses Lite encodes tool declarations as developer input items with
+    # type=additional_tools. Only role messages should be folded into the
+    # top-level instructions field.
+    return item_type is None or item_type == "message"
 
 
 def _merge_responses_instructions(existing: str, extra_parts: list[str]) -> str:
@@ -706,6 +730,7 @@ class ResponsesCompactRequest(BaseModel):
 _UNSUPPORTED_UPSTREAM_FIELDS = {
     "max_output_tokens",
     "metadata",
+    "prompt_cache_options",
     "prompt_cache_retention",
     "safety_identifier",
     "temperature",
@@ -724,11 +749,41 @@ def _strip_unsupported_fields(payload: MutableJsonObject) -> MutableJsonObject:
     _normalize_openai_compatible_aliases(payload)
     _normalize_service_tier_aliases(payload)
     _sanitize_interleaved_reasoning_input(payload)
+    _strip_platform_prompt_cache_breakpoints(payload)
     _strip_poisoned_local_compact_fallback_items(payload)
     _canonicalize_tools(payload)
     for key in _UNSUPPORTED_UPSTREAM_FIELDS:
         payload.pop(key, None)
     return payload
+
+
+def _strip_platform_prompt_cache_breakpoints(payload: MutableJsonObject) -> None:
+    """Remove Platform-only explicit-cache markers before subscription upstream.
+
+    The ChatGPT/Codex backend rejects ``prompt_cache_options`` and does not
+    terminate requests carrying content-block ``prompt_cache_breakpoint``.
+    ``prompt_cache_key`` remains supported and is intentionally preserved.
+    """
+
+    input_value = payload.get("input")
+    if input_value is not None:
+        payload["input"] = _without_prompt_cache_breakpoints(input_value)
+
+
+_PROMPT_CACHE_BREAKPOINT_CONTENT_TYPES = frozenset({"input_file", "input_image", "input_text"})
+
+
+def _without_prompt_cache_breakpoints(value: JsonValue) -> JsonValue:
+    if is_json_mapping(value):
+        strip_breakpoint = value.get("type") in _PROMPT_CACHE_BREAKPOINT_CONTENT_TYPES
+        return {
+            key: _without_prompt_cache_breakpoints(child)
+            for key, child in value.items()
+            if key != "prompt_cache_breakpoint" or not strip_breakpoint
+        }
+    if is_json_list(value):
+        return [_without_prompt_cache_breakpoints(child) for child in value]
+    return value
 
 
 def _strip_poisoned_local_compact_fallback_items(payload: MutableJsonObject) -> None:
@@ -868,6 +923,15 @@ def _compact_state_anchor_indices(input_value: list[JsonValue]) -> set[int]:
         if not is_json_mapping(item):
             continue
         item_mapping = item
+        if item_mapping.get("type") == "additional_tools":
+            preserved_indices.add(index)
+            developer_index = index + 1
+            if developer_index < len(input_value):
+                developer_item = input_value[developer_index]
+                if is_json_mapping(developer_item) and developer_item.get("role") == "developer":
+                    developer_type = developer_item.get("type")
+                    if developer_type is None or developer_type == "message":
+                        preserved_indices.add(developer_index)
         if _compact_item_is_state_anchor(item_mapping):
             preserved_indices.add(index)
             call_id = item_mapping.get("call_id")

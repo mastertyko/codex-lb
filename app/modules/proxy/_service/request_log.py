@@ -8,6 +8,7 @@ from typing import Protocol, cast
 import anyio
 
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, proxy_phase_latency_seconds
+from app.core.usage.logs import calculated_cost_from_token_counts
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy.affinity import _extract_model_class
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
@@ -49,6 +50,25 @@ def _normalize_session_id(session_id: str | None) -> str | None:
         return None
     stripped = session_id.strip()
     return stripped or None
+
+
+def _cost_with_cache_writes(
+    *,
+    model: str | None,
+    input_tokens: int | None,
+    output_tokens: int | None,
+    cached_input_tokens: int | None,
+    cache_write_input_tokens: int | None,
+    service_tier: str | None,
+) -> float | None:
+    return calculated_cost_from_token_counts(
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_input_tokens=cached_input_tokens,
+        cache_write_input_tokens=cache_write_input_tokens,
+        service_tier=service_tier,
+    )
 
 
 class _RequestLogMixin:
@@ -121,6 +141,7 @@ class _RequestLogMixin:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cache_write_input_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         reasoning_effort: str | None = None,
         transport: str | None = None,
@@ -146,6 +167,14 @@ class _RequestLogMixin:
         client_ip: str | None = None,
         archive_request_id: str | None = None,
     ) -> None:
+        cost_usd = _cost_with_cache_writes(
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_input_tokens=cached_input_tokens,
+            cache_write_input_tokens=cache_write_input_tokens,
+            service_tier=service_tier,
+        )
         task = asyncio.create_task(
             self._persist_request_log(
                 account_id=account_id,
@@ -170,6 +199,7 @@ class _RequestLogMixin:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
+                cost_usd=cost_usd,
                 reasoning_tokens=reasoning_tokens,
                 reasoning_effort=reasoning_effort,
                 transport=transport,
@@ -297,6 +327,7 @@ class _RequestLogMixin:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cost_usd: float | None = None,
         reasoning_tokens: int | None = None,
         reasoning_effort: str | None = None,
         transport: str | None = None,
@@ -334,6 +365,7 @@ class _RequestLogMixin:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
+                    cost_usd=cost_usd,
                     reasoning_tokens=reasoning_tokens,
                     reasoning_effort=reasoning_effort,
                     transport=transport,

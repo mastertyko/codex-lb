@@ -6,6 +6,8 @@ from pydantic import Field
 
 from app.modules.shared.schemas import DashboardModel
 
+_REASONING_EFFORT_PATTERN = r"(?i)^(none|minimal|low|medium|high|xhigh|max)$"
+
 
 class LimitRuleCreate(DashboardModel):
     limit_type: str = Field(pattern=r"^(total_tokens|input_tokens|output_tokens|cost_usd|credits)$")
@@ -29,7 +31,7 @@ class ApiKeyCreateRequest(DashboardModel):
     allowed_models: list[str] | None = None
     apply_to_codex_model: bool = False
     enforced_model: str | None = Field(default=None, min_length=1)
-    enforced_reasoning_effort: str | None = Field(default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh)$")
+    enforced_reasoning_effort: str | None = Field(default=None, pattern=_REASONING_EFFORT_PATTERN)
     enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
     traffic_class: str | None = Field(default=None, pattern=r"(?i)^(foreground|opportunistic)$")
     transport_policy_override: str | None = None
@@ -46,7 +48,7 @@ class ApiKeyUpdateRequest(DashboardModel):
     allowed_models: list[str] | None = None
     apply_to_codex_model: bool | None = None
     enforced_model: str | None = Field(default=None, min_length=1)
-    enforced_reasoning_effort: str | None = Field(default=None, pattern=r"(?i)^(none|minimal|low|medium|high|xhigh)$")
+    enforced_reasoning_effort: str | None = Field(default=None, pattern=_REASONING_EFFORT_PATTERN)
     enforced_service_tier: str | None = Field(default=None, pattern=r"(?i)^(auto|default|priority|flex|fast)$")
     traffic_class: str | None = Field(default=None, pattern=r"(?i)^(foreground|opportunistic)$")
     transport_policy_override: str | None = None

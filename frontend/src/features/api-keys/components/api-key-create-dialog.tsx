@@ -30,6 +30,7 @@ import { UsageSectionsMultiSelect } from "@/features/api-keys/components/usage-s
 import { ModelSourceMultiSelect } from "@/features/model-sources/components/model-source-multi-select";
 import type {
   ApiKeyCreateRequest,
+  ApiKeyReasoningEffort,
   LimitRuleCreate,
   ServiceTierType,
   TrafficClass,
@@ -70,7 +71,7 @@ type ApiKeyCreateDraft = {
   limitRules: LimitRuleCreate[];
   expiresAt: Date | null;
   enforcedModel: string;
-  enforcedReasoningEffort: string;
+  enforcedReasoningEffort: ApiKeyReasoningEffort;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
   transportPolicyOverride: TransportPolicyOverride | null;
@@ -120,7 +121,7 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
       enforcedReasoningEffort:
         draft.enforcedReasoningEffort === "none"
           ? null
-          : draft.enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
+          : draft.enforcedReasoningEffort,
       enforcedServiceTier: draft.enforcedServiceTier === "none" ? null : draft.enforcedServiceTier as ServiceTierType,
       trafficClass: draft.trafficClass,
       transportPolicyOverride: draft.transportPolicyOverride,
@@ -205,7 +206,12 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
 
             <div className="space-y-1">
               <label htmlFor="create-api-key-enforced-reasoning" className="text-sm font-medium">Enforced reasoning</label>
-              <Select value={draft.enforcedReasoningEffort} onValueChange={(enforcedReasoningEffort) => updateDraft({ enforcedReasoningEffort })}>
+              <Select
+                value={draft.enforcedReasoningEffort}
+                onValueChange={(value) =>
+                  updateDraft({ enforcedReasoningEffort: value as ApiKeyReasoningEffort })
+                }
+              >
                 <SelectTrigger id="create-api-key-enforced-reasoning">
                   <SelectValue placeholder="None" />
                 </SelectTrigger>
@@ -216,6 +222,7 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
                   <SelectItem value="medium">Medium</SelectItem>
                   <SelectItem value="high">High</SelectItem>
                   <SelectItem value="xhigh">XHigh</SelectItem>
+                  <SelectItem value="max">Max</SelectItem>
                 </SelectContent>
               </Select>
             </div>

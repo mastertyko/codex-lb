@@ -876,6 +876,7 @@ class ApiKeysService:
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        cache_write_input_tokens: int = 0,
         service_tier: str | None = None,
         cost_microdollars: int | None = None,
     ) -> None:
@@ -887,6 +888,7 @@ class ApiKeysService:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_input_tokens=cache_write_input_tokens,
                     service_tier=service_tier,
                     status="finalized",
                     cost_microdollars_override=cost_microdollars,
@@ -908,6 +910,7 @@ class ApiKeysService:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cache_write_input_tokens: int | None = None,
         service_tier: str | None = None,
     ) -> None:
         for attempt in range(_SQLITE_BUSY_RETRY_ATTEMPTS):
@@ -918,6 +921,7 @@ class ApiKeysService:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_input_tokens=cache_write_input_tokens,
                     service_tier=service_tier,
                     status="failed",
                 )
@@ -938,6 +942,7 @@ class ApiKeysService:
         input_tokens: int | None,
         output_tokens: int | None,
         cached_input_tokens: int | None,
+        cache_write_input_tokens: int | None,
         service_tier: str | None,
         status: str,
         cost_microdollars_override: int | None = None,
@@ -959,6 +964,7 @@ class ApiKeysService:
             effective_input_tokens = input_tokens or 0
             effective_output_tokens = output_tokens or 0
             effective_cached_input_tokens = cached_input_tokens or 0
+            effective_cache_write_input_tokens = cache_write_input_tokens or 0
             cost_microdollars = (
                 cost_microdollars_override
                 if cost_microdollars_override is not None
@@ -968,6 +974,7 @@ class ApiKeysService:
                     effective_output_tokens,
                     effective_cached_input_tokens,
                     service_tier,
+                    effective_cache_write_input_tokens,
                 )
             )
 
@@ -1082,6 +1089,7 @@ class ApiKeysService:
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        cache_write_input_tokens: int = 0,
         service_tier: str | None = None,
     ) -> None:
         cost_microdollars = _calculate_cost_microdollars(
@@ -1090,6 +1098,7 @@ class ApiKeysService:
             output_tokens,
             cached_input_tokens,
             service_tier,
+            cache_write_input_tokens,
         )
         await self._repository.increment_limit_usage(
             key_id,
@@ -1322,7 +1331,7 @@ def _normalize_model_slug(value: str | None) -> str | None:
     return normalized
 
 
-_SUPPORTED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh"})
+_SUPPORTED_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max"})
 _SUPPORTED_SERVICE_TIERS = frozenset({"auto", "default", "priority", "flex"})
 
 
@@ -1804,6 +1813,7 @@ def _calculate_cost_microdollars(
     output_tokens: int,
     cached_input_tokens: int,
     service_tier: str | None = None,
+    cache_write_input_tokens: int = 0,
 ) -> int:
     resolved = get_pricing_for_model(model)
     if resolved is None:
@@ -1813,6 +1823,7 @@ def _calculate_cost_microdollars(
         input_tokens=float(input_tokens),
         output_tokens=float(output_tokens),
         cached_input_tokens=float(cached_input_tokens),
+        cache_write_input_tokens=float(cache_write_input_tokens),
     )
     cost_usd = calculate_cost_from_usage(usage, price, service_tier=service_tier)
     if cost_usd is None:

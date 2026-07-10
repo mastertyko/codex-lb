@@ -8,6 +8,9 @@ from app.core.types import JsonValue
 pytestmark = pytest.mark.integration
 
 BOOTSTRAP_MODEL_SLUGS = {
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
     "gpt-5.5",
     "gpt-5.4",
     "gpt-5.4-mini",
@@ -35,6 +38,9 @@ EXPECTED_CORE_MODEL_PLANS = {
 }
 
 EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS = {
+    "gpt-5.6-sol": "0.144.0",
+    "gpt-5.6-terra": "0.144.0",
+    "gpt-5.6-luna": "0.144.0",
     "gpt-5.5": "0.124.0",
     "gpt-5.4": "0.98.0",
     "gpt-5.4-mini": "0.98.0",
@@ -164,6 +170,28 @@ async def test_v1_models_uses_bootstrap_models_when_registry_not_populated(async
     ids = {item["id"] for item in payload["data"]}
     assert ids == BOOTSTRAP_MODEL_SLUGS
     assert "gpt-5.5-pro" not in ids
+    assert "gpt-5.6" not in ids
+
+
+@pytest.mark.asyncio
+async def test_v1_models_exposes_gpt56_backend_and_output_budgets(async_client):
+    registry = get_model_registry()
+    registry._snapshot = None
+
+    resp = await async_client.get("/v1/models")
+
+    assert resp.status_code == 200
+    entries = {entry["id"]: entry for entry in resp.json()["data"]}
+    for slug in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
+        entry = entries[slug]
+        assert entry["metadata"]["context_window"] == 372_000
+        assert entry["metadata"]["input_context_window"] == 372_000
+        assert entry["metadata"]["max_output_tokens"] == 128_000
+        assert entry["context_length"] == 372_000
+        assert entry["contextLength"] == 372_000
+        assert entry["max_output_tokens"] == 128_000
+        assert entry["maxOutputTokens"] == 128_000
+        assert entry["capabilities"]["max_output_tokens"] == 128_000
 
 
 @pytest.mark.asyncio
@@ -178,6 +206,32 @@ async def test_backend_codex_models_uses_bootstrap_upstream_metadata(async_clien
     assert set(entries) == set(EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS)
     for slug, expected_version in EXPECTED_BOOTSTRAP_MINIMAL_CLIENT_VERSIONS.items():
         assert entries[slug]["minimal_client_version"] == expected_version
+
+    expected_gpt56 = {
+        "gpt-5.6-sol": ("low", 1, ["low", "medium", "high", "xhigh", "max", "ultra"], "v2"),
+        "gpt-5.6-terra": ("medium", 2, ["low", "medium", "high", "xhigh", "max", "ultra"], "v2"),
+        "gpt-5.6-luna": ("medium", 3, ["low", "medium", "high", "xhigh", "max"], "v1"),
+    }
+    for slug, (default_effort, priority, efforts, multi_agent_version) in expected_gpt56.items():
+        entry = entries[slug]
+        assert entry["context_window"] == 372_000
+        assert entry["max_context_window"] == 372_000
+        assert entry["default_reasoning_level"] == default_effort
+        assert entry["priority"] == priority
+        assert [level["effort"] for level in entry["supported_reasoning_levels"]] == efforts
+        assert entry["prefer_websockets"] is True
+        assert entry["additional_speed_tiers"] == ["fast"]
+        assert entry["service_tiers"] == [
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            }
+        ]
+        assert entry["tool_mode"] == "code_mode_only"
+        assert entry["multi_agent_version"] == multi_agent_version
+        assert entry["use_responses_lite"] is True
+        assert entry["supports_image_detail_original"] is True
 
     gpt54 = entries["gpt-5.4"]
     assert gpt54["minimal_client_version"] == "0.98.0"

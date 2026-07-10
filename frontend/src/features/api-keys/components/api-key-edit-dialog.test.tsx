@@ -121,6 +121,31 @@ describe("ApiKeyEditDialog", () => {
     expect(onSubmit.mock.calls[0][0].transportPolicyOverride).toBeNull();
   });
 
+  it("submits max reasoning without advertising native-only ultra", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+
+    renderWithProviders(
+      <ApiKeyEditDialog
+        open
+        busy={false}
+        apiKey={createApiKey()}
+        onOpenChange={vi.fn()}
+        onSubmit={onSubmit}
+      />,
+    );
+
+    await user.click(screen.getByRole("combobox", { name: "Enforced reasoning" }));
+    expect(screen.queryByRole("option", { name: "Ultra" })).not.toBeInTheDocument();
+    await user.click(await screen.findByRole("option", { name: "Max" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+    });
+    expect(onSubmit.mock.calls[0][0].enforcedReasoningEffort).toBe("max");
+  });
+
   it("includes limits when actual limit values change", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);

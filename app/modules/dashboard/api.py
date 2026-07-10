@@ -42,7 +42,9 @@ async def list_models() -> dict:
     models_by_slug = registry.get_models_with_fallback()
     if not models_by_slug:
         return {"models": []}
-    allowed_efforts = {"minimal", "low", "medium", "high", "xhigh"}
+    # Codex-native ``ultra`` enables client-side multi-agent behavior and is
+    # intentionally not a server-forwarded dashboard policy value.
+    allowed_efforts = {"minimal", "low", "medium", "high", "xhigh", "max"}
 
     def _normalize_effort(value: str | None) -> str | None:
         if not isinstance(value, str):

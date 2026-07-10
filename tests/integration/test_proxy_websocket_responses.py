@@ -10,6 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import app.modules.proxy._service.websocket.mixin as websocket_mixin_module
 import app.modules.proxy.api as proxy_api_module
 import app.modules.proxy.service as proxy_module
 from app.core.utils.request_id import get_request_id
@@ -617,7 +618,12 @@ def test_backend_responses_websocket_proxies_upstream_and_persists_log(app_insta
                         "object": "response",
                         "status": "completed",
                         "service_tier": "fast",
-                        "usage": {"input_tokens": 3, "output_tokens": 5, "total_tokens": 8},
+                        "usage": {
+                            "input_tokens": 3,
+                            "output_tokens": 5,
+                            "total_tokens": 8,
+                            "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 1},
+                        },
                     },
                 },
                 separators=(",", ":"),
@@ -677,14 +683,14 @@ def test_backend_responses_websocket_proxies_upstream_and_persists_log(app_insta
 
     request_payload = {
         "type": "response.create",
-        "model": "gpt-5.4",
+        "model": "gpt-5.6",
         "instructions": "",
         "client_metadata": {
             "x-codex-installation-id": "client-installation",
             "x-codex-turn-metadata": '{"turn_id":"turn_123","sandbox":"workspace-write"}',
         },
         "service_tier": "fast",
-        "reasoning": {"effort": "high"},
+        "reasoning": {"effort": "max"},
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
         "stream": True,
     }
@@ -712,16 +718,16 @@ def test_backend_responses_websocket_proxies_upstream_and_persists_log(app_insta
     assert seen["sticky_kind"] == proxy_module.StickySessionKind.CODEX_SESSION
     assert seen["prefer_earlier_reset"] is False
     assert seen["routing_strategy"] == "usage_weighted"
-    assert seen["model"] == "gpt-5.4"
+    assert seen["model"] == "gpt-5.6-sol"
     _assert_upstream_payloads(
         fake_upstream.sent_text,
         [
             {
-                "model": "gpt-5.4",
+                "model": "gpt-5.6-sol",
                 "instructions": "",
                 "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
                 "tools": [],
-                "reasoning": {"effort": "high"},
+                "reasoning": {"effort": "max"},
                 "client_metadata": {"x-codex-turn-metadata": '{"turn_id":"turn_123","sandbox":"workspace-write"}'},
                 "service_tier": "priority",
                 "store": False,
@@ -737,12 +743,1038 @@ def test_backend_responses_websocket_proxies_upstream_and_persists_log(app_insta
     assert log["archive_request_id"] == seen["request_id"]
     assert fake_upstream.sent_text_request_ids == [log["archive_request_id"]]
     assert fake_upstream.archived_receive_request_ids[0] == log["archive_request_id"]
-    assert log["model"] == "gpt-5.4"
+    assert log["model"] == "gpt-5.6-sol"
     assert log["service_tier"] == "priority"
     assert log["transport"] == "websocket"
     assert log["status"] == "success"
     assert log["input_tokens"] == 3
     assert log["output_tokens"] == 5
+    assert log["cached_input_tokens"] == 1
+    assert log["cache_write_input_tokens"] == 1
+
+
+def test_backend_responses_websocket_forwards_responses_lite_tools(app_instance, monkeypatch):
+    upstream_messages = [
+        _FakeUpstreamMessage(
+            "text",
+            text=json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_ws_lite_1", "object": "response", "status": "completed"},
+                },
+                separators=(",", ":"),
+            ),
+        ),
+    ]
+    fake_upstream = _FakeUpstreamWebSocket(upstream_messages)
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        return SimpleNamespace(id="acct_ws_lite", codex_installation_id=None), fake_upstream
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    lite_input = [
+        additional_tools,
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev instructions"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "ls"},
+        {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"},
+    ]
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "client_metadata": {lite_metadata_key: "TRUE"},
+        "input": lite_input,
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={
+                "Authorization": "Bearer external-token",
+                "chatgpt-account-id": "external-account",
+                "session_id": "thread-ws-lite",
+                "openai-beta": "responses_websockets=2026-02-06",
+                "User-Agent": "codex_exec/0.144.0 (Mac OS 27.0.0; arm64) unknown (codex_exec; 0.144.0)",
+            },
+        ) as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            completed = json.loads(websocket.receive_text())
+
+    assert completed["type"] == "response.completed"
+    _assert_upstream_payloads(
+        fake_upstream.sent_text,
+        [
+            {
+                "model": "gpt-5.6-sol",
+                "instructions": "",
+                "input": lite_input,
+                "tools": [],
+                "client_metadata": {lite_metadata_key: "true"},
+                "store": False,
+                "include": [],
+                "type": "response.create",
+            }
+        ],
+    )
+
+
+def test_backend_responses_websocket_strips_non_native_responses_lite_metadata(app_instance, monkeypatch):
+    upstream_messages = [
+        _FakeUpstreamMessage(
+            "text",
+            text=json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_ws_non_native_lite", "object": "response", "status": "completed"},
+                },
+                separators=(",", ":"),
+            ),
+        ),
+    ]
+    fake_upstream = _FakeUpstreamWebSocket(upstream_messages)
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(authorization: str | None, *, request: object | None = None):
+        return None
+
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        return SimpleNamespace(id="acct_ws_non_native_lite", codex_installation_id=None), fake_upstream
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    request_payload = {
+        "type": "response.create",
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "client_metadata": {
+            lite_metadata_key: "true",
+            "keep": "yes",
+        },
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+        "stream": True,
+    }
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers={
+                "Authorization": "Bearer external-token",
+                "chatgpt-account-id": "external-account",
+                "session_id": "thread-ws-non-native-lite",
+                "openai-beta": "responses_websockets=2026-02-06",
+                "User-Agent": "OpenAI/Python 2.24.0",
+            },
+        ) as websocket:
+            websocket.send_text(json.dumps(request_payload))
+            completed = json.loads(websocket.receive_text())
+
+    assert completed["type"] == "response.completed"
+    _assert_upstream_payloads(
+        fake_upstream.sent_text,
+        [
+            {
+                "model": "gpt-5.6-sol",
+                "instructions": "",
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}],
+                "tools": [],
+                "client_metadata": {"keep": "yes"},
+                "store": False,
+                "include": [],
+                "type": "response.create",
+            }
+        ],
+    )
+
+
+def _responses_lite_acceptance_messages(response_id: str) -> list[_FakeUpstreamMessage]:
+    return [
+        _FakeUpstreamMessage(
+            "text",
+            text=json.dumps(
+                {
+                    "type": "response.created",
+                    "response": {"id": response_id, "object": "response", "status": "in_progress"},
+                },
+                separators=(",", ":"),
+            ),
+        ),
+        _FakeUpstreamMessage(
+            "text",
+            text=json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": response_id, "object": "response", "status": "completed"},
+                },
+                separators=(",", ":"),
+            ),
+        ),
+    ]
+
+
+def _responses_lite_sequence_upstream(*response_ids: str) -> _SequencedUpstreamWebSocket:
+    return _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[_responses_lite_acceptance_messages(response_id) for response_id in response_ids],
+    )
+
+
+def _install_responses_lite_sequence_websocket(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_upstream: _FakeUpstreamWebSocket,
+    *,
+    refreshed_api_keys: list[object | None] | None = None,
+) -> dict[str, int]:
+    connect_calls = {"count": 0}
+    refresh_queue = deque(refreshed_api_keys or [])
+
+    class _FakeSettingsCache:
+        async def get(self):
+            return _websocket_settings()
+
+    async def allow_firewall(_websocket):
+        return None
+
+    async def allow_proxy_api_key(authorization: str | None, *, request: object | None = None):
+        del authorization, request
+        return None
+
+    async def fake_connect_proxy_websocket(self, headers, **kwargs):
+        del self, headers, kwargs
+        connect_calls["count"] += 1
+        return SimpleNamespace(id="acct_ws_lite_sequence", codex_installation_id=None), fake_upstream
+
+    async def fake_refresh_websocket_api_key_policy(self, api_key):
+        del self
+        if refresh_queue:
+            return refresh_queue.popleft()
+        return api_key
+
+    async def fake_reserve_websocket_api_key_usage(self, *args, **kwargs):
+        del self, args, kwargs
+        return None
+
+    monkeypatch.setattr(proxy_api_module, "_websocket_firewall_denial_response", allow_firewall)
+    monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", allow_proxy_api_key)
+    monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _FakeSettingsCache())
+    monkeypatch.setattr(proxy_module.ProxyService, "_connect_proxy_websocket", fake_connect_proxy_websocket)
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_refresh_websocket_api_key_policy",
+        fake_refresh_websocket_api_key_policy,
+    )
+    monkeypatch.setattr(
+        proxy_module.ProxyService,
+        "_reserve_websocket_api_key_usage",
+        fake_reserve_websocket_api_key_usage,
+    )
+    return connect_calls
+
+
+def _responses_lite_websocket_headers(
+    session_id: str,
+    *,
+    extra: dict[str, str] | None = None,
+) -> dict[str, str]:
+    headers = {
+        "Authorization": "Bearer external-token",
+        "chatgpt-account-id": "external-account",
+        "session_id": session_id,
+        "openai-beta": "responses_websockets=2026-02-06",
+        "User-Agent": "codex_exec/0.144.0 (Mac OS 27.0.0; arm64) unknown (codex_exec; 0.144.0)",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def test_responses_lite_queued_marker_revalidates_connection_trust_after_admission():
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    marker_only_text = json.dumps(
+        {
+            "type": "response.create",
+            "model": "gpt-5.6-sol",
+            "instructions": "",
+            "client_metadata": {lite_metadata_key: "true", "keep": "yes"},
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+        },
+        separators=(",", ":"),
+    )
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req_ws_lite_queued",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        responses_lite_model="gpt-5.6-sol",
+    )
+    downstream_activity = proxy_module._DownstreamWebSocketActivity()
+
+    revalidated_text = websocket_mixin_module._revalidate_websocket_responses_lite_after_admission(
+        marker_only_text,
+        request_state=request_state,
+        downstream_activity=downstream_activity,
+    )
+
+    assert json.loads(revalidated_text)["client_metadata"] == {"keep": "yes"}
+    assert request_state.responses_lite_model is None
+
+    request_state.responses_lite_model = "gpt-5.6-sol"
+    request_state.replay_count = 1
+    replay_text = websocket_mixin_module._revalidate_websocket_responses_lite_after_admission(
+        marker_only_text,
+        request_state=request_state,
+        downstream_activity=downstream_activity,
+    )
+
+    assert json.loads(replay_text)["client_metadata"] == {lite_metadata_key: "true", "keep": "yes"}
+    assert request_state.responses_lite_model == "gpt-5.6-sol"
+
+    request_state.replay_count = 0
+    request_state.responses_lite_body_derived = True
+    trimmed_body_text = websocket_mixin_module._revalidate_websocket_responses_lite_after_admission(
+        marker_only_text,
+        request_state=request_state,
+        downstream_activity=downstream_activity,
+    )
+
+    assert json.loads(trimmed_body_text)["client_metadata"] == {lite_metadata_key: "true", "keep": "yes"}
+    assert request_state.responses_lite_model == "gpt-5.6-sol"
+
+    downstream_activity.responses_lite_model = "gpt-5.6-sol"
+    downstream_activity.mark_disconnected()
+    assert downstream_activity.disconnected is True
+    assert downstream_activity.responses_lite_model is None
+
+
+def test_backend_responses_websocket_responses_lite_same_model_marker_after_acceptance(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    fake_upstream = _responses_lite_sequence_upstream("resp_ws_lite_seq_full", "resp_ws_lite_seq_follow")
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers("thread-ws-lite-seq-same-model"),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "yes"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            second_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert sent_payloads[0]["model"] == "gpt-5.6-sol"
+    assert sent_payloads[0]["input"][0]["type"] == "additional_tools"
+    assert sent_payloads[0]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[1]["model"] == "gpt-5.6-sol"
+    assert sent_payloads[1]["client_metadata"] == {lite_metadata_key: "true", "keep": "yes"}
+
+
+def test_backend_responses_websocket_responses_lite_trust_does_not_cross_connections(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    fake_upstream = _responses_lite_sequence_upstream("resp_ws_lite_connection_a", "resp_ws_lite_connection_b")
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    headers = _responses_lite_websocket_headers("thread-ws-lite-connection-local")
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect("/backend-api/codex/responses", headers=headers) as first_websocket:
+            first_websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(first_websocket.receive_text()) for _ in range(2)]
+
+        with client.websocket_connect("/backend-api/codex/responses", headers=headers) as second_websocket:
+            second_websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "yes"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            second_events = [json.loads(second_websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 2
+    assert sent_payloads[0]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[1]["client_metadata"] == {"keep": "yes"}
+
+
+def test_backend_responses_websocket_responses_lite_rejection_clears_marker_trust(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    rejected_message = _FakeUpstreamMessage(
+        "text",
+        text=json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_parameter",
+                    "message": "request rejected before response.created",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+    fake_upstream = _SequencedUpstreamWebSocket(
+        [],
+        deferred_message_batches=[
+            _responses_lite_acceptance_messages("resp_ws_lite_before_rejection"),
+            [rejected_message],
+            _responses_lite_acceptance_messages("resp_ws_lite_after_rejection"),
+        ],
+    )
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers("thread-ws-lite-rejection"),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "before-rejection"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "retry"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            rejected_event = json.loads(websocket.receive_text())
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "after-rejection"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            final_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert rejected_event["type"] == "error"
+    assert [event["type"] for event in final_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert sent_payloads[0]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[1]["client_metadata"] == {lite_metadata_key: "true", "keep": "before-rejection"}
+    assert sent_payloads[2]["client_metadata"] == {"keep": "after-rejection"}
+
+
+@pytest.mark.parametrize(
+    "invalid_request_fields",
+    [
+        {"input": [{"type": "input_image", "file_id": "file_local_rejection"}]},
+        {
+            "instructions": [],
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "invalid"}]}],
+        },
+    ],
+    ids=["unsupported-file-id", "validation-error"],
+)
+def test_backend_responses_websocket_responses_lite_local_rejection_clears_marker_trust(
+    app_instance,
+    monkeypatch,
+    invalid_request_fields: dict[str, object],
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    fake_upstream = _responses_lite_sequence_upstream(
+        "resp_ws_lite_before_local_rejection",
+        "resp_ws_lite_after_local_rejection",
+    )
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers("thread-ws-lite-local-rejection"),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "local-rejection"},
+                        **invalid_request_fields,
+                        "stream": True,
+                    }
+                )
+            )
+            rejected_event = json.loads(websocket.receive_text())
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "after-local-rejection"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            final_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert rejected_event["type"] == "error"
+    assert [event["type"] for event in final_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert len(sent_payloads) == 2
+    assert sent_payloads[0]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[1]["client_metadata"] == {"keep": "after-local-rejection"}
+
+
+def test_backend_responses_websocket_responses_lite_sequence_strips_marker_on_model_switch(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    fake_upstream = _responses_lite_sequence_upstream("resp_ws_lite_model_a", "resp_ws_lite_model_b")
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers("thread-ws-lite-seq-model-switch"),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.4",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "yes"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            second_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert sent_payloads[0]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[1]["model"] == "gpt-5.4"
+    assert sent_payloads[1]["client_metadata"] == {"keep": "yes"}
+
+
+def test_backend_responses_websocket_responses_lite_sequence_strips_marker_on_api_key_effective_model_switch(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    refreshed_api_keys: list[object | None] = [
+        SimpleNamespace(
+            id="key_ws_lite_initial",
+            allowed_models=None,
+            enforced_model=None,
+            enforced_reasoning_effort=None,
+            enforced_service_tier=None,
+        ),
+        SimpleNamespace(
+            id="key_ws_lite_switched",
+            allowed_models=None,
+            enforced_model="gpt-5.4",
+            enforced_reasoning_effort=None,
+            enforced_service_tier=None,
+        ),
+    ]
+    fake_upstream = _responses_lite_sequence_upstream("resp_ws_lite_key_a", "resp_ws_lite_key_b")
+    connect_calls = _install_responses_lite_sequence_websocket(
+        monkeypatch,
+        fake_upstream,
+        refreshed_api_keys=refreshed_api_keys,
+    )
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers("thread-ws-lite-seq-api-key"),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "yes"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            second_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert sent_payloads[0]["model"] == "gpt-5.6-sol"
+    assert sent_payloads[0]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[1]["model"] == "gpt-5.4"
+    assert sent_payloads[1]["client_metadata"] == {"keep": "yes"}
+
+
+def test_backend_responses_websocket_responses_lite_sequence_requires_acceptance_before_marker_only_reuse(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    fake_upstream = _responses_lite_sequence_upstream(
+        "resp_ws_lite_before_acceptance",
+        "resp_ws_lite_after_acceptance",
+        "resp_ws_lite_trusted_followup",
+    )
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers("thread-ws-lite-seq-before-acceptance"),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "stale"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            second_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "yes"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            third_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in third_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert sent_payloads[0]["client_metadata"] == {"keep": "stale"}
+    assert sent_payloads[1]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[2]["client_metadata"] == {lite_metadata_key: "true", "keep": "yes"}
+
+
+def test_backend_responses_websocket_responses_lite_sequence_prewarm_does_not_establish_marker_trust(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    prewarm_metadata = json.dumps({"request_kind": "prewarm", "turn_id": "turn_ws_lite_prewarm"}, separators=(",", ":"))
+    fake_upstream = _responses_lite_sequence_upstream("resp_ws_lite_prewarm_a", "resp_ws_lite_prewarm_b")
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers(
+                "thread-ws-lite-seq-prewarm",
+                extra={"x-codex-turn-metadata": prewarm_metadata},
+            ),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "yes"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "continue"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            second_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert sent_payloads[0]["client_metadata"] == {
+        "x-codex-turn-metadata": prewarm_metadata,
+        lite_metadata_key: "true",
+    }
+    assert sent_payloads[1]["client_metadata"] == {
+        "keep": "yes",
+        "x-codex-turn-metadata": prewarm_metadata,
+    }
+
+
+def test_backend_responses_websocket_responses_lite_sequence_accepted_non_lite_clears_marker_trust(
+    app_instance,
+    monkeypatch,
+):
+    lite_metadata_key = "ws_request_header_x_openai_internal_codex_responses_lite"
+    fake_upstream = _responses_lite_sequence_upstream(
+        "resp_ws_lite_clear_a",
+        "resp_ws_lite_clear_b",
+        "resp_ws_lite_clear_c",
+    )
+    connect_calls = _install_responses_lite_sequence_websocket(monkeypatch, fake_upstream)
+    full_lite_input = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "custom",
+                    "name": "exec",
+                    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+                }
+            ],
+        },
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+    ]
+
+    with TestClient(app_instance) as client:
+        with client.websocket_connect(
+            "/backend-api/codex/responses",
+            headers=_responses_lite_websocket_headers("thread-ws-lite-seq-clear"),
+        ) as websocket:
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "input": full_lite_input,
+                        "stream": True,
+                    }
+                )
+            )
+            first_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {"keep": "plain"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "plain turn"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            second_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+            websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "response.create",
+                        "model": "gpt-5.6",
+                        "instructions": "",
+                        "client_metadata": {lite_metadata_key: "TRUE", "keep": "after-clear"},
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": "follow up"}]}],
+                        "stream": True,
+                    }
+                )
+            )
+            third_events = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+    assert [event["type"] for event in first_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in second_events] == ["response.created", "response.completed"]
+    assert [event["type"] for event in third_events] == ["response.created", "response.completed"]
+    sent_payloads = [json.loads(text) for text in fake_upstream.sent_text]
+    assert connect_calls["count"] == 1
+    assert sent_payloads[0]["client_metadata"] == {lite_metadata_key: "true"}
+    assert sent_payloads[1]["client_metadata"] == {"keep": "plain"}
+    assert sent_payloads[2]["client_metadata"] == {"keep": "after-clear"}
 
 
 def test_backend_responses_websocket_keeps_same_response_distinct_tool_call_ids(

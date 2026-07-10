@@ -37,6 +37,9 @@ export const TRAFFIC_CLASSES = ["foreground", "opportunistic"] as const;
 export type TrafficClass = (typeof TRAFFIC_CLASSES)[number];
 export const TRANSPORT_POLICY_OVERRIDES = ["smart", "always_http", "always_websocket"] as const;
 export type TransportPolicyOverride = (typeof TRANSPORT_POLICY_OVERRIDES)[number];
+export const MODEL_POLICY_REASONING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const API_KEY_REASONING_EFFORTS = ["none", ...MODEL_POLICY_REASONING_EFFORTS] as const;
+export type ApiKeyReasoningEffort = (typeof API_KEY_REASONING_EFFORTS)[number];
 
 export const ApiKeySchema = z.object({
   id: z.string(),
@@ -50,7 +53,7 @@ export const ApiKeySchema = z.object({
     .default("foreground"),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().default(null),
   enforcedReasoningEffort: z
-    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
+    .enum(API_KEY_REASONING_EFFORTS)
     .nullable()
     .default(null),
   enforcedServiceTier: z
@@ -89,7 +92,7 @@ export const ApiKeyCreateRequestSchema = z.object({
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
   enforcedReasoningEffort: z
-    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
+    .enum(API_KEY_REASONING_EFFORTS)
     .nullable()
     .optional(),
   enforcedServiceTier: z
@@ -116,7 +119,7 @@ export const ApiKeyUpdateRequestSchema = z.object({
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
   enforcedReasoningEffort: z
-    .enum(["none", "minimal", "low", "medium", "high", "xhigh"])
+    .enum(API_KEY_REASONING_EFFORTS)
     .nullable()
     .optional(),
   enforcedServiceTier: z
@@ -146,9 +149,9 @@ export const ModelItemSchema = z.object({
   id: z.string(),
   name: z.string(),
   sourceOnly: z.boolean().default(false),
-  supportedReasoningEfforts: z.array(z.enum(["minimal", "low", "medium", "high", "xhigh"])).default([]),
+  supportedReasoningEfforts: z.array(z.enum(MODEL_POLICY_REASONING_EFFORTS)).default([]),
   defaultReasoningEffort: z
-    .enum(["minimal", "low", "medium", "high", "xhigh"])
+    .enum(MODEL_POLICY_REASONING_EFFORTS)
     .nullable()
     .optional(),
 });

@@ -14,6 +14,11 @@ from app.modules.proxy.request_policy import apply_api_key_enforcement, validate
 @pytest.mark.parametrize(
     ("alias", "canonical", "expected_effort", "expected_service_tier"),
     [
+        ("gpt-5.6", "gpt-5.6-sol", None, None),
+        ("gpt-5.6-max", "gpt-5.6-sol", "max", None),
+        ("gpt-5.6-sol-max", "gpt-5.6-sol", "max", None),
+        ("gpt-5.6-terra-max-fast", "gpt-5.6-terra", "max", "priority"),
+        ("gpt-5.6-luna-xhigh", "gpt-5.6-luna", "xhigh", None),
         ("gpt-5-extra", "gpt-5", "high", None),
         ("gpt-5.1-low", "gpt-5.1", "low", None),
         ("gpt-5.2-medium-fast", "gpt-5.2", "medium", "priority"),
@@ -82,6 +87,22 @@ def test_unknown_gpt5_suffix_is_not_rewritten() -> None:
     assert request.service_tier is None
 
 
+def test_unknown_gpt56_suffix_is_not_rewritten() -> None:
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-terra-preview",
+            "instructions": "",
+            "input": [],
+        }
+    )
+
+    apply_api_key_enforcement(request, None)
+
+    assert request.model == "gpt-5.6-terra-preview"
+    assert request.reasoning is None
+    assert request.service_tier is None
+
+
 def test_model_access_accepts_allowed_canonical_model_alias() -> None:
     api_key = cast(ApiKeyData, SimpleNamespace(allowed_models=frozenset({"gpt-5.5"})))
 
@@ -105,3 +126,15 @@ def test_model_access_rejects_alias_when_canonical_model_not_allowed() -> None:
 
     with pytest.raises(ProxyModelNotAllowed):
         validate_model_access(api_key, "gpt-5.5-extra")
+
+
+def test_model_access_accepts_gpt56_alias_for_canonical_sol_allowlist() -> None:
+    api_key = cast(ApiKeyData, SimpleNamespace(allowed_models=frozenset({"gpt-5.6-sol"})))
+
+    validate_model_access(api_key, "gpt-5.6")
+
+
+def test_model_access_accepts_canonical_sol_for_gpt56_alias_allowlist() -> None:
+    api_key = cast(ApiKeyData, SimpleNamespace(allowed_models=frozenset({"gpt-5.6"})))
+
+    validate_model_access(api_key, "gpt-5.6-sol")

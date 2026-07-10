@@ -546,6 +546,27 @@ async def test_responses_source_raw_alias_lookup_requires_exact_allowlist(async_
 
 
 @pytest.mark.asyncio
+async def test_responses_source_cannot_shadow_official_gpt56_alias(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    await _create_model_source(
+        async_client,
+        name="responses-gpt56-alias-collision",
+        model="gpt-5.6",
+        base_url="http://127.0.0.1:9/v1",
+        supports_responses=True,
+    )
+
+    selection = await proxy_api._select_responses_model_source(
+        "gpt-5.6-sol",
+        None,
+        raw_model="gpt-5.6",
+    )
+
+    assert selection is None
+
+
+@pytest.mark.asyncio
 async def test_chat_source_selector_can_require_streaming(async_client):
     from app.modules.model_sources.repository import ModelSourcesRepository
 
@@ -1294,6 +1315,26 @@ async def test_source_chat_raw_alias_lookup_requires_exact_allowlist(async_clien
     source, selected_model = exact_selection
     assert source.name == "alias-like-allowlist-source"
     assert selected_model == model
+
+
+@pytest.mark.asyncio
+async def test_chat_source_cannot_shadow_official_gpt56_alias(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    await _create_model_source(
+        async_client,
+        name="chat-gpt56-alias-collision",
+        model="gpt-5.6",
+        base_url="http://127.0.0.1:9/v1",
+    )
+
+    selection = await proxy_api._select_chat_model_source(
+        "gpt-5.6-sol",
+        None,
+        raw_model="gpt-5.6",
+    )
+
+    assert selection is None
 
 
 @pytest.mark.asyncio

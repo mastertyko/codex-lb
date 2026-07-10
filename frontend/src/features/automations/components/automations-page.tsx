@@ -46,10 +46,12 @@ import { useTimeFormatStore, type TimeFormatPreference } from "@/hooks/use-time-
 import { getErrorMessageOrNull } from "@/utils/errors";
 import { formatModelLabel, formatSlug, formatTimeLong } from "@/utils/formatters";
 import type {
+  AutomationCreateRequest,
   AutomationJob,
   AutomationRun,
   AutomationRunStatus,
   AutomationScheduleDay,
+  AutomationUpdateRequest,
 } from "@/features/automations/schemas";
 
 const WEEKDAY_OPTIONS: Array<{ value: AutomationScheduleDay; shortLabel: string }> = [
@@ -378,40 +380,12 @@ export function AutomationsPage() {
     createDialog.show();
   };
 
-  const handleCreate = async (payload: {
-    name: string;
-    enabled: boolean;
-    schedule: {
-      type: "daily";
-      time: string;
-      timezone: string;
-      thresholdMinutes: number;
-      days: ("mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun")[];
-    };
-    model: string;
-    reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | null;
-    prompt?: string;
-    accountIds: string[];
-  }) => {
+  const handleCreate = async (payload: AutomationCreateRequest) => {
     await createMutation.mutateAsync(payload);
     setEditingJob(null);
   };
 
-  const handleUpdate = async (automationId: string, payload: {
-    name?: string;
-    enabled?: boolean;
-    schedule?: {
-      type: "daily";
-      time: string;
-      timezone: string;
-      thresholdMinutes: number;
-      days: ("mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun")[];
-    };
-    model?: string;
-    reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh" | null;
-    prompt?: string;
-    accountIds?: string[];
-  }) => {
+  const handleUpdate = async (automationId: string, payload: AutomationUpdateRequest) => {
     await updateMutation.mutateAsync({ automationId, payload });
     setEditingJob(null);
   };

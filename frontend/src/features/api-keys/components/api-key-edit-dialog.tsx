@@ -31,6 +31,7 @@ import { UsageSectionsMultiSelect } from "@/features/api-keys/components/usage-s
 import { ModelSourceMultiSelect } from "@/features/model-sources/components/model-source-multi-select";
 import type {
   ApiKey,
+  ApiKeyReasoningEffort,
   ApiKeyUpdateRequest,
   LimitRuleCreate,
   LimitType,
@@ -99,7 +100,7 @@ type ApiKeyEditDraft = {
   expiresAt: Date | null;
   applyToCodexModel: boolean;
   enforcedModel: string;
-  enforcedReasoningEffort: string;
+  enforcedReasoningEffort: ApiKeyReasoningEffort;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
   transportPolicyOverride: TransportPolicyOverride | null;
@@ -160,7 +161,8 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
       allowedModels: draft.selectedModels.length > 0 ? draft.selectedModels : null,
       applyToCodexModel: draft.applyToCodexModel,
       enforcedModel: draft.enforcedModel.trim() ? draft.enforcedModel.trim() : null,
-      enforcedReasoningEffort: draft.enforcedReasoningEffort === "none" ? null : draft.enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
+      enforcedReasoningEffort:
+        draft.enforcedReasoningEffort === "none" ? null : draft.enforcedReasoningEffort,
       enforcedServiceTier: draft.enforcedServiceTier === "none" ? null : draft.enforcedServiceTier as ServiceTierType,
       trafficClass: draft.trafficClass,
       transportPolicyOverride: draft.transportPolicyOverride,
@@ -272,9 +274,16 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
             </div>
 
             <div className="space-y-1">
-              <div className="text-sm font-medium">Enforced reasoning</div>
-              <Select value={draft.enforcedReasoningEffort} onValueChange={(enforcedReasoningEffort) => updateDraft({ enforcedReasoningEffort })}>
-                <SelectTrigger>
+              <label htmlFor="edit-api-key-enforced-reasoning" className="text-sm font-medium">
+                Enforced reasoning
+              </label>
+              <Select
+                value={draft.enforcedReasoningEffort}
+                onValueChange={(value) =>
+                  updateDraft({ enforcedReasoningEffort: value as ApiKeyReasoningEffort })
+                }
+              >
+                <SelectTrigger id="edit-api-key-enforced-reasoning">
                   <SelectValue placeholder="None" />
                 </SelectTrigger>
                 <SelectContent>
@@ -284,6 +293,7 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
                   <SelectItem value="medium">Medium</SelectItem>
                   <SelectItem value="high">High</SelectItem>
                   <SelectItem value="xhigh">XHigh</SelectItem>
+                  <SelectItem value="max">Max</SelectItem>
                 </SelectContent>
               </Select>
             </div>

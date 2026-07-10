@@ -175,6 +175,70 @@ async def test_proxy_responses_no_accounts(async_client):
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_gpt56_alias_strips_platform_cache_controls_and_persists_write_cost(
+    async_client,
+    monkeypatch,
+):
+    raw_account_id = "acc_gpt56_cache"
+    auth_json = _make_auth_json(raw_account_id, "gpt56-cache@example.com")
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    imported = await async_client.post("/api/accounts/import", files=files)
+    assert imported.status_code == 200
+
+    captured: dict[str, object] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
+        del headers, access_token, account_id, base_url, raise_for_status, kwargs
+        captured.update(payload.to_payload())
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_gpt56_cache","object":"response",'
+            '"status":"completed","output":[],"usage":{"input_tokens":100,"output_tokens":10,'
+            '"total_tokens":110,"input_tokens_details":{"cached_tokens":20,"cache_write_tokens":30}}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-5.6",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Stable prefix",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                }
+            ],
+            "prompt_cache_key": "gpt56-cache-key",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "reasoning": {"effort": "max"},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_gpt56_cache"
+    assert captured["model"] == "gpt-5.6-sol"
+    assert captured["reasoning"] == {"effort": "max"}
+    assert captured["prompt_cache_key"] == "gpt56-cache-key"
+    assert "prompt_cache_options" not in captured
+    captured_input = cast(list[dict[str, object]], captured["input"])
+    captured_content = cast(list[dict[str, object]], captured_input[0]["content"])
+    assert "prompt_cache_breakpoint" not in captured_content[0]
+
+    async with SessionLocal() as session:
+        result = await session.execute(select(RequestLog).where(RequestLog.request_id == "resp_gpt56_cache"))
+        log = result.scalar_one()
+    expected_cost = ((50 * 5.0) + (20 * 0.5) + (30 * 6.25) + (10 * 30.0)) / 1_000_000
+    assert log.model == "gpt-5.6-sol"
+    assert log.cost_usd == pytest.approx(expected_cost)
+
+
+@pytest.mark.asyncio
 async def test_proxy_responses_repeated_401_after_refresh_fails_over(async_client, monkeypatch):
     for raw_account_id, email in (
         ("acc_stream_invalidated_a", "stream-invalidated-a@example.com"),
@@ -1657,6 +1721,122 @@ async def test_proxy_responses_forwards_native_codex_headers(async_client, monke
     assert seen_headers["x-codex-turn-metadata"] == native_headers["x-codex-turn-metadata"]
     assert seen_headers["x-codex-beta-features"] == native_headers["x-codex-beta-features"]
     assert seen_headers["x-request-id"] == native_headers["x-request-id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_internal_header", [False, True], ids=["body_only", "body_and_internal_header"])
+async def test_proxy_responses_forwards_native_responses_lite_tools(async_client, monkeypatch, include_internal_header):
+    email = "responses-lite@example.com"
+    raw_account_id = "acc_responses_lite"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    seen: dict[str, object] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kw):
+        del access_token, account_id, base_url, raise_for_status
+        seen["payload"] = payload.to_payload()
+        seen["headers"] = dict(headers)
+        yield 'data: {"type":"response.completed","response":{"id":"resp_lite_1"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    lite_input = [
+        additional_tools,
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev instructions"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "ls"},
+        {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"},
+    ]
+    payload = {"model": "gpt-5.6-sol", "instructions": "", "input": lite_input, "stream": True}
+    native_headers = {
+        "user-agent": "codex_exec/0.144.0 (Mac OS 27.0.0; arm64) unknown (codex_exec; 0.144.0)",
+        "session_id": "sid-lite",
+        "x-request-id": "req_lite_123",
+    }
+    if include_internal_header:
+        native_headers["x-openai-internal-codex-responses-lite"] = "true"
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json=payload,
+        headers=native_headers,
+    ) as resp:
+        assert resp.status_code == 200
+        _ = [line async for line in resp.aiter_lines() if line]
+
+    seen_headers = cast(dict[str, str], seen["headers"])
+    assert not any(key.lower() == "x-openai-internal-codex-responses-lite" for key in seen_headers)
+    seen_payload = cast(dict[str, object], seen["payload"])
+    assert seen_payload["input"] == lite_input
+    assert seen_payload["instructions"] == ""
+
+
+@pytest.mark.asyncio
+async def test_proxy_responses_internal_lite_header_without_body_does_not_authorize_lite(async_client, monkeypatch):
+    email = "responses-lite-header-only@example.com"
+    raw_account_id = "acc_responses_lite_header_only"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    seen: dict[str, object] = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **_kw):
+        del access_token, account_id, base_url, raise_for_status
+        seen["payload"] = payload.to_payload()
+        seen["headers"] = dict(headers)
+        yield 'data: {"type":"response.completed","response":{"id":"resp_lite_header_only_1"}}\n\n'
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": [
+            {"type": "message", "role": "developer", "content": "dev instructions"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        ],
+        "stream": True,
+    }
+    native_headers = {
+        "user-agent": "codex_exec/0.144.0 (Mac OS 27.0.0; arm64) unknown (codex_exec; 0.144.0)",
+        "x-openai-internal-codex-responses-lite": "true",
+        "session_id": "sid-lite-header-only",
+        "x-request-id": "req_lite_header_only_123",
+    }
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json=payload,
+        headers=native_headers,
+    ) as resp:
+        assert resp.status_code == 200
+        _ = [line async for line in resp.aiter_lines() if line]
+
+    seen_headers = cast(dict[str, str], seen["headers"])
+    assert not any(key.lower() == "x-openai-internal-codex-responses-lite" for key in seen_headers)
+    seen_payload = cast(dict[str, object], seen["payload"])
+    assert seen_payload["instructions"] == "dev instructions"
+    assert seen_payload["input"] == [
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+    ]
 
 
 @pytest.mark.asyncio

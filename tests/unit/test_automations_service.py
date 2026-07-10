@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
+from app.core.openai.models import ResponseUsage, ResponseUsageDetails
 from app.db.models import Account, AccountStatus
 from app.modules.automations.repository import AutomationRunRecord
 from app.modules.automations.service import (
     AutomationsService,
     AutomationValidationError,
     _AutomationRunCycleSummary,
+    _extract_compact_usage_fields,
     _normalize_chatgpt_model,
     _normalize_reasoning_effort,
     _pick_dispatch_offsets_seconds,
@@ -131,6 +134,31 @@ def test_normalize_reasoning_effort_rejects_models_with_no_supported_levels(
         _normalize_reasoning_effort("low", model_slug="gpt-4o-mini")
 
 
+def test_normalize_reasoning_effort_accepts_max_but_rejects_native_only_ultra(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeRegistry:
+        @staticmethod
+        def get_models_with_fallback() -> dict[str, object]:
+            levels = tuple(
+                type("_Level", (), {"effort": effort})()
+                for effort in ("low", "medium", "high", "xhigh", "max", "ultra")
+            )
+            return {
+                "gpt-5.6-sol": type(
+                    "_Model",
+                    (),
+                    {"supported_reasoning_levels": levels},
+                )()
+            }
+
+    monkeypatch.setattr("app.modules.automations.service.get_model_registry", lambda: _FakeRegistry())
+
+    assert _normalize_reasoning_effort("MAX", model_slug="gpt-5.6-sol") == "max"
+    with pytest.raises(AutomationValidationError, match="Unsupported reasoning effort: ultra"):
+        _normalize_reasoning_effort("ultra", model_slug="gpt-5.6-sol")
+
+
 def test_normalize_chatgpt_model_accepts_registry_model(monkeypatch: pytest.MonkeyPatch) -> None:
     class _FakeRegistry:
         @staticmethod
@@ -153,6 +181,49 @@ def test_normalize_chatgpt_model_rejects_source_only_alias(monkeypatch: pytest.M
     with pytest.raises(AutomationValidationError, match="not available for ChatGPT account routing") as exc_info:
         _normalize_chatgpt_model("openai-compatible/custom-model")
     assert exc_info.value.code == "invalid_model"
+
+
+def test_extract_compact_usage_fields_retains_cache_write_tokens() -> None:
+    response = SimpleNamespace(
+        usage=ResponseUsage(
+            input_tokens=100,
+            output_tokens=10,
+            input_tokens_details=ResponseUsageDetails(cached_tokens=20, cache_write_tokens=30),
+            output_tokens_details=ResponseUsageDetails(reasoning_tokens=4),
+        ),
+        model_extra={"service_tier": "flex"},
+    )
+
+    assert _extract_compact_usage_fields(response) == (100, 10, 20, 30, 4, "flex")
+
+
+@pytest.mark.asyncio
+async def test_automation_request_log_prices_gpt56_cache_writes() -> None:
+    class _RequestLogs:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def add_log(self, **kwargs: object) -> None:
+            self.calls.append(kwargs)
+
+    logs = _RequestLogs()
+    service = object.__new__(AutomationsService)
+    service._request_logs_repository = logs  # type: ignore[assignment]
+
+    await service._write_request_log(
+        account_id="acc-automation-cache-write",
+        request_id="resp-automation-cache-write",
+        model="gpt-5.6-sol",
+        latency_ms=12,
+        status="success",
+        input_tokens=100,
+        output_tokens=10,
+        cached_input_tokens=20,
+        cache_write_input_tokens=30,
+    )
+
+    expected_cost = ((50 * 5.0) + (20 * 0.5) + (30 * 6.25) + (10 * 30.0)) / 1_000_000
+    assert logs.calls[0]["cost_usd"] == pytest.approx(expected_cost)
 
 
 def test_compute_next_run_utc_accepts_server_default_timezone(monkeypatch: pytest.MonkeyPatch) -> None:

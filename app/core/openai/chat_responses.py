@@ -95,6 +95,7 @@ class ChatCompletionUsage(BaseModel):
 class ChatPromptTokensDetails(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    cache_write_tokens: int | None = None
     cached_tokens: int | None = None
 
 
@@ -539,8 +540,12 @@ def _map_usage(usage: ResponseUsage | None) -> ChatCompletionUsage | None:
         return None
     prompt_details = None
     cached_tokens = usage.input_tokens_details.cached_tokens if usage.input_tokens_details else None
-    if cached_tokens is not None:
-        prompt_details = ChatPromptTokensDetails(cached_tokens=cached_tokens)
+    cache_write_tokens = usage.input_tokens_details.cache_write_tokens if usage.input_tokens_details else None
+    if cached_tokens is not None or cache_write_tokens is not None:
+        prompt_details = ChatPromptTokensDetails(
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+        )
 
     completion_details = None
     reasoning_tokens = usage.output_tokens_details.reasoning_tokens if usage.output_tokens_details else None

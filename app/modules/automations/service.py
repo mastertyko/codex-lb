@@ -22,6 +22,7 @@ from app.core.crypto import TokenEncryptor
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.requests import ResponsesCompactRequest, ResponsesReasoning
 from app.core.upstream_proxy import ResolvedUpstreamRoute, resolve_upstream_route
+from app.core.usage.logs import calculated_cost_from_token_counts
 from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import get_background_session
@@ -1168,6 +1169,7 @@ class AutomationsService:
                     input_tokens,
                     output_tokens,
                     cached_input_tokens,
+                    cache_write_input_tokens,
                     reasoning_tokens,
                     service_tier,
                 ) = _extract_compact_usage_fields(compact_response)
@@ -1181,6 +1183,7 @@ class AutomationsService:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_input_tokens=cache_write_input_tokens,
                     reasoning_tokens=reasoning_tokens,
                     service_tier=service_tier,
                 )
@@ -2045,6 +2048,7 @@ class AutomationsService:
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         cached_input_tokens: int | None = None,
+        cache_write_input_tokens: int | None = None,
         reasoning_tokens: int | None = None,
         service_tier: str | None = None,
     ) -> None:
@@ -2058,6 +2062,14 @@ class AutomationsService:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
+                cost_usd=calculated_cost_from_token_counts(
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_input_tokens=cached_input_tokens,
+                    cache_write_input_tokens=cache_write_input_tokens,
+                    service_tier=service_tier,
+                ),
                 reasoning_tokens=reasoning_tokens,
                 reasoning_effort=reasoning_effort,
                 latency_ms=latency_ms,
@@ -2123,7 +2135,7 @@ def _normalize_reasoning_effort(value: str | None, *, model_slug: str) -> str | 
     normalized = value.strip().lower()
     if not normalized:
         return None
-    allowed = {"minimal", "low", "medium", "high", "xhigh"}
+    allowed = {"minimal", "low", "medium", "high", "xhigh", "max"}
     if normalized not in allowed:
         raise AutomationValidationError(
             f"Unsupported reasoning effort: {value}",
@@ -2431,13 +2443,14 @@ def _elapsed_ms(started_at: float | None) -> int | None:
 
 def _extract_compact_usage_fields(
     compact_response: object,
-) -> tuple[int | None, int | None, int | None, int | None, str | None]:
+) -> tuple[int | None, int | None, int | None, int | None, int | None, str | None]:
     usage = getattr(compact_response, "usage", None)
     input_tokens = _coerce_int(getattr(usage, "input_tokens", None))
     output_tokens = _coerce_int(getattr(usage, "output_tokens", None))
     input_details = getattr(usage, "input_tokens_details", None)
     output_details = getattr(usage, "output_tokens_details", None)
     cached_input_tokens = _coerce_int(getattr(input_details, "cached_tokens", None))
+    cache_write_input_tokens = _coerce_int(getattr(input_details, "cache_write_tokens", None))
     reasoning_tokens = _coerce_int(getattr(output_details, "reasoning_tokens", None))
 
     service_tier: str | None = None
@@ -2449,7 +2462,14 @@ def _extract_compact_usage_fields(
             if normalized:
                 service_tier = normalized
 
-    return input_tokens, output_tokens, cached_input_tokens, reasoning_tokens, service_tier
+    return (
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+        cache_write_input_tokens,
+        reasoning_tokens,
+        service_tier,
+    )
 
 
 def _coerce_int(value: object) -> int | None:

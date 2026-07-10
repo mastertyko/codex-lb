@@ -698,7 +698,14 @@ async def test_create_key_rejects_enforced_model_outside_allowed_models() -> Non
 
 
 @pytest.mark.asyncio
-async def test_create_key_normalizes_enforced_reasoning_effort() -> None:
+@pytest.mark.parametrize(
+    ("raw_effort", "expected_effort"),
+    [("HIGH", "high"), ("MAX", "max")],
+)
+async def test_create_key_normalizes_enforced_reasoning_effort(
+    raw_effort: str,
+    expected_effort: str,
+) -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
 
@@ -706,12 +713,28 @@ async def test_create_key_normalizes_enforced_reasoning_effort() -> None:
         ApiKeyCreateData(
             name="reasoning-policy",
             allowed_models=None,
-            enforced_reasoning_effort="HIGH",
+            enforced_reasoning_effort=raw_effort,
             expires_at=None,
         )
     )
 
-    assert created.enforced_reasoning_effort == "high"
+    assert created.enforced_reasoning_effort == expected_effort
+
+
+@pytest.mark.asyncio
+async def test_create_key_rejects_native_only_ultra_reasoning_effort() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    with pytest.raises(ApiKeyValidationError, match="Unsupported enforced reasoning effort 'ultra'"):
+        await service.create_key(
+            ApiKeyCreateData(
+                name="native-only-reasoning-policy",
+                allowed_models=None,
+                enforced_reasoning_effort="ultra",
+                expires_at=None,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -1830,6 +1853,35 @@ async def test_record_usage_cost_limit_uses_flex_service_tier_pricing() -> None:
     limits = await repo.get_limits_by_key(created.id)
     cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
     assert cost_limit.current_value == 2_625_000
+
+
+@pytest.mark.asyncio
+async def test_record_usage_cost_limit_includes_gpt56_cache_write_pricing() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="gpt56-cache-write-cost-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[
+                LimitRuleInput(limit_type="cost_usd", limit_window="weekly", max_value=100_000_000),
+            ],
+        )
+    )
+
+    await service.record_usage(
+        created.id,
+        model="gpt-5.6-sol",
+        input_tokens=100_000,
+        output_tokens=10_000,
+        cached_input_tokens=20_000,
+        cache_write_input_tokens=30_000,
+    )
+
+    limits = await repo.get_limits_by_key(created.id)
+    cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
+    assert cost_limit.current_value == 747_500
 
 
 @pytest.mark.asyncio

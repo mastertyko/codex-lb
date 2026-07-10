@@ -3,7 +3,9 @@ import { describe, expect, it } from "vitest";
 import {
   AutomationCreateRequestSchema,
   AutomationJobSchema,
+  AutomationReasoningEffortSchema,
   AutomationRunSchema,
+  AutomationUpdateRequestSchema,
 } from "@/features/automations/schemas";
 
 describe("automations schemas", () => {
@@ -65,6 +67,13 @@ describe("automations schemas", () => {
     });
 
     expect(parsed.accountIds).toEqual([]);
+  });
+
+  it("accepts max but rejects native-only ultra reasoning", () => {
+    expect(AutomationReasoningEffortSchema.parse("max")).toBe("max");
+    expect(AutomationUpdateRequestSchema.parse({ reasoningEffort: "max" }).reasoningEffort).toBe("max");
+    expect(AutomationReasoningEffortSchema.safeParse("ultra").success).toBe(false);
+    expect(AutomationUpdateRequestSchema.safeParse({ reasoningEffort: "ultra" }).success).toBe(false);
   });
 
   it("rejects duplicate schedule days", () => {

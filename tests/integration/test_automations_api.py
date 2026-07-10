@@ -115,6 +115,10 @@ def _make_upstream_model(slug: str, *, reasoning_efforts: tuple[str, ...]) -> Up
 async def _populate_automation_reasoning_models() -> None:
     models = [
         _make_upstream_model("automation-reasoning-xhigh", reasoning_efforts=("low", "medium", "high", "xhigh")),
+        _make_upstream_model(
+            "automation-reasoning-max",
+            reasoning_efforts=("low", "medium", "high", "xhigh", "max", "ultra"),
+        ),
         _make_upstream_model("automation-reasoning-medium", reasoning_efforts=("medium",)),
     ]
     await get_model_registry().update({"plus": models, "pro": models})
@@ -346,6 +350,55 @@ async def test_automations_patch_model_rejects_retained_unsupported_reasoning_ef
 
 
 @pytest.mark.asyncio
+async def test_automations_api_accepts_max_but_rejects_native_only_ultra(async_client):
+    await _populate_automation_reasoning_models()
+    accounts = await _create_accounts("auto-reasoning-wire-contract")
+    schedule = {
+        "type": "daily",
+        "time": "05:00",
+        "timezone": "UTC",
+        "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+    }
+
+    max_response = await async_client.post(
+        "/api/automations",
+        json={
+            "name": "Max reasoning automation",
+            "enabled": False,
+            "schedule": schedule,
+            "model": "automation-reasoning-max",
+            "reasoningEffort": "MAX",
+            "prompt": "ping",
+            "accountIds": [accounts[0].id],
+        },
+    )
+    assert max_response.status_code == 200
+    max_payload = max_response.json()
+    assert max_payload["reasoningEffort"] == "max"
+
+    max_update_response = await async_client.patch(
+        f"/api/automations/{max_payload['id']}",
+        json={"reasoningEffort": "MAX"},
+    )
+    assert max_update_response.status_code == 200
+    assert max_update_response.json()["reasoningEffort"] == "max"
+
+    ultra_response = await async_client.post(
+        "/api/automations",
+        json={
+            "name": "Native-only Ultra automation",
+            "enabled": False,
+            "schedule": schedule,
+            "model": "automation-reasoning-max",
+            "reasoningEffort": "ultra",
+            "prompt": "ping",
+            "accountIds": [accounts[0].id],
+        },
+    )
+    assert ultra_response.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_automations_run_history_keeps_claimed_model_snapshot(async_client, monkeypatch):
     await _populate_automation_reasoning_models()
     started_at = utcnow()
@@ -369,8 +422,8 @@ async def test_automations_run_history_keeps_claimed_model_snapshot(async_client
                 "timezone": "UTC",
                 "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
             },
-            "model": "automation-reasoning-xhigh",
-            "reasoningEffort": "xhigh",
+            "model": "automation-reasoning-max",
+            "reasoningEffort": "max",
             "prompt": "old ping",
             "accountIds": [accounts[0].id],
         },
@@ -392,12 +445,12 @@ async def test_automations_run_history_keeps_claimed_model_snapshot(async_client
     assert runs_response.status_code == 200
     run_item = runs_response.json()["items"][0]
     assert run_item["id"] == run_id
-    assert run_item["model"] == "automation-reasoning-xhigh"
-    assert run_item["reasoningEffort"] == "xhigh"
+    assert run_item["model"] == "automation-reasoning-max"
+    assert run_item["reasoningEffort"] == "max"
 
     old_model_response = await async_client.get(
         "/api/automations/runs",
-        params={"automationId": automation_id, "model": "automation-reasoning-xhigh", "limit": 25, "offset": 0},
+        params={"automationId": automation_id, "model": "automation-reasoning-max", "limit": 25, "offset": 0},
     )
     assert old_model_response.status_code == 200
     assert [item["id"] for item in old_model_response.json()["items"]] == [run_id]
@@ -409,9 +462,9 @@ async def test_automations_run_history_keeps_claimed_model_snapshot(async_client
     assert new_model_response.status_code == 200
     assert new_model_response.json()["items"] == []
     assert len(compact_requests) == 1
-    assert compact_requests[0].model == "automation-reasoning-xhigh"
+    assert compact_requests[0].model == "automation-reasoning-max"
     assert compact_requests[0].reasoning is not None
-    assert compact_requests[0].reasoning.effort == "xhigh"
+    assert compact_requests[0].reasoning.effort == "max"
     assert compact_requests[0].input == [{"role": "user", "content": [{"type": "input_text", "text": "old ping"}]}]
 
     async with SessionLocal() as session:
@@ -427,8 +480,8 @@ async def test_automations_run_history_keeps_claimed_model_snapshot(async_client
             )
         ]
         assert len(matching_logs) == 1
-        assert matching_logs[0].model == "automation-reasoning-xhigh"
-        assert matching_logs[0].reasoning_effort == "xhigh"
+        assert matching_logs[0].model == "automation-reasoning-max"
+        assert matching_logs[0].reasoning_effort == "max"
 
 
 @pytest.mark.asyncio
