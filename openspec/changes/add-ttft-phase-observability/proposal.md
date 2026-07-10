@@ -8,7 +8,7 @@ Operators can see total latency and TTFT today, but not enough phase detail to s
 
 - Persist nullable request-log fields for low-cardinality TTFT phase timings, prewarm canary metadata, and session gap cohorts.
 - Emit Prometheus histograms/counters for proxy phase latency, prewarm outcomes, and stuck HTTP bridge retirements.
-- Retire an HTTP bridge session after a visible `response_create_gate_timeout` only when pending visible work is already older than the configured stuck-gate threshold.
+- Retire an HTTP bridge session after a visible `response_create_gate_timeout` only when pending pre-`response.created` work has made no upstream progress for the configured stuck-gate threshold.
 - Split Codex prewarm behind deterministic API-key/session canary sampling, preserving the current master boolean behavior when no percent is configured.
 - Add a 24-hour TTFT breakdown SQL runbook under OpenSpec context and a Grafana dashboard JSON for TTFT analysis.
 

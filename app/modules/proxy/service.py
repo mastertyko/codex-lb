@@ -1305,9 +1305,17 @@ class ProxyService(
                     and state.response_create_gate_acquired
                     and state.awaiting_response_created
                     and not state.downstream_visible
-                    and state.latency_first_upstream_event_ms is None
                     and state.latency_response_created_ms is None
-                    and max(0.0, now - state.started_at) >= threshold_seconds
+                    and max(
+                        0.0,
+                        now
+                        - (
+                            state.last_upstream_progress_at
+                            if state.last_upstream_progress_at is not None
+                            else state.started_at
+                        ),
+                    )
+                    >= threshold_seconds
                     for state in pending_states
                 )
             _log_http_bridge_startup_wait_timeout(

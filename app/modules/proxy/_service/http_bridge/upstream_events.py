@@ -396,6 +396,7 @@ class _HTTPBridgeUpstreamEventsMixin:
 
             if matched_request_state is not None:
                 now = _service_time().monotonic()
+                matched_request_state.last_upstream_progress_at = now
                 if matched_request_state.latency_first_upstream_event_ms is None:
                     matched_request_state.latency_first_upstream_event_ms = int(
                         max(0.0, now - matched_request_state.started_at) * 1000

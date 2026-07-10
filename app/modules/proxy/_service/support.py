@@ -331,6 +331,7 @@ class _WebSocketRequestState:
     reasoning_effort: str | None
     api_key_reservation: ApiKeyUsageReservationData | None
     started_at: float
+    last_upstream_progress_at: float | None = None
     responses_lite_model: str | None = None
     responses_lite_body_derived: bool = False
     responses_lite_generation: int | None = None

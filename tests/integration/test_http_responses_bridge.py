@@ -6457,6 +6457,183 @@ async def test_v1_responses_http_bridge_times_out_queued_request_on_bounded_star
 
 
 @pytest.mark.asyncio
+async def test_v1_responses_http_bridge_gate_timeout_retires_stalled_precreated_session_after_progress(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    _install_bridge_settings_with_limits(
+        monkeypatch,
+        enabled=True,
+        max_sessions=1,
+        admission_wait_timeout_seconds=0.01,
+    )
+    app_settings = proxy_module.get_settings().model_copy(
+        update={"http_responses_session_bridge_stuck_gate_retire_after_seconds": 0.1}
+    )
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: app_settings)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_stalled_progress",
+        "http-bridge-stalled-progress@example.com",
+    )
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+
+    class _ProgressThenSilentUpstreamWebSocket(_SilentUpstreamWebSocket):
+        async def send_text(self, text: str) -> None:
+            await super().send_text(text)
+            await self._messages.put(
+                _FakeUpstreamMessage(
+                    "text",
+                    text=json.dumps({"type": "response.in_progress"}, separators=(",", ":")),
+                )
+            )
+
+    stalled_upstream = _ProgressThenSilentUpstreamWebSocket()
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        request_id,
+        kind,
+        request_stage="first_turn",
+        sticky_key,
+        sticky_kind,
+        reallocate_sticky,
+        sticky_max_age_seconds,
+        prefer_earlier_reset_accounts,
+        routing_strategy,
+        model,
+        exclude_account_ids=None,
+        additional_limit_name=None,
+        api_key=None,
+        preferred_account_id=None,
+    ):
+        del preferred_account_id
+        del (
+            self,
+            deadline,
+            request_id,
+            kind,
+            request_stage,
+            sticky_key,
+            sticky_kind,
+            reallocate_sticky,
+            sticky_max_age_seconds,
+            prefer_earlier_reset_accounts,
+            routing_strategy,
+            model,
+            exclude_account_ids,
+            additional_limit_name,
+        )
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        return stalled_upstream
+
+    progress_processed = asyncio.Event()
+    process_upstream_text = proxy_module.ProxyService._process_http_bridge_upstream_text
+
+    async def signal_processed_progress(self, session, text):
+        await process_upstream_text(self, session, text)
+        progress_processed.set()
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_process_http_bridge_upstream_text", signal_processed_progress)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "Return exactly OK.",
+        "input": "stall-before-created",
+    }
+    session_headers = {"session_id": "stalled-progress-session"}
+    bridge_payload = proxy_module.ResponsesRequest(**payload)
+    affinity = proxy_module._sticky_key_for_responses_request(
+        bridge_payload,
+        session_headers,
+        codex_session_affinity=True,
+        openai_cache_affinity=True,
+        openai_cache_affinity_max_age_seconds=300,
+        sticky_threads_enabled=False,
+        api_key=None,
+    )
+    key = proxy_module._make_http_bridge_session_key(
+        bridge_payload,
+        headers=session_headers,
+        affinity=affinity,
+        api_key=None,
+        request_id="req_stalled_progress",
+    )
+    stale_session = await service._get_or_create_http_bridge_session(
+        key,
+        headers=session_headers,
+        affinity=affinity,
+        api_key=None,
+        request_model="gpt-5.1",
+        idle_ttl_seconds=120.0,
+        max_sessions=1,
+    )
+    stalled_state, text_data = service._prepare_http_bridge_request(
+        bridge_payload,
+        session_headers,
+        api_key=None,
+        api_key_reservation=None,
+    )
+    stalled_state.transport = "http"
+    await service._submit_http_bridge_request(
+        stale_session,
+        request_state=stalled_state,
+        text_data=text_data,
+        queue_limit=8,
+    )
+    try:
+        await _wait_for_event(progress_processed)
+        progress_at = stalled_state.last_upstream_progress_at
+        assert progress_at is not None
+        assert stalled_state.response_id is None
+        assert stalled_state.awaiting_response_created is True
+        assert stalled_state.response_create_gate_acquired is True
+
+        monkeypatch.setattr(
+            proxy_module,
+            "time",
+            SimpleNamespace(monotonic=lambda: progress_at + 0.2),
+        )
+        waiter_response = await async_client.post(
+            "/v1/responses",
+            json={**payload, "input": "same-session-waiter"},
+            headers=session_headers,
+        )
+
+        assert waiter_response.status_code == 429
+        assert waiter_response.json()["error"]["code"] == "response_create_gate_timeout"
+        assert waiter_response.json()["error"]["type"] == "rate_limit_error"
+        assert len(stalled_upstream.sent_text) == 1
+        assert stale_session.closed is True
+        assert stalled_upstream.closed is True
+        async with service._http_bridge_lock:
+            assert service._http_bridge_sessions.get(stale_session.key) is not stale_session
+    finally:
+        await service._close_http_bridge_session(stale_session)
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_http_bridge_enforces_queue_limit_atomically_for_same_session(
     async_client,
     app_instance,
