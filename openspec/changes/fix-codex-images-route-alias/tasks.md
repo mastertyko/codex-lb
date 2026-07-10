@@ -7,3 +7,9 @@
 
 - [x] 2.1 Add focused integration coverage proving the Codex-prefixed and `/v1` generation routes share request translation and response behavior
 - [x] 2.2 Run the focused image proxy tests and validate the OpenSpec change
+
+## 3. Compatibility Closure
+
+- [x] 3.1 Classify the Codex-prefixed route for exception-level image observability
+- [x] 3.2 Add auth, malformed-body, unsupported-model, and trailing-slash parity coverage for both route prefixes
+- [x] 3.3 Re-run focused image tests, diagnostics, and strict OpenSpec validation

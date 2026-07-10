@@ -72,7 +72,12 @@ def _error_format(request: Request) -> str | None:
 
 
 def _image_route_from_path(path: str) -> ImageRoute | None:
-    if path == "/v1/images/generations":
+    if path in (
+        "/v1/images/generations",
+        "/v1/images/generations/",
+        "/backend-api/codex/images/generations",
+        "/backend-api/codex/images/generations/",
+    ):
         return "generations"
     if path == "/v1/images/edits":
         return "edits"

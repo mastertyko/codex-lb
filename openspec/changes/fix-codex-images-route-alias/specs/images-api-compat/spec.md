@@ -14,3 +14,14 @@ The system SHALL expose `POST /backend-api/codex/images/generations` as a compat
 
 - **WHEN** equivalent valid requests are sent to `POST /backend-api/codex/images/generations` and `POST /v1/images/generations`
 - **THEN** both routes apply the same validation and return the same JSON or streaming response contract
+
+#### Scenario: Codex route preserves validation and authentication observability
+
+- **WHEN** the Codex-prefixed route rejects an unauthenticated request, malformed body, or unsupported model
+- **THEN** it returns the same OpenAI error envelope and status as the equivalent `/v1` request
+- **AND** it emits one bounded `images_route_complete` event for the `generations` route with the matching outcome
+
+#### Scenario: Trailing slash uses the same generation adapter
+
+- **WHEN** a client sends an equivalent request to either generation route with a trailing slash
+- **THEN** the service processes it through the same generation adapter instead of returning 404 or 405

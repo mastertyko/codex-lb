@@ -18,6 +18,7 @@
 
 - Register the existing generation handler on both `v1_router` and the Codex `router`. A second decorator is the smallest route-only fix and guarantees both paths invoke the same function.
 - Reuse `V1ImagesGenerationsRequest`, `_proxy_images_generation_request`, and both routers' existing `validate_proxy_api_key` and OpenAI error-format dependencies. A forwarding handler or internal HTTP redirect would add an avoidable second hop and could alter authentication or streaming behavior.
+- Register trailing-slash variants explicitly with `include_in_schema=False`. The application catch-all prevents FastAPI's automatic slash redirect and otherwise turns these POSTs into 405 responses; direct aliases preserve the same handler without duplicating the public schema.
 - Keep telemetry route labels as `generations`; the alias represents the same bounded image capability rather than a new operation.
 
 ## Risks / Trade-offs

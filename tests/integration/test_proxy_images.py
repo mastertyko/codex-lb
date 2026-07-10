@@ -118,12 +118,15 @@ def _disable_http_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
 # /v1/images/generations
 # ---------------------------------------------------------------------------
 
+_GENERATION_ROUTES = ("/v1/images/generations", "/backend-api/codex/images/generations")
 
+
+@pytest.mark.parametrize("route", _GENERATION_ROUTES, ids=["v1", "codex"])
 @pytest.mark.asyncio
-async def test_images_generations_unsupported_model_returns_400(async_client, caplog):
+async def test_images_generations_unsupported_model_returns_400(async_client, caplog, route: str):
     with caplog.at_level(logging.INFO, logger="app.modules.proxy.api"):
         response = await async_client.post(
-            "/v1/images/generations",
+            route,
             json={"model": "dall-e-3", "prompt": "a red circle"},
         )
     assert response.status_code == 400
@@ -182,13 +185,14 @@ async def test_images_generations_quota_rejection_records_route_observability(as
     )
 
 
+@pytest.mark.parametrize("route", _GENERATION_ROUTES, ids=["v1", "codex"])
 @pytest.mark.asyncio
-async def test_images_generations_auth_rejection_records_route_observability(async_client, caplog):
+async def test_images_generations_auth_rejection_records_route_observability(async_client, caplog, route: str):
     await _enable_api_key_auth(async_client)
 
     with caplog.at_level(logging.WARNING, logger="app.modules.proxy.api"):
         response = await async_client.post(
-            "/v1/images/generations",
+            route,
             json={"model": "gpt-image-2", "prompt": "a red circle"},
         )
 
@@ -196,6 +200,36 @@ async def test_images_generations_auth_rejection_records_route_observability(asy
     message = "images_route_complete route=generations model=gpt-image-2 stream=false status=401 outcome=auth_error"
     assert message in caplog.text
     assert caplog.text.count(message) == 1
+
+
+@pytest.mark.parametrize("route", _GENERATION_ROUTES, ids=["v1", "codex"])
+@pytest.mark.asyncio
+async def test_images_generations_validation_error_records_route_observability(async_client, caplog, route: str):
+    with caplog.at_level(logging.WARNING, logger="app.core.handlers.exceptions"):
+        response = await async_client.post(route, json={"model": "gpt-image-2"})
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["param"] == "prompt"
+    message = (
+        "images_route_complete route=generations model=gpt-image-2 stream=false status=400 outcome=invalid_request"
+    )
+    assert message in caplog.text
+    assert caplog.text.count(message) == 1
+
+
+@pytest.mark.parametrize("route", _GENERATION_ROUTES, ids=["v1", "codex"])
+@pytest.mark.asyncio
+async def test_images_generations_trailing_slash_uses_same_handler(async_client, route: str):
+    response = await async_client.post(
+        f"{route}/",
+        json={"model": "dall-e-3", "prompt": "a red circle"},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
 
 
 @pytest.mark.asyncio
@@ -251,13 +285,9 @@ async def test_images_generations_no_accounts_returns_5xx(async_client):
     assert body["error"]["type"] in {"server_error", "invalid_request_error"}
 
 
-@pytest.mark.parametrize(
-    "route",
-    ["/v1/images/generations", "/backend-api/codex/images/generations"],
-    ids=["v1", "codex"],
-)
+@pytest.mark.parametrize("route", _GENERATION_ROUTES, ids=["v1", "codex"])
 @pytest.mark.asyncio
-async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog, route):
+async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog, route: str):
     await _import_account(async_client, "acc_images_basic", "img-basic@example.com")
 
     captured: dict[str, object] = {}
