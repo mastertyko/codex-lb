@@ -24,6 +24,7 @@ When a direct Responses WebSocket request carries a client-supplied `previous_re
 - **WHEN** the upstream websocket closes before a terminal event
 - **THEN** the service emits `stream_incomplete` for the existing response id
 - **AND** it does not replay the same `previous_response_id` request
+- **AND** the request log records upstream failure metadata identifying that replay was refused after `response.created` without a retry-safe fresh body
 
 ### Requirement: Codex WebSocket prewarm completions are classified separately
 When a direct Responses WebSocket request carries Codex turn metadata with `request_kind: "prewarm"`, the service MUST preserve that request kind in request logs. Empty-output prewarm completions MUST NOT update account success state or previous-response ownership, while still allowing the upstream terminal frame to pass through.

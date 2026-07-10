@@ -5,4 +5,5 @@
 - [x] Preserve Codex WebSocket `request_kind` metadata in request logs and avoid account-success accounting for empty prewarm completions.
 - [x] Bound Codex compact upstream calls by the proxy compact request budget and preserve compact `request_kind` logs.
 - [x] Add pre-created direct `previous_response_id` EOF replay coverage and keep owner-account replay bounded.
+- [x] Record websocket stream-incomplete replay refusal failure metadata.
 - [x] Validate focused tests and OpenSpec.

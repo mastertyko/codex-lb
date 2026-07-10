@@ -183,11 +183,11 @@ async def test_find_latest_account_id_for_response_id_prefers_session_then_falls
     executed_sql: list[str] = []
     returned_values = iter(
         [
-            "acc_latest",
-            "acc_scoped",
-            "acc_session",
+            ("acc_latest", None, None),
+            ("acc_scoped", None, None),
+            ("acc_session", None, "sid_terminal_a"),
             None,
-            "acc_scoped",
+            ("acc_scoped", None, None),
             None,
         ]
     )
@@ -195,7 +195,7 @@ async def test_find_latest_account_id_for_response_id_prefers_session_then_falls
     async def _execute(statement):
         executed_sql.append(str(statement))
         value = next(returned_values)
-        return SimpleNamespace(scalar_one_or_none=lambda: value)
+        return SimpleNamespace(one_or_none=lambda: value)
 
     session.execute.side_effect = _execute
 
@@ -257,7 +257,7 @@ async def test_find_latest_account_id_for_response_id_ignores_blank_session_id_s
 
     async def _execute(statement):
         executed_sql.append(str(statement))
-        return SimpleNamespace(scalar_one_or_none=lambda: "acc_scoped")
+        return SimpleNamespace(one_or_none=lambda: ("acc_scoped", None, None))
 
     session.execute.side_effect = _execute
 
@@ -277,11 +277,11 @@ async def test_find_latest_account_id_for_response_id_falls_back_when_session_sc
     session = AsyncMock()
     repo = RequestLogsRepository(session)
     executed_sql: list[str] = []
-    returned_values = iter(["   ", "acc_fallback"])
+    returned_values = iter([("   ", None, "sid_terminal_a"), ("acc_fallback", None, None)])
 
     async def _execute(statement):
         executed_sql.append(str(statement))
-        return SimpleNamespace(scalar_one_or_none=lambda: next(returned_values))
+        return SimpleNamespace(one_or_none=lambda: next(returned_values))
 
     session.execute.side_effect = _execute
 

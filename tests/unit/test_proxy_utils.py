@@ -9,6 +9,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Iterator, Protocol, Self, cast
 from unittest.mock import AsyncMock, MagicMock
@@ -55,6 +56,7 @@ from app.modules.proxy._service.support import (
     _account_selection_recovery_sleep_seconds,
     _sleep_for_account_selection_recovery,
 )
+from app.modules.proxy._service.websocket import helpers as websocket_helpers_module
 from app.modules.proxy._service.websocket import mixin as websocket_mixin
 from app.modules.proxy._service.websocket import mixin as websocket_mixin_module
 from app.modules.proxy.load_balancer import (
@@ -2435,6 +2437,26 @@ class _RequestLogsRecorder:
 
     async def add_log(self, **kwargs: object) -> None:
         self.calls.append(dict(kwargs))
+
+    async def find_latest_owner_record_for_response_id(
+        self,
+        *,
+        response_id: str,
+        api_key_id: str | None,
+        session_id: str | None = None,
+    ) -> SimpleNamespace | None:
+        key = (response_id, api_key_id, session_id)
+        self.lookup_calls.append(key)
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        owner = self.response_owner_by_id.get(key)
+        if owner is not None:
+            return SimpleNamespace(account_id=owner, requested_at=None, session_id=session_id)
+        if session_id is not None:
+            fallback_owner = self.response_owner_by_id.get((response_id, api_key_id, None))
+            if fallback_owner is not None:
+                return SimpleNamespace(account_id=fallback_owner, requested_at=None, session_id=None)
+        return None
 
     async def find_latest_account_id_for_response_id(
         self,
@@ -12739,10 +12761,10 @@ async def test_pop_replayable_precreated_websocket_request_replays_injected_anch
 
 
 @pytest.mark.asyncio
-async def test_pop_replayable_precreated_request_refuses_short_client_previous_response_id():
+async def test_pop_replayable_precreated_request_replays_short_client_previous_response_id():
     anchored_payload = {"type": "response.create", "previous_response_id": "resp_anchor", "input": ["tail"]}
     pending_request = proxy_service._WebSocketRequestState(
-        request_id="ws_req_short_anchor_no_replay",
+        request_id="ws_req_short_anchor_replay",
         model="gpt-5.1",
         service_tier=None,
         reasoning_effort=None,
@@ -12759,10 +12781,12 @@ async def test_pop_replayable_precreated_request_refuses_short_client_previous_r
         pending_lock=anyio.Lock(),
     )
 
-    assert replay_request is None
-    assert list(pending_requests) == [pending_request]
-    assert pending_request.replay_count == 0
+    assert replay_request is pending_request
+    assert pending_requests == deque()
+    assert pending_request.replay_count == 1
     assert pending_request.previous_response_id == "resp_anchor"
+    assert pending_request.request_text is not None
+    assert json.loads(pending_request.request_text) == anchored_payload
 
 
 @pytest.mark.asyncio
@@ -18467,6 +18491,77 @@ def test_sanitize_websocket_connect_failure_rewrites_previous_response_not_found
     assert rewritten_error_code == "stream_incomplete"
     assert rewritten_error_message == "Upstream websocket closed before response.completed"
     assert "continuity_fail_closed surface=websocket_connect reason=previous_response_not_found" in caplog.text
+    assert "resp_prev_anchor" not in caplog.text
+    assert counter.samples == [
+        {
+            "labels": {"surface": "websocket_connect", "reason": "previous_response_not_found"},
+            "value": 1.0,
+        }
+    ]
+
+
+def test_sanitize_websocket_connect_failure_records_stale_anchor_metadata(monkeypatch, caplog):
+    fixed_now = utcnow()
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_prev_connect_failure_metadata",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        previous_response_id="resp_prev_anchor",
+        session_id="sid-prev-shared",
+    )
+    request_state.fresh_upstream_request_text = '{"type":"response.create","input":[]}'
+    request_state.fresh_upstream_request_is_retry_safe = True
+    request_state.previous_response_owner_lookup_source = "request_logs"
+    request_state.previous_response_owner_lookup_outcome = "hit"
+    request_state.previous_response_owner_requested_at = fixed_now - timedelta(seconds=42)
+    request_state.previous_response_owner_session_id = "sid-prev-shared"
+    counter = _ObservedCounter()
+
+    monkeypatch.setattr(proxy_service, "PROMETHEUS_AVAILABLE", True)
+    monkeypatch.setattr(proxy_service, "continuity_fail_closed_total", counter, raising=False)
+    monkeypatch.setattr(websocket_helpers_module, "utcnow", lambda: fixed_now)
+    caplog.set_level(logging.WARNING, logger="app.modules.proxy.service")
+
+    original_payload = proxy_module.openai_error(
+        "previous_response_not_found",
+        "Previous response with id 'resp_prev_anchor' not found.",
+        error_type="invalid_request_error",
+    )
+    original_payload["error"]["param"] = "previous_response_id"
+
+    rewritten_status, rewritten_payload, rewritten_error_code, rewritten_error_message = (
+        proxy_service._sanitize_websocket_connect_failure(
+            request_state=request_state,
+            status_code=400,
+            payload=original_payload,
+            error_code="previous_response_not_found",
+            error_message="Previous response with id 'resp_prev_anchor' not found.",
+        )
+    )
+
+    assert rewritten_status == 502
+    assert rewritten_payload["error"]["code"] == "stream_incomplete"
+    assert rewritten_error_code == "stream_incomplete"
+    assert rewritten_error_message == "Upstream websocket closed before response.completed"
+    assert request_state.failure_phase_override == "upstream"
+    assert request_state.failure_detail_override == (
+        "previous_response_not_found "
+        "previous_response_source=client_supplied "
+        "fresh_replay_available=true "
+        "owner_lookup_source=request_logs "
+        "owner_lookup_outcome=hit "
+        "previous_response_age_seconds=42 "
+        "same_session=true"
+    )
+    assert "resp_prev_anchor" not in cast(str, request_state.failure_detail_override)
+    assert (
+        "diagnostics=previous_response_source=client_supplied fresh_replay_available=true "
+        "owner_lookup_source=request_logs owner_lookup_outcome=hit "
+        "previous_response_age_seconds=42 same_session=true"
+    ) in caplog.text
     assert "resp_prev_anchor" not in caplog.text
     assert counter.samples == [
         {

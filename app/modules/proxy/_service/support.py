@@ -8,6 +8,7 @@ import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Literal
 
 import anyio
@@ -368,9 +369,16 @@ class _WebSocketRequestState:
     error_message_override: str | None = None
     error_type_override: str | None = None
     error_param_override: str | None = None
+    failure_phase_override: str | None = None
+    failure_detail_override: str | None = None
+    upstream_error_code_override: str | None = None
     error_http_status_override: int | None = None
     response_event_count: int = 0
     previous_response_not_found_rewritten: bool = False
+    previous_response_owner_lookup_source: str | None = None
+    previous_response_owner_lookup_outcome: str | None = None
+    previous_response_owner_requested_at: datetime | None = None
+    previous_response_owner_session_id: str | None = None
     response_create_gate_acquired: bool = False
     response_create_gate: asyncio.Semaphore | None = None
     response_create_admission: AdmissionLease | None = None
@@ -533,6 +541,9 @@ def _clear_websocket_request_error_overrides(request_state: _WebSocketRequestSta
     request_state.error_message_override = None
     request_state.error_type_override = None
     request_state.error_param_override = None
+    request_state.failure_phase_override = None
+    request_state.failure_detail_override = None
+    request_state.upstream_error_code_override = None
     request_state.error_http_status_override = None
 
 
@@ -544,30 +555,33 @@ def _record_response_event(request_state: _WebSocketRequestState | None, event_t
     request_state.response_event_count += 1
 
 
-def _websocket_request_can_replay_before_visible_output(request_state: _WebSocketRequestState) -> bool:
+def _websocket_replay_before_visible_output_refusal_reason(request_state: _WebSocketRequestState) -> str | None:
     if not request_state.request_text:
-        return False
+        return "missing_request_text"
     if request_state.replay_count >= 1:
-        return False
+        return "replay_count_exhausted"
     if request_state.downstream_visible:
-        return False
+        return "downstream_visible"
     has_retry_safe_fresh_payload = (
         request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text is not None
     )
     precreated_pending = request_state.response_id is None and request_state.awaiting_response_created
-    # A direct previous_response_id request can be retried only while the
-    # upstream has not acknowledged it with any response.* frame. Once a
-    # response id is visible, replaying the same previous_response_id can fork
-    # continuity; before that point this is the only recoverable no-output EOF.
-    created_only_pending = (
-        request_state.response_id is not None
-        and not request_state.awaiting_response_created
-        and request_state.response_event_count <= 1
-        and (request_state.previous_response_id is None or has_retry_safe_fresh_payload)
-    )
-    if precreated_pending and request_state.response_event_count > 0:
-        return False
-    return precreated_pending or created_only_pending
+    if precreated_pending:
+        if request_state.response_event_count > 0:
+            return "precreated_response_event_seen"
+        return None
+    created_only_pending = request_state.response_id is not None and not request_state.awaiting_response_created
+    if created_only_pending:
+        if request_state.response_event_count > 1:
+            return "response_event_count_gt_1"
+        if request_state.previous_response_id is not None and not has_retry_safe_fresh_payload:
+            return "previous_response_after_created_no_fresh_body"
+        return None
+    return "not_pending_response_create"
+
+
+def _websocket_request_can_replay_before_visible_output(request_state: _WebSocketRequestState) -> bool:
+    return _websocket_replay_before_visible_output_refusal_reason(request_state) is None
 
 
 def _record_websocket_route_metadata(

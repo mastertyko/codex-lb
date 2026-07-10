@@ -62,7 +62,7 @@ from app.core.utils.sse import (
     CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME,  # noqa: F401
 )
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
-from app.core.utils.time import utcnow as utcnow
+from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
     AccountStatus,  # noqa: F401
 )
@@ -283,7 +283,7 @@ from app.modules.proxy._service.support import (
     _clear_websocket_request_error_overrides,
     _DownstreamWebSocketActivity,
     _event_type_from_payload,
-    _websocket_request_can_replay_before_visible_output,
+    _websocket_replay_before_visible_output_refusal_reason,
     _WebSocketContinuityAnchor,
     _WebSocketContinuityState,
     _WebSocketReceiveTimeout,
@@ -747,15 +747,26 @@ async def _pop_replayable_precreated_websocket_request_state(
     pending_requests: deque[_WebSocketRequestState],
     *,
     pending_lock: anyio.Lock,
+    replay_refusal_reasons: list[str] | None = None,
 ) -> _WebSocketRequestState | None:
     async with pending_lock:
-        if len(pending_requests) != 1:
+        pending_count = len(pending_requests)
+        if pending_count != 1:
+            if replay_refusal_reasons is not None:
+                replay_refusal_reasons.append(
+                    "multiple_pending_requests" if pending_count > 1 else "no_pending_requests"
+                )
             return None
         request_state = pending_requests[0]
-        if not _websocket_request_can_replay_before_visible_output(request_state):
+        replay_refusal_reason = _websocket_replay_before_visible_output_refusal_reason(request_state)
+        if replay_refusal_reason is not None:
+            if replay_refusal_reasons is not None:
+                replay_refusal_reasons.append(replay_refusal_reason)
             return None
         pending_requests.popleft()
     if _prepare_websocket_request_state_for_visible_output_replay(request_state) is None:
+        if replay_refusal_reasons is not None:
+            replay_refusal_reasons.append("prepare_replay_failed")
         return None
     return request_state
 
@@ -892,6 +903,59 @@ def _websocket_continuity_error_fields(
     return "stream_incomplete", PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE
 
 
+def _websocket_previous_response_source(request_state: _WebSocketRequestState) -> str:
+    if request_state.previous_response_id is None:
+        return "none"
+    if request_state.proxy_injected_previous_response_id:
+        return "proxy_injected"
+    return "client_supplied"
+
+
+def _websocket_same_session_for_previous_response(request_state: _WebSocketRequestState) -> bool | None:
+    request_session_id = request_state.session_id.strip() if isinstance(request_state.session_id, str) else ""
+    owner_session_id = (
+        request_state.previous_response_owner_session_id.strip()
+        if isinstance(request_state.previous_response_owner_session_id, str)
+        else ""
+    )
+    if not request_session_id or not owner_session_id:
+        return None
+    return request_session_id == owner_session_id
+
+
+def _websocket_previous_response_age_seconds(request_state: _WebSocketRequestState) -> int | None:
+    requested_at = request_state.previous_response_owner_requested_at
+    if requested_at is None:
+        return None
+    return max(0, int((utcnow() - to_utc_naive(requested_at)).total_seconds()))
+
+
+def _websocket_stale_anchor_diagnostics(request_state: _WebSocketRequestState) -> dict[str, object]:
+    return {
+        "previous_response_source": _websocket_previous_response_source(request_state),
+        "fresh_replay_available": bool(
+            request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text is not None
+        ),
+        "owner_lookup_source": request_state.previous_response_owner_lookup_source,
+        "owner_lookup_outcome": request_state.previous_response_owner_lookup_outcome,
+        "previous_response_age_seconds": _websocket_previous_response_age_seconds(request_state),
+        "same_session": _websocket_same_session_for_previous_response(request_state),
+    }
+
+
+def _websocket_stale_anchor_failure_detail(request_state: _WebSocketRequestState) -> str:
+    diagnostics = _websocket_stale_anchor_diagnostics(request_state)
+    fields: list[str] = []
+    for key, value in diagnostics.items():
+        if value is None:
+            fields.append(f"{key}=unknown")
+        elif isinstance(value, bool):
+            fields.append(f"{key}={str(value).lower()}")
+        else:
+            fields.append(f"{key}={value}")
+    return "previous_response_not_found " + " ".join(fields)
+
+
 def _rewrite_websocket_continuity_corruption_event(
     *,
     request_state: _WebSocketRequestState,
@@ -903,11 +967,25 @@ def _rewrite_websocket_continuity_corruption_event(
     del original_text
     if reconnect_requested:
         upstream_control.reconnect_requested = True
+    stale_diagnostics = (
+        _websocket_stale_anchor_diagnostics(request_state) if reason == "previous_response_not_found" else {}
+    )
+    if reason == "previous_response_not_found":
+        request_state.failure_phase_override = "upstream"
+        request_state.failure_detail_override = _websocket_stale_anchor_failure_detail(request_state)
+        request_state.upstream_error_code_override = "previous_response_not_found"
     _record_continuity_fail_closed(
         surface="websocket_stream",
         reason=reason,
         previous_response_id=request_state.previous_response_id,
         session_id=request_state.session_id,
+        upstream_error_code="previous_response_not_found" if reason == "previous_response_not_found" else None,
+        previous_response_source=cast(str | None, stale_diagnostics.get("previous_response_source")),
+        fresh_replay_available=cast(bool | None, stale_diagnostics.get("fresh_replay_available")),
+        owner_lookup_source=cast(str | None, stale_diagnostics.get("owner_lookup_source")),
+        owner_lookup_outcome=cast(str | None, stale_diagnostics.get("owner_lookup_outcome")),
+        previous_response_age_seconds=cast(int | None, stale_diagnostics.get("previous_response_age_seconds")),
+        same_session=cast(bool | None, stale_diagnostics.get("same_session")),
     )
     rewritten_code, rewritten_message = _websocket_continuity_error_fields(
         reason=reason,
@@ -986,6 +1064,7 @@ def _sanitize_websocket_connect_failure(
         error_message=error_message,
         surface="websocket_connect",
         expose_stale_previous_response_classifier=request_state.expose_stale_previous_response_classifier,
+        request_state=request_state,
     )
 
 
@@ -999,6 +1078,7 @@ def _sanitize_websocket_previous_response_error(
     error_message: str,
     surface: str,
     expose_stale_previous_response_classifier: bool = False,
+    request_state: _WebSocketRequestState | None = None,
 ) -> tuple[int, OpenAIErrorEnvelope, str, str]:
     if previous_response_id is None:
         return status_code, payload, error_code, error_message
@@ -1024,6 +1104,16 @@ def _sanitize_websocket_previous_response_error(
     if not should_rewrite:
         return status_code, payload, error_code, error_message
 
+    stale_diagnostics = (
+        _websocket_stale_anchor_diagnostics(request_state)
+        if request_state is not None and reason == "previous_response_not_found"
+        else {}
+    )
+    if request_state is not None and reason == "previous_response_not_found":
+        request_state.failure_phase_override = "upstream"
+        request_state.failure_detail_override = _websocket_stale_anchor_failure_detail(request_state)
+        request_state.upstream_error_code_override = normalized_code
+
     rewritten_code, rewritten_message = _websocket_continuity_error_fields(
         reason=reason,
         expose_stale_previous_response_classifier=expose_stale_previous_response_classifier,
@@ -1034,6 +1124,12 @@ def _sanitize_websocket_previous_response_error(
         previous_response_id=previous_response_id,
         session_id=session_id,
         upstream_error_code=normalized_code,
+        previous_response_source=cast(str | None, stale_diagnostics.get("previous_response_source")),
+        fresh_replay_available=cast(bool | None, stale_diagnostics.get("fresh_replay_available")),
+        owner_lookup_source=cast(str | None, stale_diagnostics.get("owner_lookup_source")),
+        owner_lookup_outcome=cast(str | None, stale_diagnostics.get("owner_lookup_outcome")),
+        previous_response_age_seconds=cast(int | None, stale_diagnostics.get("previous_response_age_seconds")),
+        same_session=cast(bool | None, stale_diagnostics.get("same_session")),
     )
     return (
         502,
@@ -1062,12 +1158,22 @@ def _sanitize_websocket_terminal_error_fields(
         message=error_message,
     ):
         return error_code, error_message, error_type, error_param
+    stale_diagnostics = _websocket_stale_anchor_diagnostics(request_state)
+    request_state.failure_phase_override = "upstream"
+    request_state.failure_detail_override = _websocket_stale_anchor_failure_detail(request_state)
+    request_state.upstream_error_code_override = normalized_code
     _record_continuity_fail_closed(
         surface="websocket_terminal",
         reason="previous_response_not_found",
         previous_response_id=request_state.previous_response_id,
         session_id=request_state.session_id,
         upstream_error_code=normalized_code,
+        previous_response_source=cast(str | None, stale_diagnostics.get("previous_response_source")),
+        fresh_replay_available=cast(bool | None, stale_diagnostics.get("fresh_replay_available")),
+        owner_lookup_source=cast(str | None, stale_diagnostics.get("owner_lookup_source")),
+        owner_lookup_outcome=cast(str | None, stale_diagnostics.get("owner_lookup_outcome")),
+        previous_response_age_seconds=cast(int | None, stale_diagnostics.get("previous_response_age_seconds")),
+        same_session=cast(bool | None, stale_diagnostics.get("same_session")),
     )
     rewritten_code, rewritten_message = _websocket_continuity_error_fields(
         reason="previous_response_not_found",
@@ -1349,6 +1455,15 @@ def _pop_terminal_websocket_request_state(
             pending_requests.remove(request_state)
             return request_state
     return None
+
+
+def _websocket_failure_detail_with_replay_refusal(
+    base_detail: str,
+    replay_refusal_reasons: Sequence[str],
+) -> str:
+    if not replay_refusal_reasons:
+        return base_detail
+    return f"{base_detail}_replay_refused_{replay_refusal_reasons[0]}"
 
 
 def _upstream_websocket_disconnect_message(message: UpstreamWebSocketMessage) -> str:
