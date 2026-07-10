@@ -251,8 +251,13 @@ async def test_images_generations_no_accounts_returns_5xx(async_client):
     assert body["error"]["type"] in {"server_error", "invalid_request_error"}
 
 
+@pytest.mark.parametrize(
+    "route",
+    ["/v1/images/generations", "/backend-api/codex/images/generations"],
+    ids=["v1", "codex"],
+)
 @pytest.mark.asyncio
-async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog):
+async def test_images_generations_returns_envelope_on_success(async_client, monkeypatch, caplog, route):
     await _import_account(async_client, "acc_images_basic", "img-basic@example.com")
 
     captured: dict[str, object] = {}
@@ -302,7 +307,7 @@ async def test_images_generations_returns_envelope_on_success(async_client, monk
 
     with caplog.at_level(logging.INFO, logger="app.modules.proxy.api"):
         response = await async_client.post(
-            "/v1/images/generations",
+            route,
             json={
                 "model": "gpt-image-2",
                 "prompt": "tiny red circle on white",

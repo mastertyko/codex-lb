@@ -1554,6 +1554,7 @@ async def v1_audio_transcriptions(
     )
 
 
+@router.post("/images/generations", response_model=None)
 @v1_router.post("/images/generations", response_model=None)
 async def v1_images_generations(
     request: Request,
