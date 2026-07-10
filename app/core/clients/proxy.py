@@ -55,6 +55,7 @@ from app.core.errors import (
     openai_error,
     response_failed_event,
 )
+from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import CompactResponsePayload, OpenAIError
 from app.core.openai.parsing import (
@@ -62,7 +63,11 @@ from app.core.openai.parsing import (
     parse_error_payload,
     parse_sse_event,
 )
-from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest
+from app.core.openai.requests import (
+    ResponsesCompactRequest,
+    ResponsesRequest,
+    validate_compact_input_wire_budget,
+)
 from app.core.resilience.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpenError,
@@ -77,7 +82,7 @@ from app.core.utils.sse import format_sse_event, parse_sse_data_json
 
 CODEX_INSTALLATION_ID_HEADER = "x-codex-installation-id"
 CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
-CODEX_RESPONSES_LITE_WS_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
+CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY = "ws_request_header_x_openai_internal_codex_responses_lite"
 
 IGNORE_INBOUND_HEADERS = {
     "authorization",
@@ -1344,7 +1349,7 @@ def _payload_uses_responses_lite(payload: Mapping[str, JsonValue]) -> bool:
 
 def _client_metadata_uses_responses_lite(client_metadata: Mapping[str, JsonValue]) -> bool:
     return any(
-        key.lower() == CODEX_RESPONSES_LITE_WS_METADATA_KEY
+        key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY
         and isinstance(value, str)
         and value.strip().lower() == "true"
         for key, value in client_metadata.items()
@@ -1365,10 +1370,10 @@ def _normalize_responses_lite_websocket_client_metadata(
     normalized = dict(client_metadata)
     existing_marker = _client_metadata_uses_responses_lite(normalized)
     for key in tuple(normalized):
-        if key.lower() == CODEX_RESPONSES_LITE_WS_METADATA_KEY:
+        if key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY:
             del normalized[key]
     if _payload_uses_responses_lite(payload) or (preserve_existing and existing_marker):
-        normalized[CODEX_RESPONSES_LITE_WS_METADATA_KEY] = "true"
+        normalized[CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY] = "true"
     return normalized
 
 
@@ -1376,7 +1381,7 @@ def _strip_responses_lite_websocket_client_metadata(payload: dict[str, JsonValue
     raw_metadata = payload.get("client_metadata")
     client_metadata = dict(raw_metadata) if is_json_mapping(raw_metadata) else {}
     for key in tuple(client_metadata):
-        if key.lower() == CODEX_RESPONSES_LITE_WS_METADATA_KEY:
+        if key.lower() == CODEX_RESPONSES_LITE_WEBSOCKET_METADATA_KEY:
             del client_metadata[key]
     if client_metadata:
         payload["client_metadata"] = client_metadata
@@ -3259,6 +3264,17 @@ class _CompactCommandTransport:
                 effective_connect_timeout,
             )
         _apply_responses_lite_http_header(upstream_headers, payload_dict)
+        try:
+            validate_compact_input_wire_budget(payload_dict)
+        except ClientPayloadError as exc:
+            error = openai_error(
+                exc.code or "invalid_request_error",
+                str(exc),
+                error_type=exc.error_type or "invalid_request_error",
+            )
+            if exc.param is not None:
+                error["error"]["param"] = exc.param
+            raise ProxyResponseError(400, error) from exc
         now = time.monotonic()
         compact_timeout_seconds = _remaining_total_timeout(
             compact_timeout_seconds,

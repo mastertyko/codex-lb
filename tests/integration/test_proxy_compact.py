@@ -122,6 +122,39 @@ async def test_proxy_compact_no_accounts(async_client):
 
 
 @pytest.mark.asyncio
+async def test_proxy_compact_rejects_untrimmable_lite_prelude_before_account_selection(async_client):
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "custom",
+                        "name": "exec",
+                        "format": {
+                            "type": "grammar",
+                            "syntax": "lark",
+                            "definition": "x" * 500_000,
+                        },
+                    }
+                ],
+            },
+            {"type": "message", "role": "developer", "content": "instructions"},
+        ],
+    }
+
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "responses_compact_input_too_large"
+    assert error["param"] == "input"
+
+
+@pytest.mark.asyncio
 async def test_proxy_compact_strips_tool_fields_before_upstream(async_client, monkeypatch):
     email = "compact-tools@example.com"
     raw_account_id = "acc_compact_tools"
@@ -502,7 +535,9 @@ async def test_proxy_compact_oversized_lite_input_preserves_anchor_and_sets_http
     assert "client_metadata" not in call_json
     assert call_json["instructions"] == ""
     call_input = cast(list[dict[str, object]], call_json["input"])
-    assert call_input[:2] == [additional_tools, developer_message]
+    additional_tools_index = call_input.index(additional_tools)
+    assert call_input[additional_tools_index : additional_tools_index + 2] == [additional_tools, developer_message]
+    assert {"role": "user", "content": "latest request"} in call_input
     assert oversized_history not in call_input
     assert "[compact trim] Omitted" in json.dumps(call_input)
 

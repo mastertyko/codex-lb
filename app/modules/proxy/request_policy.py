@@ -9,7 +9,12 @@ from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.exceptions import ProxyModelNotAllowed
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.model_registry import ModelRegistry, get_model_registry, resolve_known_model_alias
-from app.core.openai.requests import ResponsesCompactRequest, ResponsesReasoning, ResponsesRequest
+from app.core.openai.requests import (
+    ResponsesCompactRequest,
+    ResponsesReasoning,
+    ResponsesRequest,
+    responses_input_uses_lite_tools,
+)
 from app.core.openai.strict_schema import (
     validate_strict_function_tool_schema,
     validate_strict_json_schema,
@@ -31,6 +36,7 @@ logger = logging.getLogger(__name__)
 # accept it as of 2026-04. See https://github.com/Soju06/codex-lb/issues/493
 _UNSUPPORTED_UPSTREAM_REASONING_EFFORTS: frozenset[str] = frozenset({"minimal"})
 _DEFAULT_REASONING_EFFORT_FALLBACK = "low"
+
 
 # Cursor exposes GPT-5 family model labels with UI suffixes such as "Extra
 # High Fast". The ChatGPT/Codex upstream accepts the canonical GPT-5-family
@@ -112,6 +118,8 @@ def validate_model_access(api_key: ApiKeyData | None, model: str | None) -> None
 def apply_api_key_enforcement(
     payload: ResponsesRequest | ResponsesCompactRequest,
     api_key: ApiKeyData | None,
+    *,
+    registry: ModelRegistry | None = None,
 ) -> None:
     normalize_upstream_model_alias(payload)
 
@@ -119,16 +127,30 @@ def apply_api_key_enforcement(
         normalize_unsupported_reasoning_effort(payload)
         return
 
-    if api_key.enforced_model and payload.model != api_key.enforced_model:
-        logger.info(
-            "api_key_model_enforced request_id=%s key_id=%s requested_model=%s enforced_model=%s",
-            get_request_id(),
-            api_key.id,
-            payload.model,
-            api_key.enforced_model,
-        )
+    if api_key.enforced_model:
+        requested_model = payload.model
+        if requested_model != api_key.enforced_model:
+            logger.info(
+                "api_key_model_enforced request_id=%s key_id=%s requested_model=%s enforced_model=%s",
+                get_request_id(),
+                api_key.id,
+                requested_model,
+                api_key.enforced_model,
+            )
         payload.model = api_key.enforced_model
         normalize_upstream_model_alias(payload)
+        if (
+            responses_input_uses_lite_tools(payload.input)
+            and _model_responses_lite_capability(
+                payload.model,
+                registry=registry or get_model_registry(),
+            )
+            is False
+        ):
+            raise ProxyModelNotAllowed(
+                f"API key enforced model '{payload.model}' does not support Responses Lite",
+                code="responses_lite_model_mismatch",
+            )
 
     if api_key.enforced_reasoning_effort is not None:
         requested_effort = payload.reasoning.effort if payload.reasoning else None
@@ -171,6 +193,20 @@ def apply_api_key_enforcement(
                 api_key.enforced_service_tier,
                 effective_service_tier,
             )
+
+
+def _model_responses_lite_capability(
+    model: str,
+    *,
+    registry: ModelRegistry,
+) -> bool | None:
+    normalized_model = model.strip().lower()
+    models = registry.get_models_with_fallback()
+    model_entry = models.get(model) or models.get(normalized_model)
+    if model_entry is None:
+        return None
+    capability = model_entry.raw.get("use_responses_lite")
+    return capability if isinstance(capability, bool) else None
 
 
 # Non-standard reasoning toggles some OpenAI-compatible clients attach
@@ -375,6 +411,7 @@ def normalize_unsupported_reasoning_effort(
     so clients (e.g. Codex CLI's ``--reasoning-effort minimal``) keep
     working. Mapping picks the model's lowest advertised effort, falling
     back to ``low`` when the registry has no metadata yet.
+
     """
 
     if payload.reasoning is None or payload.reasoning.effort is None:
@@ -382,6 +419,7 @@ def normalize_unsupported_reasoning_effort(
 
     requested_effort = payload.reasoning.effort
     normalized_effort = requested_effort.strip().lower()
+
     if normalized_effort not in _UNSUPPORTED_UPSTREAM_REASONING_EFFORTS:
         return
 

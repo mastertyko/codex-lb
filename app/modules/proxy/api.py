@@ -91,14 +91,19 @@ from app.core.openai.models import (
     OpenAIErrorEnvelope as OpenAIErrorEnvelopeModel,
 )
 from app.core.openai.parsing import parse_response_payload
-from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest, extract_input_file_ids
+from app.core.openai.requests import (
+    ResponsesCompactRequest,
+    ResponsesRequest,
+    extract_input_file_ids,
+    normalize_tool_type,
+)
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
 from app.core.request_locality import resolve_request_client_host
 from app.core.resilience.overload import is_local_overload_error_code, merge_retry_after_headers
 from app.core.runtime_logging import log_error_response
 from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
-from app.core.utils.json_guards import is_json_mapping
+from app.core.utils.json_guards import is_json_list, is_json_mapping
 from app.core.utils.request_id import ensure_request_id, get_request_id
 from app.core.utils.sse import (
     CODEX_KEEPALIVE_FRAME,
@@ -129,6 +134,8 @@ from app.modules.firewall.service import FirewallRepositoryPort, FirewallService
 from app.modules.model_sources.catalog import (
     source_model_audio_cost_usd,
     source_model_cost_usd,
+    source_model_request_overrides,
+    source_model_supported_tool_types,
     source_model_supports_reasoning,
     source_models_to_upstream_models,
 )
@@ -827,10 +834,20 @@ async def models(
     return await _build_codex_models_response(api_key)
 
 
-@v1_router.get("/models", response_model=ModelListResponse)
+@v1_router.get("/models", response_model=None)
 async def v1_models(
+    request: Request,
     api_key: ApiKeyData | None = Security(validate_proxy_api_key),
 ) -> Response:
+    # Codex clients pointed at this proxy via `openai_base_url` fetch their model
+    # catalog from `<base_url>/models` and always append a `client_version` query
+    # parameter. They require the Codex catalog shape (`{"models": [...]}`); the
+    # OpenAI-compatible list shape fails to parse client-side, and the client
+    # silently falls back to its bundled model metadata (stale tool_mode /
+    # use_responses_lite flags and context windows). Serve the Codex catalog to
+    # Codex clients and keep the OpenAI-compatible shape for everyone else.
+    if request.query_params.get("client_version"):
+        return await _build_codex_models_response(api_key)
     return await _build_models_response(api_key)
 
 
@@ -857,13 +874,16 @@ async def v1_usage(
     if usage is None:
         raise ProxyAuthError("Invalid API key")
 
+    own_limits = [_to_v1_usage_limit_response(limit) for limit in usage.limits]
+    upstream_limits = [] if hide_upstream_limits else _ordered_aggregate_limits(aggregate_limits)
+
     return V1UsageResponse(
         request_count=usage.request_count,
         total_tokens=usage.total_tokens,
         cached_input_tokens=usage.cached_input_tokens,
         total_cost_usd=usage.total_cost_usd,
-        limits=[_to_v1_usage_limit_response(limit) for limit in usage.limits],
-        upstream_limits=[] if hide_upstream_limits else _ordered_aggregate_limits(aggregate_limits),
+        limits=own_limits or upstream_limits,
+        upstream_limits=upstream_limits,
         account_pool_usage=account_pool_usage,
     )
 
@@ -1555,7 +1575,7 @@ async def v1_audio_transcriptions(
 
 
 @router.post("/images/generations/", response_model=None, include_in_schema=False)
-@router.post("/images/generations", response_model=None)
+@router.post("/images/generations", response_model=None, include_in_schema=False)
 @v1_router.post("/images/generations/", response_model=None, include_in_schema=False)
 @v1_router.post("/images/generations", response_model=None)
 async def v1_images_generations(
@@ -1737,6 +1757,138 @@ async def v1_images_edits(
         payload=form_payload,
         images=images_payload,
         mask=mask_payload,
+        context=context,
+        api_key=api_key,
+        started_at=started_at,
+    )
+
+
+@router.post("/images/edits", response_model=None, include_in_schema=False)
+async def codex_images_edits(
+    request: Request,
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    """Accept Codex's JSON data-URL image-edit payload on its native base URL.
+
+    The built-in Codex image tool sends ``images: [{"image_url":
+    "data:<mime>;base64,..."}]`` rather than the multipart ``image`` parts
+    used by the public OpenAI Images API. Decode that transport shape here,
+    then delegate to the shared edit pipeline so validation and upstream
+    behavior remain identical.
+    """
+    started_at = time.perf_counter()
+    try:
+        raw_payload = await request.json()
+    except (JSONDecodeError, UnicodeDecodeError):
+        _record_images_edit_early_rejection(
+            model=None,
+            stream=False,
+            started_at=started_at,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "Expected a JSON request body.",
+                param="prompt",
+            ),
+        )
+    if not is_json_mapping(raw_payload):
+        _record_images_edit_early_rejection(
+            model=None,
+            stream=False,
+            started_at=started_at,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "Expected a JSON object request body.",
+                param="prompt",
+            ),
+        )
+
+    raw_model = raw_payload.get("model")
+    observability_model = raw_model if isinstance(raw_model, str) else None
+    raw_stream = raw_payload.get("stream", False)
+    observability_stream = raw_stream if isinstance(raw_stream, bool) else False
+    raw_form: dict[str, object] = {
+        "model": raw_model,
+        "prompt": raw_payload.get("prompt"),
+        "n": raw_payload.get("n", 1),
+        "size": raw_payload.get("size", "auto"),
+        "quality": raw_payload.get("quality", "auto"),
+        "background": raw_payload.get("background", "auto"),
+        "output_format": raw_payload.get("output_format", "png"),
+        "output_compression": raw_payload.get("output_compression", 100),
+        "moderation": raw_payload.get("moderation", "auto"),
+        "partial_images": raw_payload.get("partial_images"),
+        "stream": raw_payload.get("stream", False),
+        "input_fidelity": raw_payload.get("input_fidelity"),
+        "user": raw_payload.get("user"),
+    }
+    try:
+        form_payload = V1ImagesEditsForm.model_validate(raw_form)
+    except ValidationError as exc:
+        _record_images_edit_early_rejection(
+            model=observability_model,
+            stream=observability_stream,
+            started_at=started_at,
+        )
+        return _logged_error_json_response(request, 400, openai_validation_error(exc))
+
+    raw_images = raw_payload.get("images")
+    if not isinstance(raw_images, list) or not raw_images:
+        _record_images_edit_early_rejection(
+            model=form_payload.model,
+            stream=bool(form_payload.stream),
+            started_at=started_at,
+        )
+        return _logged_error_json_response(
+            request,
+            400,
+            images_service_module.make_invalid_request_error(
+                "At least one `images[].image_url` data URL is required.",
+                param="images",
+            ),
+        )
+
+    images: list[tuple[bytes, str | None]] = []
+    for index, raw_image in enumerate(raw_images):
+        if not is_json_mapping(raw_image) or not isinstance(image_url := raw_image.get("image_url"), str):
+            _record_images_edit_early_rejection(
+                model=form_payload.model,
+                stream=bool(form_payload.stream),
+                started_at=started_at,
+            )
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error(
+                    f"images[{index}].image_url must be a base64 data URL.",
+                    param="images",
+                ),
+            )
+        try:
+            images.append(images_service_module.decode_data_url(image_url))
+        except ValueError as exc:
+            _record_images_edit_early_rejection(
+                model=form_payload.model,
+                stream=bool(form_payload.stream),
+                started_at=started_at,
+            )
+            return _logged_error_json_response(
+                request,
+                400,
+                images_service_module.make_invalid_request_error(str(exc), param="images"),
+            )
+
+    return await _proxy_images_edit_request(
+        request=request,
+        payload=form_payload,
+        images=images,
+        mask=None,
         context=context,
         api_key=api_key,
         started_at=started_at,
@@ -3198,6 +3350,11 @@ async def _source_responses_response(
     )
     source_payload = payload.model_dump(mode="json", exclude_none=True)
     source_payload["stream"] = bool(payload.stream)
+    _apply_source_response_request_overrides(source_payload, source_model_request_overrides(source, payload.model))
+    _drop_unsupported_source_response_tools(
+        source_payload,
+        supported_tool_types=source_model_supported_tool_types(source, payload.model),
+    )
 
     if payload.stream:
         try:
@@ -3308,6 +3465,181 @@ async def _source_responses_response(
         upstream_status_code=result.upstream_status_code,
     )
     return JSONResponse(content=result.payload, status_code=200, headers=rate_limit_headers)
+
+
+# Keys that source_request_overrides must never clobber: the routed model slug
+# is owned by source selection, and the stream flag drives SSE-vs-JSON response
+# handling on the proxy side.
+_SOURCE_RESPONSE_OVERRIDE_PROTECTED_KEYS = frozenset({"model", "stream"})
+
+
+def _apply_source_response_request_overrides(
+    payload: dict[str, JsonValue],
+    overrides: Mapping[str, JsonValue],
+) -> None:
+    for key, value in overrides.items():
+        if key in _SOURCE_RESPONSE_OVERRIDE_PROTECTED_KEYS:
+            continue
+        if key == "options" and isinstance(value, Mapping):
+            existing_options = payload.get("options")
+            merged_options = dict(existing_options) if isinstance(existing_options, Mapping) else {}
+            merged_options.update(value)
+            payload["options"] = merged_options
+            continue
+        payload[key] = value
+
+
+def _source_tool_type_supported(tool_type: JsonValue | None, supported_tool_types: frozenset[str]) -> bool:
+    if tool_type == "function":
+        return True
+    return isinstance(tool_type, str) and tool_type in supported_tool_types
+
+
+def _normalize_source_allowed_tool_choice_aliases(payload: dict[str, JsonValue]) -> None:
+    """Normalize legacy tool-type aliases nested under ``allowed_tools``.
+
+    Request validation normalizes the ``tools`` list and the top-level
+    ``tool_choice`` type (``web_search_preview`` -> ``web_search``) but leaves
+    entries nested under an ``allowed_tools`` choice untouched. Sources that
+    reject the legacy alias or validate the forced choice against the
+    (normalized) tools list would fail such requests, so source-bound payloads
+    always get the same alias normalization applied to the nested entries.
+    """
+    tool_choice = payload.get("tool_choice")
+    if not is_json_mapping(tool_choice):
+        return
+    if tool_choice.get("type") != "allowed_tools":
+        return
+    allowed = tool_choice.get("tools")
+    if not is_json_list(allowed):
+        return
+    normalized_allowed: list[JsonValue] = []
+    changed = False
+    for entry in allowed:
+        if is_json_mapping(entry):
+            entry_type = entry.get("type")
+            if isinstance(entry_type, str):
+                normalized_type = normalize_tool_type(entry_type)
+                if normalized_type != entry_type:
+                    entry = {**entry, "type": normalized_type}
+                    changed = True
+        normalized_allowed.append(entry)
+    if not changed:
+        return
+    updated_choice: dict[str, JsonValue] = dict(tool_choice)
+    updated_choice["tools"] = normalized_allowed
+    payload["tool_choice"] = updated_choice
+
+
+# Maps hosted tool types to the Responses ``include`` prefixes that only make
+# sense while that tool is present (see _RESPONSES_INCLUDE_ALLOWLIST in
+# app.core.openai.requests). When the source filter drops a hosted tool, the
+# matching include entries must be pruned with it: sources that validate
+# ``include`` would otherwise reject the request the filter just repaired.
+# Non-tool-specific entries (``reasoning.*``, ``message.*``) are never pruned.
+_SOURCE_TOOL_INCLUDE_PREFIXES: dict[str, tuple[str, ...]] = {
+    "web_search": ("web_search_call.",),
+    "file_search": ("file_search_call.",),
+    "code_interpreter": ("code_interpreter_call.",),
+    "computer_use": ("computer_call_output.",),
+    "computer_use_preview": ("computer_call_output.",),
+}
+
+
+def _prune_source_tool_specific_includes(payload: dict[str, JsonValue], dropped_tool_types: frozenset[str]) -> None:
+    prefixes = tuple(
+        prefix for tool_type in dropped_tool_types for prefix in _SOURCE_TOOL_INCLUDE_PREFIXES.get(tool_type, ())
+    )
+    if not prefixes:
+        return
+    include = payload.get("include")
+    if not is_json_list(include):
+        return
+    kept_include: list[JsonValue] = [
+        entry for entry in include if not (isinstance(entry, str) and entry.startswith(prefixes))
+    ]
+    if len(kept_include) == len(include):
+        return
+    if not kept_include:
+        payload.pop("include", None)
+        return
+    payload["include"] = kept_include
+
+
+def _drop_unsupported_source_response_tools(
+    payload: dict[str, JsonValue],
+    *,
+    supported_tool_types: frozenset[str],
+) -> None:
+    _normalize_source_allowed_tool_choice_aliases(payload)
+    tools = payload.get("tools")
+    if not is_json_list(tools):
+        return
+    kept_tools: list[JsonValue] = []
+    kept_types: set[str] = set()
+    dropped_types: set[str] = set()
+    for tool in tools:
+        if not is_json_mapping(tool):
+            continue
+        tool_type = tool.get("type")
+        if not _source_tool_type_supported(tool_type, supported_tool_types):
+            if isinstance(tool_type, str):
+                dropped_types.add(normalize_tool_type(tool_type))
+            continue
+        kept_tools.append(tool)
+        if isinstance(tool_type, str):
+            kept_types.add(tool_type)
+    if len(kept_tools) == len(tools):
+        return
+    _prune_source_tool_specific_includes(payload, frozenset(dropped_types))
+    if not kept_tools:
+        payload.pop("tools", None)
+        payload.pop("tool_choice", None)
+        payload.pop("parallel_tool_calls", None)
+        return
+    payload["tools"] = kept_tools
+    _drop_dangling_source_tool_choice(payload, frozenset(kept_types))
+
+
+def _drop_dangling_source_tool_choice(payload: dict[str, JsonValue], kept_types: frozenset[str]) -> None:
+    """Keep tool_choice consistent with the tools that survived filtering.
+
+    A forced tool_choice that references a dropped hosted tool (for example
+    ``{"type": "web_search"}``) would make the source reject the request, so it
+    falls back to the provider default by removing the key. ``function``-typed
+    choices always stay: function tools are never dropped by the filter.
+
+    Entries under ``allowed_tools`` carry the same tool-type alias
+    normalization as the ``tools`` list by the time this runs (see
+    ``_normalize_source_allowed_tool_choice_aliases``), so a legacy-alias
+    forced choice keeps matching the normalized tool it targets.
+    """
+    tool_choice = payload.get("tool_choice")
+    if not is_json_mapping(tool_choice):
+        return
+    choice_type = tool_choice.get("type")
+    if choice_type == "function":
+        return
+    if choice_type == "allowed_tools":
+        allowed = tool_choice.get("tools")
+        if not is_json_list(allowed):
+            return
+        kept_allowed: list[JsonValue] = [
+            entry
+            for entry in allowed
+            if is_json_mapping(entry) and _source_tool_type_supported(entry.get("type"), kept_types)
+        ]
+        if len(kept_allowed) == len(allowed):
+            return
+        if not kept_allowed:
+            payload.pop("tool_choice", None)
+            return
+        updated_choice: dict[str, JsonValue] = dict(tool_choice)
+        updated_choice["tools"] = kept_allowed
+        payload["tool_choice"] = updated_choice
+        return
+    if not _source_tool_type_supported(choice_type, kept_types):
+        payload.pop("tool_choice", None)
 
 
 async def _source_chat_completion_response(
@@ -3667,16 +3999,43 @@ async def _stream_responses(
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
-    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
-    if admission_denial is not None:
-        return admission_denial
-    compact_trigger_input: list[JsonValue] | None = None
+    compact_payload: ResponsesCompactRequest | None = None
     if codex_session_affinity:
         try:
             compact_trigger_input = strip_terminal_compaction_trigger_input(payload)
+            if compact_trigger_input is not None:
+                compact_payload_data = payload.model_dump(
+                    mode="json",
+                    include={
+                        "model",
+                        "instructions",
+                        "reasoning",
+                        "store",
+                        "service_tier",
+                        "prompt_cache_key",
+                    },
+                    exclude_none=True,
+                )
+                if isinstance(payload.model_extra, dict):
+                    prompt_cache_key_alias = payload.model_extra.get("promptCacheKey")
+                    if isinstance(prompt_cache_key_alias, str) and "prompt_cache_key" not in compact_payload_data:
+                        compact_payload_data["prompt_cache_key"] = prompt_cache_key_alias
+                compact_payload_data["input"] = compact_trigger_input
+                if payload.previous_response_id is not None:
+                    compact_payload_data["previous_response_id"] = payload.previous_response_id
+                if payload.conversation is not None:
+                    compact_payload_data["conversation"] = payload.conversation
+                compact_payload = ResponsesCompactRequest.model_validate(compact_payload_data)
+                # Validate the exact compact wire payload before admission or
+                # reservation work so an untrimmable trigger is a client 400,
+                # not a late service exception that reaches the global 500.
+                compact_payload.to_payload()
         except ClientPayloadError as exc:
             error = openai_client_payload_error(exc)
             return _logged_error_json_response(request, 400, error)
+    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
+    if admission_denial is not None:
+        return admission_denial
     owns_reservation = api_key_reservation_override is None
     reservation = (
         api_key_reservation_override
@@ -3705,29 +4064,7 @@ async def _stream_responses(
         if downstream_turn_state is not None
         else {}
     )
-    if compact_trigger_input is not None:
-        compact_payload_data = payload.model_dump(
-            mode="json",
-            include={
-                "model",
-                "instructions",
-                "reasoning",
-                "store",
-                "service_tier",
-                "prompt_cache_key",
-            },
-            exclude_none=True,
-        )
-        if isinstance(payload.model_extra, dict):
-            prompt_cache_key_alias = payload.model_extra.get("promptCacheKey")
-            if isinstance(prompt_cache_key_alias, str) and "prompt_cache_key" not in compact_payload_data:
-                compact_payload_data["prompt_cache_key"] = prompt_cache_key_alias
-        compact_payload_data["input"] = compact_trigger_input
-        if payload.previous_response_id is not None:
-            compact_payload_data["previous_response_id"] = payload.previous_response_id
-        if payload.conversation is not None:
-            compact_payload_data["conversation"] = payload.conversation
-        compact_payload = ResponsesCompactRequest.model_validate(compact_payload_data)
+    if compact_payload is not None:
         try:
             try:
                 compact_result = await context.service.compact_responses(
@@ -4010,6 +4347,11 @@ async def _compact_responses(
 ) -> JSONResponse:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
+    try:
+        request_usage_budget = estimate_api_key_request_usage(payload)
+    except ClientPayloadError as exc:
+        error = openai_client_payload_error(exc)
+        return _logged_error_json_response(request, 400, error)
     admission_denial = await _opportunistic_admission_denial(
         request,
         context,
@@ -4023,7 +4365,7 @@ async def _compact_responses(
         api_key,
         request_model=payload.model,
         request_service_tier=_compact_request_service_tier(payload),
-        request_usage_budget=estimate_api_key_request_usage(payload),
+        request_usage_budget=request_usage_budget,
     )
 
     rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)

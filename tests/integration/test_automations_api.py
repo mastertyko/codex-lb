@@ -350,9 +350,9 @@ async def test_automations_patch_model_rejects_retained_unsupported_reasoning_ef
 
 
 @pytest.mark.asyncio
-async def test_automations_api_accepts_max_but_rejects_native_only_ultra(async_client):
+async def test_automations_api_normalizes_max_reasoning_effort(async_client):
     await _populate_automation_reasoning_models()
-    accounts = await _create_accounts("auto-reasoning-wire-contract")
+    accounts = await _create_accounts("auto-reasoning-normalization")
     schedule = {
         "type": "daily",
         "time": "05:00",
@@ -383,19 +383,32 @@ async def test_automations_api_accepts_max_but_rejects_native_only_ultra(async_c
     assert max_update_response.status_code == 200
     assert max_update_response.json()["reasoningEffort"] == "max"
 
-    ultra_response = await async_client.post(
+
+@pytest.mark.asyncio
+async def test_automations_api_rejects_ultra_reasoning_effort(async_client):
+    await _populate_automation_reasoning_models()
+    accounts = await _create_accounts("auto-reasoning-ultra")
+
+    response = await async_client.post(
         "/api/automations",
         json={
-            "name": "Native-only Ultra automation",
-            "enabled": False,
-            "schedule": schedule,
+            "name": "Ultra reasoning automation",
+            "enabled": True,
+            "schedule": {
+                "type": "daily",
+                "time": "05:00",
+                "timezone": "UTC",
+                "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            },
             "model": "automation-reasoning-max",
             "reasoningEffort": "ultra",
             "prompt": "ping",
             "accountIds": [accounts[0].id],
         },
     )
-    assert ultra_response.status_code == 422
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
 
 
 @pytest.mark.asyncio
@@ -482,6 +495,48 @@ async def test_automations_run_history_keeps_claimed_model_snapshot(async_client
         assert len(matching_logs) == 1
         assert matching_logs[0].model == "automation-reasoning-max"
         assert matching_logs[0].reasoning_effort == "max"
+
+
+@pytest.mark.asyncio
+async def test_automations_run_now_forwards_max_reasoning_on_wire(async_client, monkeypatch):
+    accounts = await _create_accounts("auto-max-wire-forwarding")
+    compact_requests = []
+
+    async def _fake_compact(request, *_args, **_kwargs):
+        compact_requests.append(request)
+        return SimpleNamespace(id="resp-max-wire-forwarding")
+
+    monkeypatch.setattr("app.modules.automations.service.core_compact_responses", _fake_compact)
+
+    create_response = await async_client.post(
+        "/api/automations",
+        json={
+            "name": "Max wire forwarding",
+            "enabled": False,
+            "schedule": {
+                "type": "daily",
+                "time": "05:00",
+                "timezone": "UTC",
+                "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+            },
+            "model": "gpt-5.6-sol",
+            "reasoningEffort": "max",
+            "prompt": "max ping",
+            "accountIds": [accounts[0].id],
+        },
+    )
+    assert create_response.status_code == 200
+    automation_id = create_response.json()["id"]
+    assert create_response.json()["reasoningEffort"] == "max"
+
+    run_response = await async_client.post(f"/api/automations/{automation_id}/run-now")
+    assert run_response.status_code == 202
+    assert run_response.json()["status"] == "success"
+
+    assert len(compact_requests) == 1
+    assert compact_requests[0].model == "gpt-5.6-sol"
+    assert compact_requests[0].reasoning is not None
+    assert compact_requests[0].reasoning.effort == "max"
 
 
 @pytest.mark.asyncio
