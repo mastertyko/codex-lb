@@ -3983,16 +3983,43 @@ async def _stream_responses(
 ) -> Response:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
-    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
-    if admission_denial is not None:
-        return admission_denial
-    compact_trigger_input: list[JsonValue] | None = None
+    compact_payload: ResponsesCompactRequest | None = None
     if codex_session_affinity:
         try:
             compact_trigger_input = strip_terminal_compaction_trigger_input(payload)
+            if compact_trigger_input is not None:
+                compact_payload_data = payload.model_dump(
+                    mode="json",
+                    include={
+                        "model",
+                        "instructions",
+                        "reasoning",
+                        "store",
+                        "service_tier",
+                        "prompt_cache_key",
+                    },
+                    exclude_none=True,
+                )
+                if isinstance(payload.model_extra, dict):
+                    prompt_cache_key_alias = payload.model_extra.get("promptCacheKey")
+                    if isinstance(prompt_cache_key_alias, str) and "prompt_cache_key" not in compact_payload_data:
+                        compact_payload_data["prompt_cache_key"] = prompt_cache_key_alias
+                compact_payload_data["input"] = compact_trigger_input
+                if payload.previous_response_id is not None:
+                    compact_payload_data["previous_response_id"] = payload.previous_response_id
+                if payload.conversation is not None:
+                    compact_payload_data["conversation"] = payload.conversation
+                compact_payload = ResponsesCompactRequest.model_validate(compact_payload_data)
+                # Validate the exact compact wire payload before admission or
+                # reservation work so an untrimmable trigger is a client 400,
+                # not a late service exception that reaches the global 500.
+                compact_payload.to_payload()
         except ClientPayloadError as exc:
             error = openai_client_payload_error(exc)
             return _logged_error_json_response(request, 400, error)
+    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
+    if admission_denial is not None:
+        return admission_denial
     owns_reservation = api_key_reservation_override is None
     reservation = (
         api_key_reservation_override
@@ -4021,29 +4048,7 @@ async def _stream_responses(
         if downstream_turn_state is not None
         else {}
     )
-    if compact_trigger_input is not None:
-        compact_payload_data = payload.model_dump(
-            mode="json",
-            include={
-                "model",
-                "instructions",
-                "reasoning",
-                "store",
-                "service_tier",
-                "prompt_cache_key",
-            },
-            exclude_none=True,
-        )
-        if isinstance(payload.model_extra, dict):
-            prompt_cache_key_alias = payload.model_extra.get("promptCacheKey")
-            if isinstance(prompt_cache_key_alias, str) and "prompt_cache_key" not in compact_payload_data:
-                compact_payload_data["prompt_cache_key"] = prompt_cache_key_alias
-        compact_payload_data["input"] = compact_trigger_input
-        if payload.previous_response_id is not None:
-            compact_payload_data["previous_response_id"] = payload.previous_response_id
-        if payload.conversation is not None:
-            compact_payload_data["conversation"] = payload.conversation
-        compact_payload = ResponsesCompactRequest.model_validate(compact_payload_data)
+    if compact_payload is not None:
         try:
             try:
                 compact_result = await context.service.compact_responses(
@@ -4326,6 +4331,11 @@ async def _compact_responses(
 ) -> JSONResponse:
     apply_api_key_enforcement(payload, api_key)
     validate_model_access(api_key, payload.model)
+    try:
+        request_usage_budget = estimate_api_key_request_usage(payload)
+    except ClientPayloadError as exc:
+        error = openai_client_payload_error(exc)
+        return _logged_error_json_response(request, 400, error)
     admission_denial = await _opportunistic_admission_denial(
         request,
         context,
@@ -4339,7 +4349,7 @@ async def _compact_responses(
         api_key,
         request_model=payload.model,
         request_service_tier=_compact_request_service_tier(payload),
-        request_usage_budget=estimate_api_key_request_usage(payload),
+        request_usage_budget=request_usage_budget,
     )
 
     rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
