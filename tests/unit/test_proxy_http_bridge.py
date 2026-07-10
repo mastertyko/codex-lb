@@ -6573,6 +6573,15 @@ async def test_stream_via_http_bridge_reacquires_api_key_reservation_after_owner
     )
     request_state_initial.request_stage = "follow_up"
     request_state_initial.preferred_account_id = "acc-1"
+    request_state_initial.proxy_injected_previous_response_id = True
+    request_state_initial.fresh_upstream_request_text = '{"type":"response.create","request":"fresh"}'
+    request_state_initial.fresh_upstream_request_is_retry_safe = True
+    request_state_initial.replay_count = 1
+    request_state_initial.previous_response_owner_lookup_source = "request_logs"
+    request_state_initial.previous_response_owner_lookup_outcome = "hit"
+    request_state_initial.previous_response_owner_session_id = "sid-123"
+    request_state_initial.input_item_count = 3
+    request_state_initial.input_full_fingerprint = "input-fingerprint"
     request_state_retry = proxy_service._WebSocketRequestState(
         request_id="req-retry",
         model="gpt-5.4",
@@ -6709,6 +6718,15 @@ async def test_stream_via_http_bridge_reacquires_api_key_reservation_after_owner
     assert prepare_reservations == [initial_reservation, retried_reservation]
     assert submitted_reservations == [retried_reservation]
     reserve_retry.assert_awaited_once()
+    assert request_state_retry.proxy_injected_previous_response_id is True
+    assert request_state_retry.fresh_upstream_request_text == request_state_initial.fresh_upstream_request_text
+    assert request_state_retry.fresh_upstream_request_is_retry_safe is True
+    assert request_state_retry.replay_count == 1
+    assert request_state_retry.previous_response_owner_lookup_source == "request_logs"
+    assert request_state_retry.previous_response_owner_lookup_outcome == "hit"
+    assert request_state_retry.previous_response_owner_session_id == "sid-123"
+    assert request_state_retry.input_item_count == 3
+    assert request_state_retry.input_full_fingerprint == "input-fingerprint"
 
 
 @pytest.mark.asyncio

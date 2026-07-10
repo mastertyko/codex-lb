@@ -891,6 +891,7 @@ def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
         return
 
     head_count = _compact_trim_prefix_count(token_counts)
+    lite_prefix_indices = _compact_lite_prefix_indices(input_value)
     preserved_indices = _compact_state_anchor_indices(input_value)
     selected_indices = set(preserved_indices)
     selected_indices.update(range(head_count))
@@ -913,7 +914,25 @@ def _trim_compact_input_for_upstream(payload: MutableJsonObject) -> None:
     )
     if len(selected_indices) == len(input_value):
         return
-    payload["input"] = _compact_trimmed_input_with_markers(input_value, token_counts, selected_indices)
+    payload["input"] = _compact_trimmed_input_with_markers(
+        input_value,
+        token_counts,
+        selected_indices,
+        prefix_indices=lite_prefix_indices,
+    )
+
+
+def _compact_lite_prefix_indices(input_value: list[JsonValue]) -> tuple[int, int] | tuple[()]:
+    for index, item in enumerate(input_value[:-1]):
+        if not is_json_mapping(item) or item.get("type") != "additional_tools":
+            continue
+        developer_item = input_value[index + 1]
+        if not is_json_mapping(developer_item) or developer_item.get("role") != "developer":
+            continue
+        developer_type = developer_item.get("type")
+        if developer_type is None or developer_type == "message":
+            return index, index + 1
+    return ()
 
 
 def _compact_state_anchor_indices(input_value: list[JsonValue]) -> set[int]:
@@ -1080,12 +1099,19 @@ def _compact_item_texts(item: Mapping[str, JsonValue]) -> list[str]:
 
 
 def _compact_trimmed_input_with_markers(
-    input_value: list[JsonValue], token_counts: list[int], selected_indices: set[int]
+    input_value: list[JsonValue],
+    token_counts: list[int],
+    selected_indices: set[int],
+    *,
+    prefix_indices: tuple[int, int] | tuple[()] = (),
 ) -> list[JsonValue]:
-    trimmed: list[JsonValue] = []
+    prefix_index_set = set(prefix_indices)
+    trimmed = [input_value[index] for index in prefix_indices]
     omitted_items = 0
     omitted_tokens = 0
     for index, item in enumerate(input_value):
+        if index in prefix_index_set:
+            continue
         if index in selected_indices:
             if omitted_items:
                 trimmed.append(_compact_trim_marker(omitted_items=omitted_items, omitted_tokens=omitted_tokens))

@@ -921,6 +921,29 @@ class _HTTPBridgeStreamingMixin:
                     )
                     retry_request_state.enforce_openai_sdk_contract = enforce_openai_sdk_contract
                     retry_request_state.affinity_policy = affinity
+                    retry_request_state.proxy_injected_previous_response_id = (
+                        request_state.proxy_injected_previous_response_id
+                    )
+                    retry_request_state.fresh_upstream_request_text = request_state.fresh_upstream_request_text
+                    retry_request_state.fresh_upstream_request_is_retry_safe = (
+                        request_state.fresh_upstream_request_is_retry_safe
+                    )
+                    retry_request_state.replay_count = request_state.replay_count
+                    retry_request_state.auth_replay_count = request_state.auth_replay_count
+                    retry_request_state.previous_response_owner_lookup_source = (
+                        request_state.previous_response_owner_lookup_source
+                    )
+                    retry_request_state.previous_response_owner_lookup_outcome = (
+                        request_state.previous_response_owner_lookup_outcome
+                    )
+                    retry_request_state.previous_response_owner_requested_at = (
+                        request_state.previous_response_owner_requested_at
+                    )
+                    retry_request_state.previous_response_owner_session_id = (
+                        request_state.previous_response_owner_session_id
+                    )
+                    retry_request_state.input_item_count = request_state.input_item_count
+                    retry_request_state.input_full_fingerprint = request_state.input_full_fingerprint
                     if downstream_turn_state is not None:
                         retry_request_state.session_id = _normalize_session_id(downstream_turn_state)
                     retry_request_state.transport = _REQUEST_TRANSPORT_HTTP

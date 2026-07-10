@@ -14654,6 +14654,13 @@ async def test_process_upstream_websocket_text_masks_anonymous_previous_response
     assert finalize_request_state.await_count == 2
     finalized_requests = [call.args[0] for call in finalize_request_state.await_args_list]
     assert finalized_requests == [followup_request_a, followup_request_b]
+    for finalized_request in finalized_requests:
+        assert finalized_request.failure_phase_override == "upstream"
+        assert finalized_request.upstream_error_code_override == "previous_response_not_found"
+        assert finalized_request.failure_detail_override is not None
+        assert finalized_request.failure_detail_override.startswith(
+            "previous_response_not_found previous_response_source=client_supplied "
+        )
     for call in finalize_request_state.await_args_list:
         assert call.kwargs["event_type"] == "response.failed"
     handle_stream_error.assert_not_awaited()
@@ -17487,6 +17494,68 @@ async def test_resolve_websocket_previous_response_owner_prefers_scoped_lookup_o
 
 
 @pytest.mark.asyncio
+async def test_resolve_websocket_previous_response_owner_cache_hit_leaves_session_relationship_unknown() -> None:
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    api_key = ApiKeyData(
+        id="key_cached_owner",
+        name="cached-owner-key",
+        key_prefix="sk-cached",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+    request_logs.response_owner_by_id[("resp_cached_owner", api_key.id, None)] = "acc_cached_owner"
+
+    first_request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_cached_owner_first",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        session_id="turn_scope_cached",
+    )
+    first_owner = await service._resolve_websocket_previous_response_owner(
+        previous_response_id="resp_cached_owner",
+        api_key=api_key,
+        session_id="turn_scope_cached",
+        surface="websocket",
+        request_state=first_request_state,
+    )
+
+    second_request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_cached_owner_second",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        session_id="turn_scope_cached",
+    )
+    second_owner = await service._resolve_websocket_previous_response_owner(
+        previous_response_id="resp_cached_owner",
+        api_key=api_key,
+        session_id="turn_scope_cached",
+        surface="websocket",
+        request_state=second_request_state,
+    )
+
+    assert first_owner == second_owner == "acc_cached_owner"
+    assert request_logs.lookup_calls == [("resp_cached_owner", api_key.id, "turn_scope_cached")]
+    assert first_request_state.previous_response_owner_lookup_source == "request_logs"
+    assert second_request_state.previous_response_owner_lookup_source == "request_cache"
+    assert second_request_state.previous_response_owner_lookup_outcome == "hit"
+    assert second_request_state.previous_response_owner_session_id is None
+    assert websocket_helpers_module._websocket_same_session_for_previous_response(second_request_state) is None
+
+
+@pytest.mark.asyncio
 async def test_resolve_websocket_previous_response_owner_uses_unique_scoped_cache_fallback_on_lookup_failure() -> None:
     request_logs = _RequestLogsRecorder()
     request_logs.lookup_error = RuntimeError("request log lookup unavailable")
@@ -18556,7 +18625,7 @@ def test_sanitize_websocket_connect_failure_records_stale_anchor_metadata(monkey
         "previous_response_age_seconds=42 "
         "same_session=true"
     )
-    assert "resp_prev_anchor" not in cast(str, request_state.failure_detail_override)
+    assert "resp_prev_anchor" not in request_state.failure_detail_override
     assert (
         "diagnostics=previous_response_source=client_supplied fresh_replay_available=true "
         "owner_lookup_source=request_logs owner_lookup_outcome=hit "

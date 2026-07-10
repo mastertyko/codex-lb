@@ -502,8 +502,7 @@ async def test_proxy_compact_oversized_lite_input_preserves_anchor_and_sets_http
     assert "client_metadata" not in call_json
     assert call_json["instructions"] == ""
     call_input = cast(list[dict[str, object]], call_json["input"])
-    additional_index = call_input.index(additional_tools)
-    assert call_input[additional_index + 1] == developer_message
+    assert call_input[:2] == [additional_tools, developer_message]
     assert oversized_history not in call_input
     assert "[compact trim] Omitted" in json.dumps(call_input)
 

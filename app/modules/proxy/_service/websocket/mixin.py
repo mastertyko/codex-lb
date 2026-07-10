@@ -2420,7 +2420,7 @@ class _WebSocketMixin:
         cache_key = (response_id, api_key_id, session_id_value)
         cached_account_id = proxy._websocket_previous_response_account_index.get(cache_key)
         if cached_account_id is not None:
-            _record_lookup_metadata(source="request_cache", outcome="hit", owner_session_id=session_id_value)
+            _record_lookup_metadata(source="request_cache", outcome="hit")
             _record_continuity_owner_resolution(
                 surface=surface,
                 source="request_cache",
@@ -3081,16 +3081,27 @@ class _WebSocketMixin:
                 else "stream_incomplete"
             )
             for grouped_request_state in grouped_previous_response_request_states:
-                (
-                    grouped_downstream_text,
-                    _grouped_event_block,
-                    grouped_event,
-                    grouped_payload,
-                    grouped_event_type,
-                ) = _facade()._build_stream_incomplete_terminal_event_for_request(
-                    grouped_request_state,
-                    reason=grouped_error_reason,
-                )
+                if grouped_error_reason == "previous_response_not_found":
+                    grouped_event, grouped_payload, grouped_event_type, grouped_downstream_text = (
+                        _rewrite_websocket_continuity_corruption_event(
+                            request_state=grouped_request_state,
+                            upstream_control=upstream_control,
+                            reason=grouped_error_reason,
+                            reconnect_requested=True,
+                            original_text=text,
+                        )
+                    )
+                else:
+                    (
+                        grouped_downstream_text,
+                        _grouped_event_block,
+                        grouped_event,
+                        grouped_payload,
+                        grouped_event_type,
+                    ) = _facade()._build_stream_incomplete_terminal_event_for_request(
+                        grouped_request_state,
+                        reason=grouped_error_reason,
+                    )
                 downstream_texts.append(grouped_downstream_text)
                 await proxy._finalize_websocket_request_state(
                     grouped_request_state,
