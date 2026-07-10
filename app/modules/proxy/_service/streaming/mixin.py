@@ -747,7 +747,6 @@ class _StreamingMixin(_StreamingRetryMixin):
                     response_id = event.response.id
                 if event.type == "response.incomplete":
                     status = "error"
-
             if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                 saw_text_delta = True
             if not _facade()._should_suppress_text_done_event(
@@ -1036,18 +1035,18 @@ class _StreamingMixin(_StreamingRetryMixin):
             await proxy._load_balancer.release_account_lease(account_response_create_lease)
             input_tokens = usage.input_tokens if usage else None
             output_tokens = usage.output_tokens if usage else None
-            cached_input_tokens = (
-                usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
-            )
-            reasoning_tokens = (
-                usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
-            )
+            input_details = usage.input_tokens_details if usage else None
+            output_details = usage.output_tokens_details if usage else None
+            cached_input_tokens = input_details.cached_tokens if input_details else None
+            cache_write_input_tokens = input_details.cache_write_tokens if input_details else None
+            reasoning_tokens = output_details.reasoning_tokens if output_details else None
             settlement.status = status
             settlement.model = model
             settlement.service_tier = service_tier
             settlement.input_tokens = input_tokens
             settlement.output_tokens = output_tokens
             settlement.cached_input_tokens = cached_input_tokens
+            settlement.cache_write_input_tokens = cache_write_input_tokens
             settlement.error_code = error_code
             settlement.error_message = error_message
             await proxy._write_request_log(
@@ -1063,6 +1062,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
+                cache_write_input_tokens=cache_write_input_tokens,
                 reasoning_tokens=reasoning_tokens,
                 reasoning_effort=reasoning_effort,
                 transport=request_transport,

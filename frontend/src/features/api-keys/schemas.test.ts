@@ -6,6 +6,7 @@ import {
   ApiKeySchema,
   ApiKeyUpdateRequestSchema,
   LimitRuleCreateSchema,
+  ModelItemSchema,
 } from "@/features/api-keys/schemas";
 
 const ISO = "2026-01-01T00:00:00+00:00";
@@ -82,6 +83,24 @@ describe("ApiKeySchema", () => {
     expect(parsed.pooledCapacityCreditsPrimary).toBe(225.0);
   });
 
+  it("parses assigned model source ids", () => {
+    const parsed = ApiKeySchema.parse({
+      id: "key-1",
+      name: "Service Key",
+      keyPrefix: "sk-live",
+      allowedModels: null,
+      sourceAssignmentScopeEnabled: true,
+      assignedSourceIds: ["src_vllm"],
+      expiresAt: null,
+      isActive: true,
+      createdAt: ISO,
+      lastUsedAt: null,
+    });
+
+    expect(parsed.sourceAssignmentScopeEnabled).toBe(true);
+    expect(parsed.assignedSourceIds).toEqual(["src_vllm"]);
+  });
+
   it("defaults usage sections to both visible sections", () => {
     const parsed = ApiKeySchema.parse({
       id: "key-1",
@@ -127,6 +146,15 @@ describe("ApiKeyCreateRequestSchema", () => {
 
     expect(parsed.assignedAccountIds).toEqual(["acc_primary"]);
     expect(parsed.usageSections).toBe("account_pool_usage");
+  });
+
+  it("accepts optional assigned model sources", () => {
+    const parsed = ApiKeyCreateRequestSchema.parse({
+      name: "Source Scoped Key",
+      assignedSourceIds: ["src_vllm"],
+    });
+
+    expect(parsed.assignedSourceIds).toEqual(["src_vllm"]);
   });
 
   it("accepts opportunistic traffic class in create payload", () => {
@@ -193,12 +221,76 @@ describe("ApiKeyUpdateRequestSchema", () => {
     expect(parsed.resetUsage).toBe(true);
   });
 
+  it("accepts clearing assigned model sources", () => {
+    const parsed = ApiKeyUpdateRequestSchema.parse({
+      assignedSourceIds: [],
+    });
+
+    expect(parsed.assignedSourceIds).toEqual([]);
+  });
+
   it("accepts opportunistic traffic class in update payload", () => {
     const parsed = ApiKeyUpdateRequestSchema.parse({
       trafficClass: "opportunistic",
     });
 
     expect(parsed.trafficClass).toBe("opportunistic");
+  });
+});
+
+describe("reasoning effort schemas", () => {
+  it("accepts max across API-key and dashboard model contracts", () => {
+    const apiKey = ApiKeySchema.parse({
+      id: "key-max",
+      name: "Max policy",
+      keyPrefix: "sk-max",
+      allowedModels: ["gpt-5.6-sol"],
+      enforcedReasoningEffort: "max",
+      expiresAt: null,
+      isActive: true,
+      createdAt: ISO,
+      lastUsedAt: null,
+    });
+    const createRequest = ApiKeyCreateRequestSchema.parse({
+      name: "Max policy",
+      enforcedReasoningEffort: "max",
+    });
+    const updateRequest = ApiKeyUpdateRequestSchema.parse({
+      enforcedReasoningEffort: "max",
+    });
+    const model = ModelItemSchema.parse({
+      id: "gpt-5.6-sol",
+      name: "GPT-5.6 Sol",
+      supportedReasoningEfforts: ["low", "max"],
+      defaultReasoningEffort: "max",
+    });
+
+    expect(apiKey.enforcedReasoningEffort).toBe("max");
+    expect(createRequest.enforcedReasoningEffort).toBe("max");
+    expect(updateRequest.enforcedReasoningEffort).toBe("max");
+    expect(model.supportedReasoningEfforts).toEqual(["low", "max"]);
+    expect(model.defaultReasoningEffort).toBe("max");
+  });
+
+  it("rejects native-only ultra on wire-policy contracts", () => {
+    expect(
+      ApiKeyCreateRequestSchema.safeParse({
+        name: "Native-only policy",
+        enforcedReasoningEffort: "ultra",
+      }).success,
+    ).toBe(false);
+    expect(
+      ApiKeyUpdateRequestSchema.safeParse({
+        enforcedReasoningEffort: "ultra",
+      }).success,
+    ).toBe(false);
+    expect(
+      ModelItemSchema.safeParse({
+        id: "gpt-5.6-sol",
+        name: "GPT-5.6 Sol",
+        supportedReasoningEfforts: ["max", "ultra"],
+      }).success,
+    ).toBe(false);
   });
 });
 

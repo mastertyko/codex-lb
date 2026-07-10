@@ -192,6 +192,84 @@ def test_openai_prompt_cache_aliases_are_normalized():
     assert "promptCacheRetention" not in dumped
 
 
+def test_platform_explicit_prompt_cache_controls_are_stripped_for_subscription_upstream() -> None:
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "hi",
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "stable prefix",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                }
+            ],
+            "prompt_cache_key": "thread_123",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+        }
+    )
+
+    dumped = request.to_payload()
+
+    assert dumped["prompt_cache_key"] == "thread_123"
+    assert "prompt_cache_options" not in dumped
+    assert dumped["input"] == [
+        {
+            "role": "user",
+            "content": [{"type": "input_text", "text": "stable prefix"}],
+        }
+    ]
+
+
+def test_prompt_cache_sanitizer_preserves_same_named_lite_tool_schema_property() -> None:
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {
+                    "type": "json_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {"prompt_cache_breakpoint": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+    }
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "",
+            "input": [
+                additional_tools,
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "stable prefix",
+                            "prompt_cache_breakpoint": {"mode": "explicit"},
+                        }
+                    ],
+                },
+            ],
+        }
+    )
+
+    assert request.to_payload()["input"] == [
+        additional_tools,
+        {"role": "user", "content": [{"type": "input_text", "text": "stable prefix"}]},
+    ]
+
+
 def test_settings_default_prompt_cache_affinity_ttl_is_1800():
     from app.core.config.settings import Settings
 
@@ -561,6 +639,78 @@ def test_responses_input_system_message_moves_to_instructions():
 
     assert request.instructions == "primary\nsys\ndev"
     assert request.input == [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+
+
+def test_responses_input_preserves_responses_lite_shape_untouched():
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    lite_input = [
+        additional_tools,
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev instructions"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"type": "custom_tool_call", "call_id": "call_1", "name": "exec", "input": "ls"},
+        {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"},
+    ]
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": lite_input,
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.instructions == ""
+    assert request.to_payload()["input"] == lite_input
+
+
+def test_responses_input_additional_tools_with_following_developer_message_stays_body_authoritative():
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    developer_message = {"type": "message", "role": "developer", "content": "dev instructions"}
+    lite_input = [additional_tools, developer_message]
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": lite_input,
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.instructions == ""
+    assert request.to_payload()["input"] == lite_input
+
+
+def test_responses_input_custom_tool_call_output_survives_instruction_lift():
+    payload = {
+        "model": "gpt-5.1",
+        "instructions": "",
+        "input": [
+            {"type": "message", "role": "developer", "content": "dev instructions"},
+            {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"},
+        ],
+    }
+    request = ResponsesRequest.model_validate(payload)
+
+    assert request.instructions == "dev instructions"
+    assert request.to_payload()["input"] == [
+        {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"},
+    ]
 
 
 def test_responses_input_system_message_keeps_user_text_parts():

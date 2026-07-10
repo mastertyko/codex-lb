@@ -8,6 +8,7 @@ from app.core.openai.contracts import (
     FunctionCallOutputInputItem,
     InputFileItem,
     OpenAIMessage,
+    PromptCacheBreakpoint,
     RefusalContentPart,
     TextContentPart,
 )
@@ -23,6 +24,13 @@ def _json_dict_or_none(value: JsonValue) -> dict[str, JsonValue] | None:
     if not is_json_dict(value):
         return None
     return value
+
+
+def _prompt_cache_breakpoint(part: dict[str, JsonValue]) -> PromptCacheBreakpoint | None:
+    value = _json_dict_or_none(part.get("prompt_cache_breakpoint"))
+    if value is None or value.get("mode") != "explicit" or set(value) != {"mode"}:
+        return None
+    return PromptCacheBreakpoint(mode="explicit")
 
 
 def _content_parts(content: JsonValue) -> list[JsonValue]:
@@ -298,10 +306,14 @@ def _normalize_content_parts(content: JsonValue, role: str = "user") -> JsonValu
 def _normalize_content_part(part: dict[str, JsonValue], role: str = "user") -> JsonValue:
     part_type = part.get("type") or ("text" if "text" in part else None)
     text_type = _text_type_for_role(role)
+    prompt_cache_breakpoint = _prompt_cache_breakpoint(part) if role == "user" else None
     if part_type in _TEXT_CONTENT_PART_TYPES:
         text = part.get("text")
         if isinstance(text, str):
-            return cast(JsonValue, TextContentPart(type=text_type, text=text))
+            normalized_text = TextContentPart(type=text_type, text=text)
+            if prompt_cache_breakpoint is not None:
+                normalized_text["prompt_cache_breakpoint"] = prompt_cache_breakpoint
+            return cast(JsonValue, normalized_text)
         return part
     if role == "assistant":
         return part
@@ -318,17 +330,33 @@ def _normalize_content_part(part: dict[str, JsonValue], role: str = "user") -> J
         else:
             url = None
         if isinstance(url, str):
-            return {"type": "input_image", "image_url": url, **({"detail": detail} if detail is not None else {})}
+            normalized_image: dict[str, JsonValue] = {
+                "type": "input_image",
+                "image_url": url,
+                **({"detail": detail} if detail is not None else {}),
+            }
+            if prompt_cache_breakpoint is not None:
+                normalized_image["prompt_cache_breakpoint"] = cast(JsonValue, prompt_cache_breakpoint)
+            return normalized_image
         return part
     if part_type == "input_image":
         return part
     if part_type == "input_audio":
         data_url = _audio_input_to_data_url(part.get("input_audio"))
         if data_url:
-            return {"type": "input_file", "file_url": data_url}
+            normalized_audio: dict[str, JsonValue] = {"type": "input_file", "file_url": data_url}
+            if prompt_cache_breakpoint is not None:
+                normalized_audio["prompt_cache_breakpoint"] = cast(JsonValue, prompt_cache_breakpoint)
+            return normalized_audio
         return part
     if part_type == "file":
-        return cast(JsonValue, _file_part_to_input_file(part.get("file")))
+        return cast(
+            JsonValue,
+            _file_part_to_input_file(
+                part.get("file"),
+                prompt_cache_breakpoint=prompt_cache_breakpoint,
+            ),
+        )
     return part
 
 
@@ -352,16 +380,25 @@ def _audio_mime_type(audio_format: str) -> str:
     return f"audio/{audio_format}"
 
 
-def _file_part_to_input_file(file_info: JsonValue) -> InputFileItem:
+def _file_part_to_input_file(
+    file_info: JsonValue,
+    *,
+    prompt_cache_breakpoint: PromptCacheBreakpoint | None = None,
+) -> InputFileItem:
+    def with_prompt_cache_breakpoint(item: InputFileItem) -> InputFileItem:
+        if prompt_cache_breakpoint is not None:
+            item["prompt_cache_breakpoint"] = prompt_cache_breakpoint
+        return item
+
     file_info_dict = _json_dict_or_none(file_info)
     if file_info_dict is None:
-        return InputFileItem(type="input_file")
+        return with_prompt_cache_breakpoint(InputFileItem(type="input_file"))
     file_id = file_info_dict.get("file_id")
     if isinstance(file_id, str) and file_id:
-        return InputFileItem(type="input_file", file_id=file_id)
+        return with_prompt_cache_breakpoint(InputFileItem(type="input_file", file_id=file_id))
     file_url = file_info_dict.get("file_url")
     if isinstance(file_url, str) and file_url:
-        return InputFileItem(type="input_file", file_url=file_url)
+        return with_prompt_cache_breakpoint(InputFileItem(type="input_file", file_url=file_url))
     file_data = file_info_dict.get("file_data")
     if not isinstance(file_data, str):
         data = file_info_dict.get("data")
@@ -372,5 +409,7 @@ def _file_part_to_input_file(file_info: JsonValue) -> InputFileItem:
             mime_type = file_info_dict.get("content_type")
         if not isinstance(mime_type, str) or not mime_type:
             mime_type = "application/octet-stream"
-        return InputFileItem(type="input_file", file_url=f"data:{mime_type};base64,{file_data}")
-    return InputFileItem(type="input_file")
+        return with_prompt_cache_breakpoint(
+            InputFileItem(type="input_file", file_url=f"data:{mime_type};base64,{file_data}")
+        )
+    return with_prompt_cache_breakpoint(InputFileItem(type="input_file"))

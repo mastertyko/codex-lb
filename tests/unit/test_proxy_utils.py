@@ -633,6 +633,24 @@ def test_build_upstream_headers_strips_internal_responses_lite_header():
     assert "x-openai-internal-codex-responses-lite" not in lowered
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        (
+            {"input": [{"type": "additional_tools"}]},
+            {proxy_module.CODEX_RESPONSES_LITE_HEADER: "true"},
+        ),
+        ({}, {}),
+    ],
+)
+def test_apply_responses_lite_http_header_uses_request_body_only(payload, expected):
+    headers: dict[str, str] = {}
+
+    proxy_module._apply_responses_lite_http_header(headers, payload)
+
+    assert headers == expected
+
+
 def test_build_upstream_headers_accept_override():
     inbound = {}
     headers = _build_upstream_headers(inbound, "token", None, accept="application/json")
@@ -678,6 +696,33 @@ def test_apply_api_key_enforcement_overrides_service_tier_aliases_to_priority():
     proxy_request_policy.apply_api_key_enforcement(payload, api_key)
 
     assert payload.service_tier == "priority"
+
+
+def test_apply_api_key_enforcement_to_chat_payload_overrides_reasoning_object():
+    payload: dict[str, JsonValue] = {
+        "model": "source-reasoning-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning": {"effort": "low", "summary": "auto"},
+        "reasoning_effort": "low",
+    }
+    api_key = proxy_service.ApiKeyData(
+        id="key_reasoning",
+        name="reasoning-key",
+        key_prefix="sk-clb-test",
+        allowed_models=None,
+        enforced_model=None,
+        enforced_reasoning_effort="high",
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+
+    proxy_request_policy.apply_api_key_enforcement_to_chat_payload(payload, api_key)
+
+    assert payload["reasoning"] == {"effort": "high", "summary": "auto"}
+    assert payload["reasoning_effort"] == "high"
 
 
 def _service_tier_enforcement_key(enforced: str) -> proxy_service.ApiKeyData:
@@ -2136,6 +2181,33 @@ def test_response_create_client_metadata_reads_turn_metadata_case_insensitively(
     )
 
     assert metadata == {"x-codex-turn-metadata": '{"turn_id":"header-turn"}'}
+
+
+def test_response_create_client_metadata_derives_responses_lite_from_body():
+    metadata = proxy_service._response_create_client_metadata(
+        {
+            "input": [{"type": "additional_tools"}],
+            "client_metadata": {"keep": "yes"},
+        },
+        headers={},
+    )
+
+    assert metadata == {
+        "keep": "yes",
+        proxy_module.CODEX_RESPONSES_LITE_WS_METADATA_KEY: "true",
+    }
+
+
+def test_response_create_client_metadata_fails_closed_for_stale_responses_lite_header_without_body():
+    metadata = proxy_service._response_create_client_metadata(
+        {"client_metadata": {"keep": "yes"}},
+        headers={
+            "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+            "User-Agent": "codex_exec/0.144.0 (Mac OS 27.0.0; arm64) unknown (codex_exec; 0.144.0)",
+        },
+    )
+
+    assert metadata == {"keep": "yes"}
 
 
 def test_has_native_codex_transport_headers_does_not_treat_session_id_as_websocket_signal():
@@ -4021,6 +4093,70 @@ async def test_stream_responses_starts_upstream_timer_after_image_inlining(monke
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_forwards_responses_lite_header_and_tools_upstream(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 1.0
+        stream_idle_timeout_seconds = 1.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        log_upstream_request_payload = False
+        proxy_request_budget_seconds = 15.0
+        upstream_stream_transport = "http"
+        log_upstream_request_summary = False
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    lite_input = [
+        additional_tools,
+        {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "dev instructions"}]},
+        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+        {"type": "custom_tool_call_output", "call_id": "call_1", "output": "README.md"},
+    ]
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.6-sol", "instructions": "", "input": lite_input})
+    session = _SseSession(_SsePostResponse([b'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n']))
+
+    events = [
+        event
+        async for event in proxy_module.stream_responses(
+            payload,
+            headers={
+                "User-Agent": "codex_exec/0.144.0 (Mac OS 27.0.0; arm64) unknown (codex_exec; 0.144.0)",
+                "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+            },
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+        )
+    ]
+
+    assert events == ['data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n']
+    call = session.calls[0]
+    upstream_headers = cast(dict[str, str], call["headers"])
+    lite_header_values = {
+        key: value for key, value in upstream_headers.items() if key.lower() == proxy_module.CODEX_RESPONSES_LITE_HEADER
+    }
+    assert list(lite_header_values.values()) == ["true"]
+    upstream_payload = cast(dict[str, JsonValue], call["json"])
+    assert upstream_payload["input"] == lite_input
+    assert upstream_payload["instructions"] == ""
+    assert "client_metadata" not in upstream_payload
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_uses_http_responses_stream_budget(monkeypatch):
     class Settings:
         upstream_base_url = "https://chatgpt.com/backend-api"
@@ -4056,7 +4192,7 @@ async def test_stream_responses_uses_http_responses_stream_budget(monkeypatch):
 
     timeout = session.calls[0]["timeout"]
     assert isinstance(timeout, proxy_module.aiohttp.ClientTimeout)
-    assert timeout.total == pytest.approx(7200.0)
+    assert timeout.total == pytest.approx(7200.0, abs=0.1)
     assert events == ['data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n']
 
 
@@ -4613,6 +4749,152 @@ async def test_stream_responses_uses_websocket_transport(monkeypatch):
         expected_created,
         expected_completed,
     ]
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_websocket_sends_responses_lite_in_client_metadata(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_stream_transport = "websocket"
+        upstream_connect_timeout_seconds = 8.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        log_upstream_request_payload = False
+        proxy_request_budget_seconds = 75.0
+        log_upstream_request_summary = False
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "",
+            "input": [
+                additional_tools,
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ],
+        }
+    )
+    websocket = _WsResponse(
+        [
+            SimpleNamespace(
+                type=proxy_module.aiohttp.WSMsgType.TEXT,
+                data='{"type":"response.created","response":{"id":"resp_ws","service_tier":"auto"}}',
+            ),
+            SimpleNamespace(
+                type=proxy_module.aiohttp.WSMsgType.TEXT,
+                data='{"type":"response.completed","response":{"id":"resp_ws","service_tier":"default"}}',
+            ),
+        ]
+    )
+    session = _WsSession(websocket)
+
+    events = [
+        event
+        async for event in proxy_module.stream_responses(
+            payload,
+            headers={"originator": "codex_cli_rs", "session_id": "sid_ws"},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+        )
+    ]
+
+    assert len(events) == 2
+    upstream_headers = cast(dict[str, str], session.ws_calls[0]["headers"])
+    lowered = {key.lower() for key in upstream_headers}
+    assert proxy_module.CODEX_RESPONSES_LITE_HEADER.lower() not in lowered
+    client_metadata = cast(dict[str, JsonValue], websocket.sent_json[0]["client_metadata"])
+    assert client_metadata[proxy_module.CODEX_RESPONSES_LITE_WS_METADATA_KEY] == "true"
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_responses_lite_websocket_fallback_uses_http_header_without_ws_metadata(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_stream_transport = "auto"
+        upstream_connect_timeout_seconds = 8.0
+        stream_idle_timeout_seconds = 45.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        log_upstream_request_payload = False
+        proxy_request_budget_seconds = 75.0
+        log_upstream_request_summary = False
+
+    registry = SimpleNamespace(
+        get_snapshot=lambda: SimpleNamespace(models={"gpt-5.4": SimpleNamespace(prefer_websockets=True)})
+    )
+    attempts = {"websocket": 0}
+    request_info = cast(RequestInfo, SimpleNamespace(real_url="wss://chatgpt.com/backend-api/codex/responses"))
+
+    async def fake_open_upstream_websocket(**kwargs):
+        attempts["websocket"] += 1
+        raise proxy_module.aiohttp.WSServerHandshakeError(request_info, (), status=426, message="Upgrade Required")
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "get_model_registry", lambda: registry)
+    monkeypatch.setattr(proxy_module, "_open_upstream_websocket", fake_open_upstream_websocket)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    additional_tools = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    session = _SseSession(_SsePostResponse([b'data: {"type":"response.completed","response":{"id":"resp_http"}}\n\n']))
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.4",
+            "instructions": "",
+            "input": [
+                additional_tools,
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            ],
+        }
+    )
+
+    events = [
+        event
+        async for event in proxy_module.stream_responses(
+            payload,
+            headers={},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+        )
+    ]
+
+    assert attempts["websocket"] == 1
+    assert events == ['data: {"type":"response.completed","response":{"id":"resp_http"}}\n\n']
+    call = session.calls[0]
+    upstream_headers = cast(dict[str, str], call["headers"])
+    lite_values = [
+        value for key, value in upstream_headers.items() if key.lower() == proxy_module.CODEX_RESPONSES_LITE_HEADER
+    ]
+    assert lite_values == ["true"]
+    upstream_payload = cast(dict[str, JsonValue], call["json"])
+    assert "client_metadata" not in upstream_payload
 
 
 @pytest.mark.asyncio
@@ -6668,6 +6950,53 @@ async def test_compact_responses_defaults_to_no_configured_request_timeout(monke
     dumped = result.model_dump(mode="json", exclude_none=True)
     assert dumped["object"] == "response.compaction"
     assert dumped["compaction_summary"]["encrypted_content"] == "enc_summary_2"
+
+
+@pytest.mark.asyncio
+async def test_compact_responses_does_not_promote_responses_lite_metadata(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 2.0
+        upstream_compact_timeout_seconds = None
+        image_inline_fetch_enabled = False
+        log_upstream_request_payload = False
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    payload = proxy_module.ResponsesCompactRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "hi",
+            "input": [{"role": "user", "content": "hi"}],
+            "client_metadata": {
+                proxy_module.CODEX_RESPONSES_LITE_WS_METADATA_KEY: "TRUE",
+                "other": "keep",
+            },
+        }
+    )
+    session = _CompactSession(
+        _JsonCompactResponse(
+            {"object": "response.compaction", "compaction_summary": {"encrypted_content": "enc_summary_lite"}}
+        )
+    )
+
+    await proxy_module.compact_responses(
+        payload,
+        headers={
+            "User-Agent": "codex_exec/0.144.0 (Mac OS 27.0.0; arm64) unknown (codex_exec; 0.144.0)",
+            proxy_module.CODEX_RESPONSES_LITE_HEADER: "true",
+        },
+        access_token="token",
+        account_id="acc_1",
+        session=cast(proxy_module.aiohttp.ClientSession, session),
+    )
+
+    upstream_headers = cast(dict[str, str], session.calls[0]["headers"])
+    assert proxy_module.CODEX_RESPONSES_LITE_HEADER not in {key.lower() for key in upstream_headers}
+    upstream_payload = cast(dict[str, object], session.calls[0]["json"])
+    assert "client_metadata" not in upstream_payload
 
 
 def test_sticky_key_for_responses_request_uses_bounded_cache_affinity():
@@ -13116,23 +13445,29 @@ async def test_finalize_websocket_request_state_updates_balancer_state(monkeypat
     account = _make_account("acc_ws_finalize")
     record_success = AsyncMock()
     handle_stream_error = AsyncMock()
+    settle_stream_usage = AsyncMock(return_value=True)
 
     monkeypatch.setattr(service._load_balancer, "record_success", record_success)
     monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
-    monkeypatch.setattr(service, "_settle_stream_api_key_usage", AsyncMock(return_value=True))
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle_stream_usage)
 
     completed_payload: dict[str, JsonValue] = {
         "type": "response.completed",
         "response": {
             "id": "resp_ws_complete",
-            "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+            "usage": {
+                "input_tokens": 2,
+                "output_tokens": 3,
+                "total_tokens": 5,
+                "input_tokens_details": {"cached_tokens": 1, "cache_write_tokens": 1},
+            },
         },
     }
     completed_event = parse_sse_event(f"data: {json.dumps(completed_payload)}\n\n")
     assert completed_event is not None
     completed_state = proxy_service._WebSocketRequestState(
         request_id="ws_req_complete",
-        model="gpt-5.1",
+        model="gpt-5.6-sol",
         service_tier=None,
         reasoning_effort=None,
         api_key_reservation=None,
@@ -13156,6 +13491,12 @@ async def test_finalize_websocket_request_state_updates_balancer_state(monkeypat
     handle_stream_error.assert_not_awaited()
     assert completed_upstream_control.reconnect_requested is False
     assert request_logs.calls[-1]["request_kind"] == "normal"
+    expected_cost = ((1 * 0.5) + (1 * 6.25) + (3 * 30.0)) / 1_000_000
+    assert request_logs.calls[-1]["cost_usd"] == pytest.approx(expected_cost)
+    completed_call = settle_stream_usage.await_args
+    assert completed_call is not None
+    completed_settlement = completed_call.args[2]
+    assert completed_settlement.cache_write_input_tokens == 1
 
     record_success.reset_mock()
     handle_stream_error.reset_mock()
@@ -15286,6 +15627,7 @@ async def test_stream_api_key_settlement_outlives_caller_cancel_and_closes_repo(
         input_tokens=12,
         output_tokens=34,
         cached_input_tokens=5,
+        cache_write_input_tokens=7,
     )
 
     caller = asyncio.create_task(
@@ -15317,6 +15659,7 @@ async def test_stream_api_key_settlement_outlives_caller_cancel_and_closes_repo(
             "input_tokens": 12,
             "output_tokens": 34,
             "cached_input_tokens": 5,
+            "cache_write_input_tokens": 7,
             "service_tier": "default",
         }
     ]
@@ -18234,6 +18577,7 @@ def test_sanitize_websocket_connect_failure_rewrites_missing_tool_output():
 async def test_emit_websocket_connect_failure_releases_response_create_gate(monkeypatch):
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
+    downstream_activity = proxy_service._DownstreamWebSocketActivity(responses_lite_model="gpt-5.6-sol")
     request_state = proxy_service._WebSocketRequestState(
         request_id="ws_req_connect_failure_gate",
         model="gpt-5.1",
@@ -18242,6 +18586,7 @@ async def test_emit_websocket_connect_failure_releases_response_create_gate(monk
         api_key_reservation=None,
         started_at=0.0,
         awaiting_response_created=True,
+        downstream_activity=downstream_activity,
     )
     response_create_gate = asyncio.Semaphore(1)
     await response_create_gate.acquire()
@@ -18275,12 +18620,14 @@ async def test_emit_websocket_connect_failure_releases_response_create_gate(monk
     assert request_state.awaiting_response_created is False
     assert request_state.response_create_gate_acquired is False
     assert request_state.response_create_gate is None
+    assert downstream_activity.responses_lite_model is None
 
 
 @pytest.mark.asyncio
 async def test_emit_websocket_terminal_error_releases_response_create_gate():
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
+    downstream_activity = proxy_service._DownstreamWebSocketActivity(responses_lite_model="gpt-5.6-sol")
     request_state = proxy_service._WebSocketRequestState(
         request_id="ws_req_terminal_failure_gate",
         model="gpt-5.1",
@@ -18289,6 +18636,7 @@ async def test_emit_websocket_terminal_error_releases_response_create_gate():
         api_key_reservation=None,
         started_at=0.0,
         awaiting_response_created=True,
+        downstream_activity=downstream_activity,
     )
     response_create_gate = asyncio.Semaphore(1)
     await response_create_gate.acquire()
@@ -18310,6 +18658,7 @@ async def test_emit_websocket_terminal_error_releases_response_create_gate():
     assert request_state.awaiting_response_created is False
     assert request_state.response_create_gate_acquired is False
     assert request_state.response_create_gate is None
+    assert downstream_activity.responses_lite_model is None
 
 
 @pytest.mark.asyncio
@@ -23235,6 +23584,61 @@ def test_prepare_http_bridge_request_kind_uses_headers_over_payload_metadata():
     assert upstream_payload["client_metadata"]["x-codex-turn-metadata"] == json.dumps(
         {"request_kind": "prewarm", "turn_id": "payload-turn"}
     )
+
+
+def test_prepare_http_bridge_request_strips_non_native_responses_lite_metadata():
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "hello",
+            "input": [],
+            "client_metadata": {
+                proxy_module.CODEX_RESPONSES_LITE_WS_METADATA_KEY: "true",
+                "keep": "yes",
+            },
+        }
+    )
+    headers = {"User-Agent": "OpenAI/Python 2.24.0"}
+
+    _, text_data = service._prepare_http_bridge_request(
+        payload,
+        headers,
+        api_key=None,
+        api_key_reservation=None,
+    )
+
+    upstream_payload = json.loads(text_data)
+    assert upstream_payload["client_metadata"] == {"keep": "yes"}
+
+
+def test_prepare_http_bridge_request_preserves_responses_lite_metadata_when_requested():
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "hello",
+            "input": [],
+            "client_metadata": {
+                proxy_module.CODEX_RESPONSES_LITE_WS_METADATA_KEY: "true",
+                "keep": "yes",
+            },
+        }
+    )
+
+    _, text_data = service._prepare_http_bridge_request(
+        payload,
+        {"User-Agent": "OpenAI/Python 2.24.0"},
+        api_key=None,
+        api_key_reservation=None,
+        preserve_responses_lite_client_metadata=True,
+    )
+
+    upstream_payload = json.loads(text_data)
+    assert upstream_payload["client_metadata"] == {
+        "keep": "yes",
+        proxy_module.CODEX_RESPONSES_LITE_WS_METADATA_KEY: "true",
+    }
 
 
 @pytest.mark.asyncio

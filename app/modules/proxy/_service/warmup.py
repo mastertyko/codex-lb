@@ -24,7 +24,7 @@ from app.db.models import Account, AccountStatus
 from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy._service.support import _call_with_supported_optional_kwargs, _request_log_useragent_fields
 from app.modules.proxy.helpers import _header_account_id, _normalize_error_code, _parse_openai_error
-from app.modules.proxy.request_policy import normalize_upstream_model_alias, validate_model_access
+from app.modules.proxy.request_policy import normalize_upstream_model_alias, resolve_model_alias, validate_model_access
 
 _REQUEST_TRANSPORT_HTTP = "http"
 _WARMUP_MODES = frozenset({"normal", "strict", "force"})
@@ -306,7 +306,9 @@ class _WarmupMixin:
         input_tokens: int | None = None
         output_tokens: int | None = None
         cached_input_tokens: int | None = None
+        cache_write_input_tokens: int | None = None
         reasoning_tokens: int | None = None
+        canonical_warmup_model = resolve_model_alias(warmup_model) or warmup_model
         reservation: ApiKeyUsageReservationData | None = None
         upstream_proxy_route_mode: str | None = None
         upstream_proxy_pool_id: str | None = None
@@ -360,6 +362,9 @@ class _WarmupMixin:
             cached_input_tokens = (
                 usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
             )
+            cache_write_input_tokens = (
+                usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
+            )
             reasoning_tokens = (
                 usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
             )
@@ -402,7 +407,7 @@ class _WarmupMixin:
                     account_id=account.id,
                     api_key=api_key,
                     request_id=request_id,
-                    model=warmup_model,
+                    model=canonical_warmup_model,
                     latency_ms=int((time.monotonic() - started_at) * 1000),
                     status=status,
                     error_code=error_code,
@@ -410,6 +415,7 @@ class _WarmupMixin:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_input_tokens=cache_write_input_tokens,
                     reasoning_tokens=reasoning_tokens,
                     transport=_REQUEST_TRANSPORT_HTTP,
                     request_kind="warmup",

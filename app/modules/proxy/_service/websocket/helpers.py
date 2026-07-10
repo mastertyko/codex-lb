@@ -30,9 +30,15 @@ from app.core.clients.proxy import (  # noqa: F401  # noqa: F401
     push_stream_timeout_overrides,
     push_transcribe_timeout_overrides,
 )
-from app.core.clients.proxy import codex_control_request as core_codex_control_request  # noqa: F401
-from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
-from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
+from app.core.clients.proxy import (
+    codex_control_request as core_codex_control_request,  # noqa: F401
+)
+from app.core.clients.proxy import (
+    compact_responses as core_compact_responses,  # noqa: F401
+)
+from app.core.clients.proxy import (
+    transcribe_audio as core_transcribe_audio,  # noqa: F401
+)
 from app.core.clients.proxy_websocket import (
     UpstreamWebSocketMessage,
 )
@@ -52,7 +58,9 @@ from app.core.openai.requests import (
     ResponsesRequest,
 )
 from app.core.types import JsonValue
-from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
+from app.core.utils.sse import (
+    CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME,  # noqa: F401
+)
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import utcnow as utcnow
 from app.db.models import (
@@ -273,6 +281,7 @@ from app.modules.proxy._service.support import (
     _WEBSOCKET_FULL_REPLAY_WAIT_MIN_ITEMS,
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
     _clear_websocket_request_error_overrides,
+    _DownstreamWebSocketActivity,
     _event_type_from_payload,
     _websocket_request_can_replay_before_visible_output,
     _WebSocketContinuityAnchor,
@@ -463,6 +472,16 @@ def _record_websocket_continuity_completion(
     continuity_state.last_completed_input_count = request_state.input_item_count
     continuity_state.last_completed_input_prefix_fingerprint = request_state.input_full_fingerprint
     continuity_state.last_pending_function_call_ids = list(request_state.pending_function_call_ids)
+
+
+def _record_websocket_responses_lite_acceptance(
+    downstream_activity: _DownstreamWebSocketActivity,
+    *,
+    request_state: _WebSocketRequestState,
+) -> None:
+    if request_state.request_kind == "prewarm":
+        return
+    downstream_activity.responses_lite_model = request_state.responses_lite_model
 
 
 def _websocket_response_id(event: OpenAIEvent | None, payload: dict[str, JsonValue] | None) -> str | None:

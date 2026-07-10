@@ -7,9 +7,14 @@ from app.core.types import JsonValue
 type MessageRole = Literal["system", "developer", "user", "assistant", "tool"]
 
 
+class PromptCacheBreakpoint(TypedDict):
+    mode: Literal["explicit"]
+
+
 class TextContentPart(TypedDict, total=False):
     type: str
     text: str
+    prompt_cache_breakpoint: PromptCacheBreakpoint
 
 
 class RefusalContentPart(TypedDict):
@@ -89,3 +94,4 @@ class InputFileItem(TypedDict, total=False):
     type: Literal["input_file"]
     file_id: str
     file_url: str
+    prompt_cache_breakpoint: PromptCacheBreakpoint

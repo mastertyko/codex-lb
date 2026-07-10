@@ -299,6 +299,102 @@ def test_chat_prompt_cache_controls_are_preserved():
     assert "prompt_cache_retention" not in dumped
 
 
+@pytest.mark.parametrize(
+    ("content_part", "expected_part"),
+    [
+        (
+            {
+                "type": "text",
+                "text": "stable prefix",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+                "_client_marker": "drop-me",
+            },
+            {
+                "type": "input_text",
+                "text": "stable prefix",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+        ),
+        (
+            {
+                "type": "image_url",
+                "image_url": {"url": "https://example.com/cache.png", "detail": "high"},
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+                "_client_marker": "drop-me",
+            },
+            {
+                "type": "input_image",
+                "image_url": "https://example.com/cache.png",
+                "detail": "high",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+        ),
+        (
+            {
+                "type": "file",
+                "file": {"file_data": "dGVzdA==", "mime_type": "text/plain"},
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+                "_client_marker": "drop-me",
+            },
+            {
+                "type": "input_file",
+                "file_url": "data:text/plain;base64,dGVzdA==",
+                "prompt_cache_breakpoint": {"mode": "explicit"},
+            },
+        ),
+    ],
+)
+def test_chat_user_prompt_cache_breakpoint_is_recognized_then_stripped_for_subscription_upstream(
+    content_part: JsonValue,
+    expected_part: JsonValue,
+) -> None:
+    payload = {
+        "model": "gpt-5.6-sol",
+        "messages": [{"role": "user", "content": [content_part]}],
+        "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+    }
+
+    request = ChatCompletionsRequest.model_validate(payload).to_responses_request()
+    assert request.input == [{"role": "user", "content": [expected_part]}]
+
+    dumped = request.to_payload()
+    expected_upstream_part = dict(cast(dict[str, JsonValue], expected_part))
+    expected_upstream_part.pop("prompt_cache_breakpoint")
+
+    assert dumped["input"] == [{"role": "user", "content": [expected_upstream_part]}]
+    assert "prompt_cache_options" not in dumped
+
+
+@pytest.mark.parametrize(
+    "breakpoint",
+    [
+        "explicit",
+        {},
+        {"mode": "automatic"},
+        {"mode": "explicit", "client_only": True},
+    ],
+)
+def test_chat_user_prompt_cache_breakpoint_rejects_invalid_shape(breakpoint: JsonValue) -> None:
+    payload = {
+        "model": "gpt-5.6-sol",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "stable prefix",
+                        "prompt_cache_breakpoint": breakpoint,
+                    }
+                ],
+            }
+        ],
+    }
+
+    with pytest.raises(ValidationError):
+        ChatCompletionsRequest.model_validate(payload)
+
+
 def test_chat_reasoning_effort_maps_to_responses_reasoning():
     payload = {
         "model": "gpt-5.2",

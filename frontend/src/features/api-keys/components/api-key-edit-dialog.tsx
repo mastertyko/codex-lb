@@ -28,8 +28,10 @@ import { LimitRulesEditor } from "@/features/api-keys/components/limit-rules-edi
 import { AccountMultiSelect } from "@/features/api-keys/components/account-multi-select";
 import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-select";
 import { UsageSectionsMultiSelect } from "@/features/api-keys/components/usage-sections-multi-select";
+import { ModelSourceMultiSelect } from "@/features/model-sources/components/model-source-multi-select";
 import type {
   ApiKey,
+  ApiKeyReasoningEffort,
   ApiKeyUpdateRequest,
   LimitRuleCreate,
   LimitType,
@@ -91,12 +93,14 @@ function hasSelectionChange(initialIds: string[], nextIds: string[]): boolean {
 type ApiKeyEditDraft = {
   selectedModels: string[];
   selectedAccountIds: string[];
+  selectedSourceIds: string[];
+  clearSourceScope: boolean;
   usageSections: string;
   limitRules: LimitRuleCreate[];
   expiresAt: Date | null;
   applyToCodexModel: boolean;
   enforcedModel: string;
-  enforcedReasoningEffort: string;
+  enforcedReasoningEffort: ApiKeyReasoningEffort;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
   transportPolicyOverride: TransportPolicyOverride | null;
@@ -106,6 +110,8 @@ function createApiKeyEditDraft(apiKey: ApiKey): ApiKeyEditDraft {
   return {
     selectedModels: apiKey.allowedModels || [],
     selectedAccountIds: apiKey.assignedAccountIds,
+    selectedSourceIds: apiKey.assignedSourceIds,
+    clearSourceScope: false,
     usageSections: apiKey.usageSections,
     limitRules: limitsToCreateRules(apiKey),
     expiresAt: parseDate(apiKey.expiresAt),
@@ -142,12 +148,21 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
     const shouldSubmitAssignedAccountIds =
       hasSelectionChange(apiKey.assignedAccountIds, draft.selectedAccountIds) ||
       (apiKey.accountAssignmentScopeEnabled && draft.selectedAccountIds.length === 0);
+    // A source-scoped key whose assigned sources were all deleted comes back
+    // as scopeEnabled=true with an empty id list (deny-all). Submitting an
+    // empty list would make the backend disable scoping and silently broaden
+    // the key to every source, so an empty->empty selection is only sent when
+    // the user explicitly opts to remove the restriction.
+    const shouldSubmitAssignedSourceIds =
+      hasSelectionChange(apiKey.assignedSourceIds, draft.selectedSourceIds) ||
+      (apiKey.sourceAssignmentScopeEnabled && draft.selectedSourceIds.length === 0 && draft.clearSourceScope);
     const payload: ApiKeyUpdateRequest = {
       name: values.name,
       allowedModels: draft.selectedModels.length > 0 ? draft.selectedModels : null,
       applyToCodexModel: draft.applyToCodexModel,
       enforcedModel: draft.enforcedModel.trim() ? draft.enforcedModel.trim() : null,
-      enforcedReasoningEffort: draft.enforcedReasoningEffort === "none" ? null : draft.enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
+      enforcedReasoningEffort:
+        draft.enforcedReasoningEffort === "none" ? null : draft.enforcedReasoningEffort,
       enforcedServiceTier: draft.enforcedServiceTier === "none" ? null : draft.enforcedServiceTier as ServiceTierType,
       trafficClass: draft.trafficClass,
       transportPolicyOverride: draft.transportPolicyOverride,
@@ -157,6 +172,9 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
     };
     if (shouldSubmitAssignedAccountIds) {
       payload.assignedAccountIds = draft.selectedAccountIds;
+    }
+    if (shouldSubmitAssignedSourceIds) {
+      payload.assignedSourceIds = draft.selectedSourceIds;
     }
     if (hasLimitRuleChanges(initialLimitRules, draft.limitRules)) {
       payload.limits = normalizedLimits;
@@ -213,6 +231,34 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
             </div>
 
             <div className="space-y-1">
+              <div className="text-sm font-medium">Assigned model sources</div>
+              <ModelSourceMultiSelect
+                value={draft.selectedSourceIds}
+                onChange={(selectedSourceIds) => updateDraft({ selectedSourceIds })}
+              />
+              {apiKey.sourceAssignmentScopeEnabled &&
+              apiKey.assignedSourceIds.length === 0 &&
+              draft.selectedSourceIds.length === 0 ? (
+                <div className="space-y-1 rounded-md border border-destructive/50 p-2 text-xs">
+                  <p className="text-muted-foreground">
+                    This key is restricted to model sources that no longer exist, so it cannot
+                    access any source. Select sources above, or remove the restriction.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <Checkbox
+                      id="edit-api-key-clear-source-scope"
+                      checked={draft.clearSourceScope}
+                      onCheckedChange={(checked) => updateDraft({ clearSourceScope: checked === true })}
+                    />
+                    <label htmlFor="edit-api-key-clear-source-scope" className="cursor-pointer">
+                      Remove source restriction (allow all sources)
+                    </label>
+                  </div>
+                </div>
+              ) : null}
+            </div>
+
+            <div className="space-y-1">
               <div className="text-sm font-medium">Usage sections shown to client</div>
               <UsageSectionsMultiSelect value={draft.usageSections} onChange={(usageSections) => updateDraft({ usageSections })} />
             </div>
@@ -228,9 +274,16 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
             </div>
 
             <div className="space-y-1">
-              <div className="text-sm font-medium">Enforced reasoning</div>
-              <Select value={draft.enforcedReasoningEffort} onValueChange={(enforcedReasoningEffort) => updateDraft({ enforcedReasoningEffort })}>
-                <SelectTrigger>
+              <label htmlFor="edit-api-key-enforced-reasoning" className="text-sm font-medium">
+                Enforced reasoning
+              </label>
+              <Select
+                value={draft.enforcedReasoningEffort}
+                onValueChange={(value) =>
+                  updateDraft({ enforcedReasoningEffort: value as ApiKeyReasoningEffort })
+                }
+              >
+                <SelectTrigger id="edit-api-key-enforced-reasoning">
                   <SelectValue placeholder="None" />
                 </SelectTrigger>
                 <SelectContent>
@@ -240,6 +293,7 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
                   <SelectItem value="medium">Medium</SelectItem>
                   <SelectItem value="high">High</SelectItem>
                   <SelectItem value="xhigh">XHigh</SelectItem>
+                  <SelectItem value="max">Max</SelectItem>
                 </SelectContent>
               </Select>
             </div>

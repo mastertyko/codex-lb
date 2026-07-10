@@ -47,6 +47,7 @@ class OpenAIErrorEnvelope(BaseModel):
 class ResponseUsageDetails(BaseModel):
     model_config = ConfigDict(extra="allow")
 
+    cache_write_tokens: StrictInt | None = None
     cached_tokens: StrictInt | None = None
     reasoning_tokens: StrictInt | None = None
 

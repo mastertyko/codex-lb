@@ -9,7 +9,17 @@ import pytest
 from sqlalchemy.exc import OperationalError
 
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, ApiKey, ApiKeyAccountAssignment, ApiKeyLimit, LimitType, UsageHistory
+from app.db.models import (
+    Account,
+    AccountStatus,
+    ApiKey,
+    ApiKeyAccountAssignment,
+    ApiKeyLimit,
+    ApiKeyModelSourceAssignment,
+    LimitType,
+    ModelSource,
+    UsageHistory,
+)
 from app.modules.api_keys.repository import (
     _UNSET,
     ApiKeyTrendBucket,
@@ -55,7 +65,9 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         self.rows: dict[str, ApiKey] = {}
         self._limits: dict[str, list[ApiKeyLimit]] = {}
         self._account_assignments: dict[str, list[ApiKeyAccountAssignment]] = {}
+        self._source_assignments: dict[str, list[ApiKeyModelSourceAssignment]] = {}
         self._accounts: dict[str, Account] = {}
+        self._model_sources: dict[str, ModelSource] = {}
         self._limit_id_seq = 0
         self._reservations: dict[str, UsageReservationData] = {}
         self.list_all_accounts_calls = 0
@@ -71,6 +83,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         self.rows[row.id] = row
         row.limits = []
         row.account_assignments = []
+        row.source_assignments = []
         return row
 
     async def get_by_id(self, key_id: str) -> ApiKey | None:
@@ -78,6 +91,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         if row is not None:
             row.limits = self._limits.get(key_id, [])
             row.account_assignments = self._account_assignments.get(key_id, [])
+            row.source_assignments = self._source_assignments.get(key_id, [])
         return row
 
     async def get_by_hash(self, key_hash: str) -> ApiKey | None:
@@ -85,6 +99,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             if row.key_hash == key_hash:
                 row.limits = self._limits.get(row.id, [])
                 row.account_assignments = self._account_assignments.get(row.id, [])
+                row.source_assignments = self._source_assignments.get(row.id, [])
                 return row
         return None
 
@@ -93,11 +108,15 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         for row in result:
             row.limits = self._limits.get(row.id, [])
             row.account_assignments = self._account_assignments.get(row.id, [])
+            row.source_assignments = self._source_assignments.get(row.id, [])
         return result
 
     async def list_accounts_by_ids(self, account_ids: list[str]) -> list[Account]:
         self.list_accounts_by_ids_calls.append(list(account_ids))
         return [self._accounts[account_id] for account_id in account_ids if account_id in self._accounts]
+
+    async def list_model_sources_by_ids(self, source_ids: list[str]) -> list[ModelSource]:
+        return [self._model_sources[source_id] for source_id in source_ids if source_id in self._model_sources]
 
     async def list_all_accounts(self) -> list[Account]:
         self.list_all_accounts_calls += 1
@@ -132,6 +151,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         transport_policy_override: str | None | _Unset = _UNSET,
         usage_sections: str | _Unset = _UNSET,
         account_assignment_scope_enabled: bool | _Unset = _UNSET,
+        source_assignment_scope_enabled: bool | _Unset = _UNSET,
         expires_at: datetime | None | _Unset = _UNSET,
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
@@ -153,6 +173,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             "transport_policy_override": transport_policy_override,
             "usage_sections": usage_sections,
             "account_assignment_scope_enabled": account_assignment_scope_enabled,
+            "source_assignment_scope_enabled": source_assignment_scope_enabled,
             "expires_at": expires_at,
             "is_active": is_active,
             "key_hash": key_hash,
@@ -162,6 +183,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
                 continue
             setattr(row, field, value)
         row.limits = self._limits.get(key_id, [])
+        row.source_assignments = self._source_assignments.get(key_id, [])
         return row
 
     async def delete(self, key_id: str) -> bool:
@@ -169,6 +191,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             return False
         self.rows.pop(key_id)
         self._limits.pop(key_id, None)
+        self._source_assignments.pop(key_id, None)
         return True
 
     async def update_last_used(self, key_id: str, *, commit: bool = True) -> None:
@@ -235,6 +258,14 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         row = self.rows.get(key_id)
         if row is not None:
             row.account_assignments = assignments
+
+    async def replace_source_assignments(self, key_id: str, source_ids: list[str], *, commit: bool = True) -> None:
+        del commit
+        assignments = [ApiKeyModelSourceAssignment(api_key_id=key_id, source_id=source_id) for source_id in source_ids]
+        self._source_assignments[key_id] = assignments
+        row = self.rows.get(key_id)
+        if row is not None:
+            row.source_assignments = assignments
 
     async def increment_limit_usage(
         self,
@@ -467,10 +498,12 @@ class _TransactionalAssignmentFailureRepo(_FakeApiKeysRepository):
         super().__init__()
         self._pending_rows: dict[str, ApiKey] = {}
         self._pending_account_assignments: dict[str, list[ApiKeyAccountAssignment]] = {}
+        self._pending_source_assignments: dict[str, list[ApiKeyModelSourceAssignment]] = {}
 
     async def create(self, row: ApiKey, *, commit: bool = True) -> ApiKey:
         row.limits = []
         row.account_assignments = []
+        row.source_assignments = []
         if commit:
             return await super().create(row, commit=commit)
         self._pending_rows[row.id] = row
@@ -481,6 +514,7 @@ class _TransactionalAssignmentFailureRepo(_FakeApiKeysRepository):
         if row is not None:
             row.limits = self._limits.get(key_id, [])
             row.account_assignments = self._account_assignments.get(key_id, [])
+            row.source_assignments = self._source_assignments.get(key_id, [])
         return row
 
     async def replace_account_assignments(self, key_id: str, account_ids: list[str], *, commit: bool = True) -> None:
@@ -491,13 +525,16 @@ class _TransactionalAssignmentFailureRepo(_FakeApiKeysRepository):
         self.commit_calls += 1
         self.rows.update(self._pending_rows)
         self._account_assignments.update(self._pending_account_assignments)
+        self._source_assignments.update(self._pending_source_assignments)
         self._pending_rows = {}
         self._pending_account_assignments = {}
+        self._pending_source_assignments = {}
 
     async def rollback(self) -> None:
         self.rollback_calls += 1
         self._pending_rows = {}
         self._pending_account_assignments = {}
+        self._pending_source_assignments = {}
 
 
 def _compute_increment(limit: ApiKeyLimit, input_tokens: int, output_tokens: int, cost_microdollars: int) -> int:
@@ -661,7 +698,14 @@ async def test_create_key_rejects_enforced_model_outside_allowed_models() -> Non
 
 
 @pytest.mark.asyncio
-async def test_create_key_normalizes_enforced_reasoning_effort() -> None:
+@pytest.mark.parametrize(
+    ("raw_effort", "expected_effort"),
+    [("HIGH", "high"), ("MAX", "max")],
+)
+async def test_create_key_normalizes_enforced_reasoning_effort(
+    raw_effort: str,
+    expected_effort: str,
+) -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
 
@@ -669,12 +713,28 @@ async def test_create_key_normalizes_enforced_reasoning_effort() -> None:
         ApiKeyCreateData(
             name="reasoning-policy",
             allowed_models=None,
-            enforced_reasoning_effort="HIGH",
+            enforced_reasoning_effort=raw_effort,
             expires_at=None,
         )
     )
 
-    assert created.enforced_reasoning_effort == "high"
+    assert created.enforced_reasoning_effort == expected_effort
+
+
+@pytest.mark.asyncio
+async def test_create_key_rejects_native_only_ultra_reasoning_effort() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    with pytest.raises(ApiKeyValidationError, match="Unsupported enforced reasoning effort 'ultra'"):
+        await service.create_key(
+            ApiKeyCreateData(
+                name="native-only-reasoning-policy",
+                allowed_models=None,
+                enforced_reasoning_effort="ultra",
+                expires_at=None,
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -815,6 +875,83 @@ async def test_create_key_persists_assigned_accounts() -> None:
 
     assert created.account_assignment_scope_enabled is True
     assert created.assigned_account_ids == ["acc-a"]
+
+
+@pytest.mark.asyncio
+async def test_create_key_persists_assigned_model_sources() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    repo._model_sources = {
+        "src-local": ModelSource(
+            id="src-local",
+            name="Local",
+            kind="openai_compatible",
+            base_url="http://localhost:8000/v1",
+            is_enabled=True,
+        ),
+    }
+
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="source-scope",
+            allowed_models=None,
+            expires_at=None,
+            assigned_source_ids=["src-local"],
+        )
+    )
+
+    assert created.source_assignment_scope_enabled is True
+    assert created.assigned_source_ids == ["src-local"]
+
+
+@pytest.mark.asyncio
+async def test_update_key_tracks_model_source_scope_after_clear() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    repo._model_sources = {
+        "src-local": ModelSource(
+            id="src-local",
+            name="Local",
+            kind="openai_compatible",
+            base_url="http://localhost:8000/v1",
+            is_enabled=True,
+        ),
+    }
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="source-scope",
+            allowed_models=None,
+            expires_at=None,
+            assigned_source_ids=["src-local"],
+        )
+    )
+
+    cleared = await service.update_key(
+        created.id,
+        ApiKeyUpdateData(
+            assigned_source_ids=[],
+            assigned_source_ids_set=True,
+        ),
+    )
+
+    assert cleared.source_assignment_scope_enabled is False
+    assert cleared.assigned_source_ids == []
+
+
+@pytest.mark.asyncio
+async def test_create_key_rejects_unknown_assigned_model_sources() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    with pytest.raises(ValueError, match="Unknown model source ids: missing-source"):
+        await service.create_key(
+            ApiKeyCreateData(
+                name="source-scope",
+                allowed_models=None,
+                expires_at=None,
+                assigned_source_ids=["missing-source"],
+            )
+        )
 
 
 @pytest.mark.asyncio
@@ -1716,6 +1853,35 @@ async def test_record_usage_cost_limit_uses_flex_service_tier_pricing() -> None:
     limits = await repo.get_limits_by_key(created.id)
     cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
     assert cost_limit.current_value == 2_625_000
+
+
+@pytest.mark.asyncio
+async def test_record_usage_cost_limit_includes_gpt56_cache_write_pricing() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="gpt56-cache-write-cost-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[
+                LimitRuleInput(limit_type="cost_usd", limit_window="weekly", max_value=100_000_000),
+            ],
+        )
+    )
+
+    await service.record_usage(
+        created.id,
+        model="gpt-5.6-sol",
+        input_tokens=100_000,
+        output_tokens=10_000,
+        cached_input_tokens=20_000,
+        cache_write_input_tokens=30_000,
+    )
+
+    limits = await repo.get_limits_by_key(created.id)
+    cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
+    assert cost_limit.current_value == 747_500
 
 
 @pytest.mark.asyncio

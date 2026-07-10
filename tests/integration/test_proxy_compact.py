@@ -441,6 +441,74 @@ async def test_proxy_compact_success_preserves_compaction_payload(async_client, 
 
 
 @pytest.mark.asyncio
+async def test_proxy_compact_oversized_lite_input_preserves_anchor_and_sets_http_header(async_client, monkeypatch):
+    email = "compact-lite-anchor@example.com"
+    raw_account_id = "acc_compact_lite_anchor"
+    auth_json = _make_auth_json(raw_account_id, email)
+    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
+    response = await async_client.post("/api/accounts/import", files=files)
+    assert response.status_code == 200
+
+    session = _JsonSession(_JsonResponse({"object": "response.compaction", "output": []}))
+
+    @contextlib.asynccontextmanager
+    async def lease_session(session_override=None):
+        assert session_override is None
+        yield session
+
+    monkeypatch.setattr(proxy_client_module, "lease_http_session", lease_session)
+
+    additional_tools: dict[str, object] = {
+        "type": "additional_tools",
+        "role": "developer",
+        "tools": [
+            {
+                "type": "custom",
+                "name": "exec",
+                "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.*/"},
+            }
+        ],
+    }
+    developer_message = {
+        "type": "message",
+        "role": "developer",
+        "content": [{"type": "input_text", "text": "dev instructions"}],
+    }
+    oversized_history = {"role": "assistant", "content": "x" * 500_000}
+    payload = {
+        "model": "gpt-5.6-sol",
+        "instructions": "",
+        "input": [
+            {"role": "user", "content": "initial instructions"},
+            additional_tools,
+            developer_message,
+            oversized_history,
+            {"role": "user", "content": "latest request"},
+        ],
+        "client_metadata": {
+            "ws_request_header_x_openai_internal_codex_responses_lite": "true",
+            "debug": "drop-me",
+        },
+    }
+    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+
+    assert response.status_code == 200
+    call_json = _session_call_json(session)
+    call_headers = cast(dict[str, str], session.calls[0]["headers"])
+    lite_values = [
+        value for key, value in call_headers.items() if key.lower() == "x-openai-internal-codex-responses-lite"
+    ]
+    assert lite_values == ["true"]
+    assert "client_metadata" not in call_json
+    assert call_json["instructions"] == ""
+    call_input = cast(list[dict[str, object]], call_json["input"])
+    additional_index = call_input.index(additional_tools)
+    assert call_input[additional_index + 1] == developer_message
+    assert oversized_history not in call_input
+    assert "[compact trim] Omitted" in json.dumps(call_input)
+
+
+@pytest.mark.asyncio
 async def test_proxy_compact_masks_previous_response_not_found(async_client, monkeypatch):
     email = "compact-prev-missing@example.com"
     raw_account_id = "acc_compact_prev_missing"

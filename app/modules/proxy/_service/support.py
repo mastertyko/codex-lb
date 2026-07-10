@@ -255,6 +255,7 @@ class _StreamSettlement:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_write_input_tokens: int | None = None
     error_code: str | None = None
     error_message: str | None = None
     error: UpstreamError | None = None
@@ -310,7 +311,21 @@ class _WebSocketRequestState:
     reasoning_effort: str | None
     api_key_reservation: ApiKeyUsageReservationData | None
     started_at: float
+    responses_lite_model: str | None = None
+    responses_lite_body_derived: bool = False
+    downstream_activity: _DownstreamWebSocketActivity | None = None
     latency_first_token_ms: int | None = None
+    latency_response_created_ms: int | None = None
+    latency_first_upstream_event_ms: int | None = None
+    latency_response_create_gate_wait_ms: int | None = None
+    latency_bridge_queue_wait_ms: int | None = None
+    response_create_gate_wait_started_at: float | None = None
+    bridge_queue_wait_started_at: float | None = None
+    prewarm_status: str | None = None
+    prewarm_latency_ms: int | None = None
+    prewarm_canary_bucket: str | None = None
+    prewarm_eligible_reason: str | None = None
+    session_previous_gap_ms: int | None = None
     request_log_id: str | None = None
     archive_request_id: str | None = None
     requested_service_tier: str | None = None
@@ -502,12 +517,14 @@ class _WebSocketUpstreamControl:
 class _DownstreamWebSocketActivity:
     last_activity_at: float = field(default_factory=time.monotonic)
     disconnected: bool = False
+    responses_lite_model: str | None = None
 
     def mark(self) -> None:
         self.last_activity_at = time.monotonic()
 
     def mark_disconnected(self) -> None:
         self.disconnected = True
+        self.responses_lite_model = None
         self.mark()
 
 

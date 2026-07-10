@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 
 from app.core.clients.proxy import UpstreamProxyRouteTrace
+from app.core.openai.models import ResponseUsage, ResponseUsageDetails
 from app.core.upstream_proxy import ResolvedProxyEndpoint, ResolvedUpstreamRoute, UpstreamProxyRouteError
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountLimitWarmup, AccountStatus, DashboardSettings, UsageHistory
@@ -198,6 +199,7 @@ class FakeRequestLogsRepo:
         upstream_proxy_endpoint_id: str | None = None,
         upstream_proxy_fallback_used: bool | None = None,
         upstream_proxy_fail_closed_reason: str | None = None,
+        cost_usd: float | None = None,
     ) -> None:
         self.logs.append(
             {
@@ -238,6 +240,7 @@ class FakeRequestLogsRepo:
                 "upstream_proxy_endpoint_id": upstream_proxy_endpoint_id,
                 "upstream_proxy_fallback_used": upstream_proxy_fallback_used,
                 "upstream_proxy_fail_closed_reason": upstream_proxy_fail_closed_reason,
+                "cost_usd": cost_usd,
             }
         )
 
@@ -299,6 +302,7 @@ async def test_fake_request_logs_repo_accepts_request_log_metadata_fields() -> N
             "upstream_proxy_endpoint_id": None,
             "upstream_proxy_fallback_used": None,
             "upstream_proxy_fail_closed_reason": None,
+            "cost_usd": None,
         }
     ]
 
@@ -572,6 +576,31 @@ async def test_reset_confirmed_candidate_sends_one_warmup() -> None:
     assert repo.rows[0].status == "succeeded"
     assert logs.logs[0]["source"] == "limit_warmup"
     assert logs.logs[0]["request_kind"] == "warmup"
+
+
+@pytest.mark.asyncio
+async def test_warmup_request_log_prices_gpt56_cache_writes() -> None:
+    logs = FakeRequestLogsRepo()
+    service = LimitWarmupService(FakeWarmupRepo(), logs, sender=FakeSender())
+    result = LimitWarmupSendResult(
+        request_id="warmup-gpt56-cache-write",
+        success=True,
+        latency_ms=12,
+        usage=ResponseUsage(
+            input_tokens=100,
+            output_tokens=10,
+            input_tokens_details=ResponseUsageDetails(cached_tokens=20, cache_write_tokens=30),
+        ),
+    )
+
+    await service._record_request_log(
+        account=_account("acc-gpt56-cache-write"),
+        model="gpt-5.6-sol",
+        result=result,
+    )
+
+    expected_cost = ((50 * 5.0) + (20 * 0.5) + (30 * 6.25) + (10 * 30.0)) / 1_000_000
+    assert logs.logs[0]["cost_usd"] == pytest.approx(expected_cost)
 
 
 @pytest.mark.asyncio

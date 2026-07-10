@@ -309,7 +309,7 @@ async def test_stream_chat_chunks_include_usage_chunk_supports_details():
         (
             'data: {"type":"response.completed","response":{"id":"r1","usage":'
             '{"input_tokens":2,"output_tokens":3,"total_tokens":5,'
-            '"input_tokens_details":{"cached_tokens":1},'
+            '"input_tokens_details":{"cached_tokens":1,"cache_write_tokens":2},'
             '"output_tokens_details":{"reasoning_tokens":2}}}}\n\n'
         ),
     ]
@@ -327,6 +327,7 @@ async def test_stream_chat_chunks_include_usage_chunk_supports_details():
     usage = chunks[-1]["usage"]
     assert usage["total_tokens"] == 5
     assert usage["prompt_tokens_details"]["cached_tokens"] == 1
+    assert usage["prompt_tokens_details"]["cache_write_tokens"] == 2
     assert usage["completion_tokens_details"]["reasoning_tokens"] == 2
 
 

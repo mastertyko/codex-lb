@@ -368,6 +368,7 @@ def _validate_user_content(content: JsonValue) -> None:
         part_mapping = _json_mapping(part)
         if part_mapping is None:
             raise ValueError("User message content parts must be objects.")
+        _validate_prompt_cache_breakpoint(part_mapping)
         part_type = _part_type(part_mapping)
         if part_type in _TEXT_CONTENT_PART_TYPES:
             text = part_mapping.get("text")
@@ -389,6 +390,14 @@ def _validate_user_content(content: JsonValue) -> None:
                 raise ValueError("File content parts must include file metadata.")
             continue
         raise ValueError(f"Unsupported user content part type: {part_type}")
+
+
+def _validate_prompt_cache_breakpoint(part: Mapping[str, JsonValue]) -> None:
+    if "prompt_cache_breakpoint" not in part:
+        return
+    breakpoint = _json_mapping(part.get("prompt_cache_breakpoint"))
+    if breakpoint is None or breakpoint.get("mode") != "explicit" or set(breakpoint) != {"mode"}:
+        raise ValueError("prompt_cache_breakpoint must be {'mode': 'explicit'}.")
 
 
 def _validate_tool_message(message: Mapping[str, JsonValue]) -> None:

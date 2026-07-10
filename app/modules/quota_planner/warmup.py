@@ -13,6 +13,7 @@ from app.core.clients.proxy import stream_responses
 from app.core.crypto import TokenEncryptor
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import ResponsesRequest
+from app.core.usage.logs import calculated_cost_from_token_counts
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, QuotaPlannerDecision
 from app.modules.accounts.repository import AccountsRepository
@@ -53,6 +54,7 @@ class WarmupUsage:
     output_tokens: int
     cached_input_tokens: int
     reasoning_tokens: int | None
+    cache_write_input_tokens: int = 0
 
 
 class QuotaWarmupService:
@@ -211,6 +213,7 @@ class QuotaWarmupService:
                     input_tokens=usage.input_tokens,
                     output_tokens=usage.output_tokens,
                     cached_input_tokens=usage.cached_input_tokens,
+                    cache_write_input_tokens=usage.cache_write_input_tokens,
                 )
             await self._request_logs.add_log(
                 account_id=account_id,
@@ -221,6 +224,14 @@ class QuotaWarmupService:
                 output_tokens=usage.output_tokens,
                 cached_input_tokens=usage.cached_input_tokens,
                 reasoning_tokens=usage.reasoning_tokens,
+                cost_usd=calculated_cost_from_token_counts(
+                    model=resolved_model,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cached_input_tokens=usage.cached_input_tokens,
+                    cache_write_input_tokens=usage.cache_write_input_tokens,
+                    service_tier=None,
+                ),
                 latency_ms=int((time.monotonic() - started) * 1000),
                 status="success",
                 error_code=None,
@@ -428,6 +439,10 @@ class QuotaWarmupService:
                 reasoning_tokens=(
                     raw_usage.output_tokens_details.reasoning_tokens if raw_usage.output_tokens_details else None
                 ),
+                cache_write_input_tokens=(
+                    raw_usage.input_tokens_details.cache_write_tokens if raw_usage.input_tokens_details else 0
+                )
+                or 0,
             )
         return usage
 

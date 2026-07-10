@@ -27,8 +27,10 @@ import { ExpiryPicker } from "@/features/api-keys/components/expiry-picker";
 import { LimitRulesEditor } from "@/features/api-keys/components/limit-rules-editor";
 import { ModelMultiSelect } from "@/features/api-keys/components/model-multi-select";
 import { UsageSectionsMultiSelect } from "@/features/api-keys/components/usage-sections-multi-select";
+import { ModelSourceMultiSelect } from "@/features/model-sources/components/model-source-multi-select";
 import type {
   ApiKeyCreateRequest,
+  ApiKeyReasoningEffort,
   LimitRuleCreate,
   ServiceTierType,
   TrafficClass,
@@ -64,11 +66,12 @@ type ApiKeyCreateFormProps = {
 type ApiKeyCreateDraft = {
   selectedModels: string[];
   selectedAccountIds: string[];
+  selectedSourceIds: string[];
   usageSections: string;
   limitRules: LimitRuleCreate[];
   expiresAt: Date | null;
   enforcedModel: string;
-  enforcedReasoningEffort: string;
+  enforcedReasoningEffort: ApiKeyReasoningEffort;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
   transportPolicyOverride: TransportPolicyOverride | null;
@@ -78,6 +81,7 @@ type ApiKeyCreateDraft = {
 const initialApiKeyCreateDraft: ApiKeyCreateDraft = {
   selectedModels: [],
   selectedAccountIds: [],
+  selectedSourceIds: [],
   usageSections: "upstream_limits,account_pool_usage",
   limitRules: [],
   expiresAt: null,
@@ -111,12 +115,13 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
       allowedModels: draft.selectedModels.length > 0 ? draft.selectedModels : undefined,
       applyToCodexModel: draft.applyToCodexModel,
       ...(draft.selectedAccountIds.length > 0 ? { assignedAccountIds: draft.selectedAccountIds } : {}),
+      ...(draft.selectedSourceIds.length > 0 ? { assignedSourceIds: draft.selectedSourceIds } : {}),
       usageSections: draft.usageSections,
       enforcedModel: draft.enforcedModel.trim() ? draft.enforcedModel.trim() : null,
       enforcedReasoningEffort:
         draft.enforcedReasoningEffort === "none"
           ? null
-          : draft.enforcedReasoningEffort as "minimal" | "low" | "medium" | "high" | "xhigh",
+          : draft.enforcedReasoningEffort,
       enforcedServiceTier: draft.enforcedServiceTier === "none" ? null : draft.enforcedServiceTier as ServiceTierType,
       trafficClass: draft.trafficClass,
       transportPolicyOverride: draft.transportPolicyOverride,
@@ -176,6 +181,14 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
             </div>
 
             <div className="space-y-1">
+              <p className="text-sm font-medium">Assigned model sources</p>
+              <ModelSourceMultiSelect
+                value={draft.selectedSourceIds}
+                onChange={(selectedSourceIds) => updateDraft({ selectedSourceIds })}
+              />
+            </div>
+
+            <div className="space-y-1">
               <label className="text-sm font-medium">Usage sections shown to client</label>
               <UsageSectionsMultiSelect value={draft.usageSections} onChange={(usageSections) => updateDraft({ usageSections })} />
             </div>
@@ -193,7 +206,12 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
 
             <div className="space-y-1">
               <label htmlFor="create-api-key-enforced-reasoning" className="text-sm font-medium">Enforced reasoning</label>
-              <Select value={draft.enforcedReasoningEffort} onValueChange={(enforcedReasoningEffort) => updateDraft({ enforcedReasoningEffort })}>
+              <Select
+                value={draft.enforcedReasoningEffort}
+                onValueChange={(value) =>
+                  updateDraft({ enforcedReasoningEffort: value as ApiKeyReasoningEffort })
+                }
+              >
                 <SelectTrigger id="create-api-key-enforced-reasoning">
                   <SelectValue placeholder="None" />
                 </SelectTrigger>
@@ -204,6 +222,7 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
                   <SelectItem value="medium">Medium</SelectItem>
                   <SelectItem value="high">High</SelectItem>
                   <SelectItem value="xhigh">XHigh</SelectItem>
+                  <SelectItem value="max">Max</SelectItem>
                 </SelectContent>
               </Select>
             </div>

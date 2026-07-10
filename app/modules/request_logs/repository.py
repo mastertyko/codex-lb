@@ -223,6 +223,15 @@ class RequestLogsRepository:
         status: str,
         error_code: str | None,
         latency_first_token_ms: int | None = None,
+        latency_response_created_ms: int | None = None,
+        latency_first_upstream_event_ms: int | None = None,
+        latency_response_create_gate_wait_ms: int | None = None,
+        latency_bridge_queue_wait_ms: int | None = None,
+        prewarm_status: str | None = None,
+        prewarm_latency_ms: int | None = None,
+        prewarm_canary_bucket: str | None = None,
+        prewarm_eligible_reason: str | None = None,
+        session_previous_gap_ms: int | None = None,
         error_message: str | None = None,
         requested_at: datetime | None = None,
         cached_input_tokens: int | None = None,
@@ -245,6 +254,9 @@ class RequestLogsRepository:
         failure_exception_type: str | None = None,
         upstream_status_code: int | None = None,
         upstream_error_code: str | None = None,
+        model_source_id: str | None = None,
+        model_source_kind: str | None = None,
+        cost_usd: float | None = None,
         bridge_stage: str | None = None,
         request_kind: str = RequestKind.NORMAL.value,
         upstream_proxy_route_mode: str | None = None,
@@ -267,12 +279,15 @@ class RequestLogsRepository:
             resolved_client_ip = client_ip if not isinstance(client_ip, str) or client_ip.strip() else None
             log = RequestLog(
                 account_id=account_id,
+                model_source_id=model_source_id,
+                model_source_kind=model_source_kind,
                 api_key_id=api_key_id,
                 session_id=session_id,
                 request_id=resolved_request_id,
                 archive_request_id=resolved_archive_request_id,
                 model=model,
                 plan_type=resolved_plan_type,
+                source=source,
                 transport=transport,
                 upstream_transport=upstream_transport,
                 request_kind=request_kind,
@@ -290,6 +305,15 @@ class RequestLogsRepository:
                 reasoning_effort=reasoning_effort,
                 latency_ms=latency_ms,
                 latency_first_token_ms=latency_first_token_ms,
+                latency_response_created_ms=latency_response_created_ms,
+                latency_first_upstream_event_ms=latency_first_upstream_event_ms,
+                latency_response_create_gate_wait_ms=latency_response_create_gate_wait_ms,
+                latency_bridge_queue_wait_ms=latency_bridge_queue_wait_ms,
+                prewarm_status=prewarm_status,
+                prewarm_latency_ms=prewarm_latency_ms,
+                prewarm_canary_bucket=prewarm_canary_bucket,
+                prewarm_eligible_reason=prewarm_eligible_reason,
+                session_previous_gap_ms=session_previous_gap_ms,
                 status=status,
                 error_code=error_code,
                 error_message=error_message,
@@ -306,7 +330,13 @@ class RequestLogsRepository:
                 upstream_proxy_fail_closed_reason=upstream_proxy_fail_closed_reason,
                 requested_at=requested_at or utcnow(),
             )
-            log.cost_usd = calculated_cost_from_log(typing_cast(RequestLogLike, log))
+            log.cost_usd = (
+                cost_usd
+                if cost_usd is not None
+                else 0.0
+                if model_source_id is not None
+                else calculated_cost_from_log(typing_cast(RequestLogLike, log))
+            )
             self._session.add(log)
             try:
                 await self._session.commit()

@@ -18,6 +18,7 @@ from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import ResponsesRequest
 from app.core.plan_types import account_plan_matches_allowed
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError, resolve_upstream_route
+from app.core.usage.logs import calculated_cost_from_token_counts
 from app.core.usage.pricing import get_pricing_for_model
 from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountLimitWarmup, AccountStatus, DashboardSettings, UsageHistory
@@ -133,6 +134,7 @@ class LimitWarmupRequestLogRepository(Protocol):
         upstream_proxy_endpoint_id: str | None = None,
         upstream_proxy_fallback_used: bool | None = None,
         upstream_proxy_fail_closed_reason: str | None = None,
+        cost_usd: float | None = None,
     ) -> object: ...
 
 
@@ -589,6 +591,11 @@ class LimitWarmupService:
             if usage is not None and usage.input_tokens_details is not None
             else None
         )
+        cache_write_input_tokens = (
+            usage.input_tokens_details.cache_write_tokens
+            if usage is not None and usage.input_tokens_details is not None
+            else None
+        )
         reasoning_tokens = (
             usage.output_tokens_details.reasoning_tokens
             if usage is not None and usage.output_tokens_details is not None
@@ -602,6 +609,14 @@ class LimitWarmupService:
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
             reasoning_tokens=reasoning_tokens,
+            cost_usd=calculated_cost_from_token_counts(
+                model=model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cached_input_tokens=cached_input_tokens,
+                cache_write_input_tokens=cache_write_input_tokens,
+                service_tier=None,
+            ),
             latency_ms=result.latency_ms,
             status="success" if result.success else "error",
             error_code=result.error_code,

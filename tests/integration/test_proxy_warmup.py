@@ -419,8 +419,21 @@ async def test_warmup_route_failure_records_fail_closed_reason(async_client, mon
 
 
 @pytest.mark.asyncio
-async def test_warmup_normalizes_model_alias_before_upstream(async_client, monkeypatch):
-    _set_warmup_model_env(monkeypatch, "gpt-5.4-mini-high")
+@pytest.mark.parametrize(
+    ("configured_alias", "canonical_model", "reasoning_effort"),
+    [
+        ("gpt-5.4-mini-high", "gpt-5.4-mini", "high"),
+        ("gpt-5.6-max", "gpt-5.6-sol", "max"),
+    ],
+)
+async def test_warmup_normalizes_model_alias_before_upstream_and_logging(
+    async_client,
+    monkeypatch,
+    configured_alias,
+    canonical_model,
+    reasoning_effort,
+):
+    _set_warmup_model_env(monkeypatch, configured_alias)
     await _enable_api_key_auth(async_client)
     settings_response = await async_client.put(
         "/api/settings",
@@ -428,7 +441,7 @@ async def test_warmup_normalizes_model_alias_before_upstream(async_client, monke
             "stickyThreadsEnabled": False,
             "preferEarlierResetAccounts": False,
             "apiKeyAuthEnabled": True,
-            "warmupModel": "gpt-5.4-mini-high",
+            "warmupModel": configured_alias,
         },
     )
     assert settings_response.status_code == 200
@@ -465,10 +478,15 @@ async def test_warmup_normalizes_model_alias_before_upstream(async_client, monke
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["submitted"][0]["model"] == "gpt-5.4-mini-high"
+    assert payload["submitted"][0]["model"] == configured_alias
     captured_request_payload = captured_payloads[0]
-    assert captured_request_payload["model"] == "gpt-5.4-mini"
-    assert captured_request_payload["reasoning"] == {"effort": "high"}
+    assert captured_request_payload["model"] == canonical_model
+    assert captured_request_payload["reasoning"] == {"effort": reasoning_effort}
+
+    async with SessionLocal() as session:
+        row = (await session.execute(select(RequestLog).where(RequestLog.request_kind == "warmup"))).scalar_one()
+
+    assert row.model == canonical_model
 
 
 @pytest.mark.asyncio

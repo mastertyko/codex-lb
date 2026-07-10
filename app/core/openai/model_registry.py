@@ -3,14 +3,36 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
+from types import MappingProxyType
 
 import anyio
 
 from app.core.types import JsonValue
 
 logger = logging.getLogger(__name__)
+
+MODEL_SOURCE_KIND_SUBSCRIPTION = "subscription"
+MODEL_SOURCE_KIND_OPENAI_COMPATIBLE = "openai_compatible"
+
+MODEL_ALIASES: Mapping[str, str] = MappingProxyType(
+    {
+        "gpt-5.6": "gpt-5.6-sol",
+    }
+)
+
+
+def resolve_known_model_alias(slug: str | None) -> str | None:
+    if not isinstance(slug, str):
+        return None
+    return MODEL_ALIASES.get(slug.strip().lower())
+
+
+def _normalize_model_lookup_slug(slug: str) -> str:
+    normalized = slug.strip().lower()
+    return resolve_known_model_alias(normalized) or normalized
 
 
 @dataclass(frozen=True)
@@ -38,6 +60,8 @@ class UpstreamModel:
     priority: int
     available_in_plans: frozenset[str]
     base_instructions: str = ""
+    source_kind: str = MODEL_SOURCE_KIND_SUBSCRIPTION
+    source_id: str | None = None
     raw: dict[str, JsonValue] = field(default_factory=dict, hash=False, compare=False)
 
 
@@ -52,7 +76,13 @@ class ModelRegistrySnapshot:
     fetched_at: float
 
 
-_BOOTSTRAP_WEBSOCKET_PREFERRED_MODEL_PATTERNS = ("gpt-5.5", "gpt-5.5-*", "gpt-5.4", "gpt-5.4-*")
+_BOOTSTRAP_WEBSOCKET_PREFERRED_MODEL_PATTERNS = (
+    "gpt-5.6-*",
+    "gpt-5.5",
+    "gpt-5.5-*",
+    "gpt-5.4",
+    "gpt-5.4-*",
+)
 
 _REASONING_LEVELS_STANDARD = (
     ReasoningLevel(effort="low", description="Low reasoning effort"),
@@ -65,6 +95,19 @@ _REASONING_LEVELS_EXTENDED = (
     ReasoningLevel(effort="medium", description="Medium reasoning effort"),
     ReasoningLevel(effort="high", description="High reasoning effort"),
     ReasoningLevel(effort="xhigh", description="Extra high reasoning effort"),
+)
+
+_REASONING_LEVELS_GPT56_MAX = (
+    ReasoningLevel(effort="low", description="Fast responses with lighter reasoning"),
+    ReasoningLevel(effort="medium", description="Balances speed and reasoning depth for everyday tasks"),
+    ReasoningLevel(effort="high", description="Greater reasoning depth for complex problems"),
+    ReasoningLevel(effort="xhigh", description="Extra high reasoning depth for complex problems"),
+    ReasoningLevel(effort="max", description="Maximum reasoning depth for the hardest problems"),
+)
+
+_REASONING_LEVELS_GPT56_ULTRA = (
+    *_REASONING_LEVELS_GPT56_MAX,
+    ReasoningLevel(effort="ultra", description="Maximum reasoning with automatic task delegation"),
 )
 
 _BOOTSTRAP_AVAILABLE_IN_PLANS = frozenset(
@@ -93,11 +136,56 @@ _BOOTSTRAP_CORE_AVAILABLE_IN_PLANS = frozenset(
     plan for plan in _BOOTSTRAP_AVAILABLE_IN_PLANS if plan not in {"free", "free_workspace", "k12"}
 )
 
+_GPT56_AVAILABLE_IN_PLANS = _BOOTSTRAP_AVAILABLE_IN_PLANS | frozenset(
+    {
+        "edu_plus",
+        "edu_pro",
+        "enterprise_cbp_automation",
+        "sci",
+    }
+)
+
+
+def _gpt56_raw_metadata(
+    *,
+    multi_agent_version: str,
+    availability_nux: dict[str, JsonValue] | None = None,
+) -> dict[str, JsonValue]:
+    return {
+        "apply_patch_tool_type": "freeform",
+        "web_search_tool_type": "text_and_image",
+        "supports_image_detail_original": True,
+        "truncation_policy": {"mode": "tokens", "limit": 10_000},
+        "tool_mode": "code_mode_only",
+        "multi_agent_version": multi_agent_version,
+        "use_responses_lite": True,
+        "include_skills_usage_instructions": False,
+        "auto_review_model_override": None,
+        "auto_compact_token_limit": None,
+        "comp_hash": "3000",
+        "reasoning_summary_format": "experimental",
+        "default_reasoning_summary": "none",
+        "availability_nux": availability_nux,
+        "upgrade": None,
+        "experimental_supported_tools": [],
+        "supports_search_tool": True,
+        "default_service_tier": None,
+        "service_tiers": [
+            {
+                "id": "priority",
+                "name": "Fast",
+                "description": "1.5x speed, increased usage",
+            }
+        ],
+        "additional_speed_tiers": ["fast"],
+    }
+
 
 def _bootstrap_model(
     slug: str,
     display_name: str,
     *,
+    description: str | None = None,
     prefer_websockets: bool,
     minimal_client_version: str | None,
     reasoning_levels: tuple[ReasoningLevel, ...] = _REASONING_LEVELS_EXTENDED,
@@ -109,6 +197,7 @@ def _bootstrap_model(
     available_in_plans: frozenset[str] = _BOOTSTRAP_AVAILABLE_IN_PLANS,
     visibility: str = "list",
     shell_type: str = "shell_command",
+    priority: int = 0,
     raw: dict[str, JsonValue] | None = None,
 ) -> UpstreamModel:
     raw_fields: dict[str, JsonValue] = {
@@ -122,7 +211,7 @@ def _bootstrap_model(
     return UpstreamModel(
         slug=slug,
         display_name=display_name,
-        description=display_name,
+        description=description if description is not None else display_name,
         context_window=context_window,
         input_modalities=input_modalities,
         supported_reasoning_levels=reasoning_levels,
@@ -134,7 +223,7 @@ def _bootstrap_model(
         supports_parallel_tool_calls=True,
         supported_in_api=supported_in_api,
         minimal_client_version=minimal_client_version,
-        priority=0,
+        priority=priority,
         available_in_plans=available_in_plans,
         raw=raw_fields,
     )
@@ -147,6 +236,54 @@ def _bootstrap_model(
 # explicit rather than inherited from helper defaults; every slug must exist
 # upstream, and live upstream data always takes precedence once available.
 _BOOTSTRAP_STATIC_MODELS: tuple[UpstreamModel, ...] = (
+    _bootstrap_model(
+        "gpt-5.6-sol",
+        "GPT-5.6-Sol",
+        description="Latest frontier agentic coding model.",
+        prefer_websockets=True,
+        minimal_client_version="0.144.0",
+        reasoning_levels=_REASONING_LEVELS_GPT56_ULTRA,
+        context_window=372_000,
+        default_reasoning_level="low",
+        priority=1,
+        available_in_plans=_GPT56_AVAILABLE_IN_PLANS,
+        raw=_gpt56_raw_metadata(
+            multi_agent_version="v2",
+            availability_nux={
+                "message": (
+                    "Our most capable model yet. GPT-5.6 Sol can tackle complex code changes, dig into research, "
+                    "produce polished documents, and take on your most ambitious work. Sol is highly capable at "
+                    "lower reasoning efforts—try starting lower, then turn it up for harder jobs."
+                )
+            },
+        ),
+    ),
+    _bootstrap_model(
+        "gpt-5.6-terra",
+        "GPT-5.6-Terra",
+        description="Balanced agentic coding model for everyday work.",
+        prefer_websockets=True,
+        minimal_client_version="0.144.0",
+        reasoning_levels=_REASONING_LEVELS_GPT56_ULTRA,
+        context_window=372_000,
+        default_reasoning_level="medium",
+        priority=2,
+        available_in_plans=_GPT56_AVAILABLE_IN_PLANS,
+        raw=_gpt56_raw_metadata(multi_agent_version="v2"),
+    ),
+    _bootstrap_model(
+        "gpt-5.6-luna",
+        "GPT-5.6-Luna",
+        description="Fast and affordable agentic coding model.",
+        prefer_websockets=True,
+        minimal_client_version="0.144.0",
+        reasoning_levels=_REASONING_LEVELS_GPT56_MAX,
+        context_window=372_000,
+        default_reasoning_level="medium",
+        priority=3,
+        available_in_plans=_GPT56_AVAILABLE_IN_PLANS,
+        raw=_gpt56_raw_metadata(multi_agent_version="v1"),
+    ),
     _bootstrap_model(
         "gpt-5.5",
         "GPT-5.5",
@@ -359,16 +496,21 @@ class ModelRegistry:
         return self._bootstrap_models
 
     def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
-        normalized_slug = slug.strip().lower()
+        normalized_slug = _normalize_model_lookup_slug(slug)
+        bootstrap_model = self._bootstrap_models.get(normalized_slug)
+        if bootstrap_model is None:
+            bootstrap_model = self._bootstrap_models.get(slug)
         if self._snapshot is None:
-            model = self._bootstrap_models.get(slug) or self._bootstrap_models.get(normalized_slug)
-            return model.available_in_plans if model is not None else None
-        return self._snapshot.model_plans.get(slug) or self._snapshot.model_plans.get(normalized_slug, frozenset())
+            return bootstrap_model.available_in_plans if bootstrap_model is not None else None
+        snapshot_plans = self._snapshot.model_plans.get(normalized_slug)
+        if snapshot_plans is not None:
+            return snapshot_plans
+        return self._snapshot.model_plans.get(slug, frozenset())
 
     def plan_types_for_model_service_tier(self, slug: str, service_tier: str | None) -> frozenset[str] | None:
         if service_tier is None:
             return self.plan_types_for_model(slug)
-        normalized_slug = slug.strip().lower()
+        normalized_slug = _normalize_model_lookup_slug(slug)
         normalized_service_tier = service_tier.strip()
         if not normalized_slug or not normalized_service_tier:
             return self.plan_types_for_model(slug)
@@ -378,9 +520,9 @@ class ModelRegistry:
         if self._snapshot is None:
             return self.plan_types_for_model(slug)
 
-        tier_plans = self._snapshot.model_service_tier_plans.get(slug) or self._snapshot.model_service_tier_plans.get(
-            normalized_slug
-        )
+        tier_plans = self._snapshot.model_service_tier_plans.get(normalized_slug)
+        if tier_plans is None:
+            tier_plans = self._snapshot.model_service_tier_plans.get(slug)
         if tier_plans is None:
             return self.plan_types_for_model(slug)
         return tier_plans.get(normalized_service_tier, frozenset())
@@ -388,14 +530,14 @@ class ModelRegistry:
     def account_ids_for_model_service_tier(self, slug: str, service_tier: str | None) -> frozenset[str] | None:
         if service_tier is None or self._snapshot is None:
             return None
-        normalized_slug = slug.strip().lower()
+        normalized_slug = _normalize_model_lookup_slug(slug)
         normalized_service_tier = _canonical_service_tier_value(service_tier)
         if not normalized_slug or not normalized_service_tier:
             return None
 
-        tier_accounts = self._snapshot.model_service_tier_accounts.get(
-            slug
-        ) or self._snapshot.model_service_tier_accounts.get(normalized_slug)
+        tier_accounts = self._snapshot.model_service_tier_accounts.get(normalized_slug)
+        if tier_accounts is None:
+            tier_accounts = self._snapshot.model_service_tier_accounts.get(slug)
         if tier_accounts is None:
             return None
         return tier_accounts.get(normalized_service_tier, frozenset())
@@ -403,17 +545,21 @@ class ModelRegistry:
     def prefers_websockets(self, slug: str | None) -> bool:
         if not isinstance(slug, str):
             return False
-        normalized_slug = slug.strip().lower()
+        normalized_slug = _normalize_model_lookup_slug(slug)
         if not normalized_slug:
             return False
 
         if self._snapshot is not None:
-            model = self._snapshot.models.get(slug) or self._snapshot.models.get(normalized_slug)
+            model = self._snapshot.models.get(normalized_slug)
+            if model is None:
+                model = self._snapshot.models.get(slug)
             if model is not None:
                 return model.prefer_websockets
             return False
 
-        bootstrap_model = self._bootstrap_models.get(slug) or self._bootstrap_models.get(normalized_slug)
+        bootstrap_model = self._bootstrap_models.get(normalized_slug)
+        if bootstrap_model is None:
+            bootstrap_model = self._bootstrap_models.get(slug)
         if bootstrap_model is not None:
             return bootstrap_model.prefer_websockets
 
