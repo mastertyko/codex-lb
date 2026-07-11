@@ -2446,11 +2446,7 @@ class _WebSocketMixin:
         cache_key = (response_id, api_key_id, session_id_value)
         cached_account_id = proxy._websocket_previous_response_account_index.get(cache_key)
         if cached_account_id is not None:
-            _record_lookup_metadata(
-                source="request_cache",
-                outcome="hit",
-                owner_session_id=session_id_value,
-            )
+            _record_lookup_metadata(source="request_cache", outcome="hit")
             _record_continuity_owner_resolution(
                 surface=surface,
                 source="request_cache",

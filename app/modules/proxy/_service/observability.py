@@ -203,20 +203,30 @@ def _format_continuity_fail_closed_diagnostics(
     previous_response_age_seconds: int | None,
     same_session: bool | None,
 ) -> str | None:
-    fields: list[str] = []
-    if previous_response_source is not None:
-        fields.append(f"previous_response_source={previous_response_source}")
-    if fresh_replay_available is not None:
-        fields.append(f"fresh_replay_available={str(fresh_replay_available).lower()}")
-    if owner_lookup_source is not None:
-        fields.append(f"owner_lookup_source={owner_lookup_source}")
-    if owner_lookup_outcome is not None:
-        fields.append(f"owner_lookup_outcome={owner_lookup_outcome}")
-    if previous_response_age_seconds is not None:
-        fields.append(f"previous_response_age_seconds={previous_response_age_seconds}")
-    if same_session is not None:
-        fields.append(f"same_session={str(same_session).lower()}")
-    return " ".join(fields) if fields else None
+    if all(
+        value is None
+        for value in (
+            previous_response_source,
+            fresh_replay_available,
+            owner_lookup_source,
+            owner_lookup_outcome,
+            previous_response_age_seconds,
+            same_session,
+        )
+    ):
+        return None
+    return " ".join(
+        (
+            f"previous_response_source={previous_response_source or 'unknown'}",
+            "fresh_replay_available="
+            f"{str(fresh_replay_available).lower() if fresh_replay_available is not None else 'unknown'}",
+            f"owner_lookup_source={owner_lookup_source or 'unknown'}",
+            f"owner_lookup_outcome={owner_lookup_outcome or 'unknown'}",
+            "previous_response_age_seconds="
+            f"{previous_response_age_seconds if previous_response_age_seconds is not None else 'unknown'}",
+            f"same_session={str(same_session).lower() if same_session is not None else 'unknown'}",
+        )
+    )
 
 
 def _record_continuity_fail_closed(

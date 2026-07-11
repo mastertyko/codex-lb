@@ -1490,6 +1490,44 @@ async def test_resolve_websocket_previous_response_owner_records_request_log_sou
 
 
 @pytest.mark.asyncio
+async def test_resolve_websocket_previous_response_owner_cache_hit_keeps_owner_session_unknown():
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="ws_req_cached_owner_metadata",
+        model="gpt-5.1",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        previous_response_id="resp_cached_owner_metadata",
+        session_id="sid-cached-owner",
+    )
+    service._remember_websocket_previous_response_owner(
+        previous_response_id="resp_cached_owner_metadata",
+        api_key_id=None,
+        account_id="acc_cached_owner",
+        session_id="sid-cached-owner",
+    )
+
+    owner = await service._resolve_websocket_previous_response_owner(
+        previous_response_id="resp_cached_owner_metadata",
+        api_key=None,
+        session_id="sid-cached-owner",
+        surface="websocket",
+        request_state=request_state,
+    )
+
+    assert owner == "acc_cached_owner"
+    assert request_logs.lookup_calls == []
+    assert request_state.previous_response_owner_lookup_source == "request_cache"
+    assert request_state.previous_response_owner_lookup_outcome == "hit"
+    assert request_state.previous_response_owner_requested_at is None
+    assert request_state.previous_response_owner_session_id is None
+    assert websocket_helpers_module._websocket_stale_anchor_diagnostics(request_state).same_session is None
+
+
+@pytest.mark.asyncio
 async def test_resolve_websocket_previous_response_owner_fail_closed_records_metric_and_log(monkeypatch, caplog):
     request_logs = _RequestLogsRecorder()
     request_logs.lookup_error = RuntimeError("lookup unavailable")

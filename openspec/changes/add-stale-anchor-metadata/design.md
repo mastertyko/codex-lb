@@ -23,6 +23,7 @@ Direct WebSocket stale-anchor incidents currently log `continuity_owner_resoluti
 - Derive `previous_response_source` from request-state flags: `proxy_injected` when codex-lb rewrote the upstream body by trimming/replacing a client full resend, `client_supplied` when the inbound payload already carried `previous_response_id`, and `unknown` only when state is insufficient.
 - Derive `fresh_replay_available` from the existing retry-safe fresh upstream request state rather than re-inspecting payloads.
 - Derive age and same-session relationship from owner lookup metadata when available; missing values stay explicit as `unknown`/`None` instead of guessed.
+- Treat account-only request-cache hits as owner-session metadata unknown. The cache does not retain the matched request-log row, so inferring `same_session=true` from the current lookup scope would produce false evidence after a cross-session fallback.
 
 ## Risks / Trade-offs
 
