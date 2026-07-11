@@ -9571,8 +9571,16 @@ def test_backend_responses_websocket_logs_proxy_injected_stale_anchor_metadata(
     assert failure_detail.startswith("previous_response_not_found ")
     assert "previous_response_source=proxy_injected" in failure_detail
     assert "fresh_replay_available=false" in failure_detail
+    assert "owner_lookup_source=request_cache" in failure_detail
+    assert "owner_lookup_outcome=hit" in failure_detail
+    assert "previous_response_age_seconds=unknown" in failure_detail
+    assert "same_session=unknown" in failure_detail
     assert "resp_ws_proxy_injected_anchor" not in failure_detail
     assert "continuity_fail_closed surface=websocket_stream reason=previous_response_not_found" in caplog.text
     assert "previous_response_source=proxy_injected" in caplog.text
     assert "fresh_replay_available=false" in caplog.text
+    assert "owner_lookup_source=request_cache" in caplog.text
+    assert "owner_lookup_outcome=hit" in caplog.text
+    assert "previous_response_age_seconds=unknown" in caplog.text
+    assert "same_session=unknown" in caplog.text
     assert "resp_ws_proxy_injected_anchor" not in caplog.text

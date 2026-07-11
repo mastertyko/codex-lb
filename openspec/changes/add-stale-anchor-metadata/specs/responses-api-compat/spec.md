@@ -14,6 +14,7 @@ When a direct Responses WebSocket request fails closed because upstream rejects 
 - **AND** upstream rejects that anchor with `previous_response_not_found`
 - **THEN** the continuity failure log and request-log failure metadata identify `previous_response_source=proxy_injected`
 - **AND** they state whether a retry-safe fresh no-anchor replay body was available
+- **AND** owner lookup, age, and same-session fields remain explicit as `unknown` when unavailable rather than being omitted
 
 #### Scenario: stale anchor owner hit records age and session relationship
 - **GIVEN** owner lookup finds a previous response row for the rejected anchor
