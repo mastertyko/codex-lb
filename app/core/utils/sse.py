@@ -112,25 +112,20 @@ def extract_sse_data(event_block: str) -> str | None:
 
 def _extract_sse_data_lines(event_block: str) -> list[str] | None:
     data_lines: list[str] = []
-    for raw_line in _SSE_LINE_BOUNDARY.split(event_block):
-        if not raw_line:
+    raw_lines = event_block.split("\n") if "\r" not in event_block else _SSE_LINE_BOUNDARY.split(event_block)
+    for raw_line in raw_lines:
+        if raw_line == "data":
+            data_lines.append("")
             continue
-        if raw_line.startswith(":"):
+        if not raw_line.startswith("data:"):
             continue
-
-        field, value = _parse_sse_field(raw_line)
-        if field == "data":
-            data_lines.append(value)
+        value = raw_line[5:]
+        if value.startswith(" "):
+            value = value[1:]
+        data_lines.append(value)
 
     if not data_lines:
         return None
     return data_lines
 
 
-def _parse_sse_field(line: str) -> tuple[str, str]:
-    if ":" not in line:
-        return line, ""
-    field, value = line.split(":", 1)
-    if value.startswith(" "):
-        value = value[1:]
-    return field, value
