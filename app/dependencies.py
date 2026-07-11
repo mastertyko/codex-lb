@@ -12,6 +12,7 @@ from app.db.session import get_background_session, get_session
 from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.service import AccountsService
+from app.modules.activity.service import ActivityService
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeysService
 from app.modules.audit.repository import AuditRepository
@@ -45,6 +46,13 @@ from app.modules.settings.service import SettingsService
 from app.modules.sticky_sessions.service import StickySessionsService
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 from app.modules.usage.service import UsageService
+
+
+@dataclass(slots=True)
+class ActivityContext:
+    session: AsyncSession
+    repository: RequestLogsRepository
+    service: ActivityService
 
 
 @dataclass(slots=True)
@@ -272,6 +280,14 @@ def get_model_sources_context(
     repository = ModelSourcesRepository(session)
     service = ModelSourcesService(repository)
     return ModelSourcesContext(session=session, repository=repository, service=service)
+
+
+def get_activity_context(
+    session: AsyncSession = Depends(get_session),
+) -> ActivityContext:
+    repository = RequestLogsRepository(session)
+    service = ActivityService(repository)
+    return ActivityContext(session=session, repository=repository, service=service)
 
 
 def get_request_logs_context(
