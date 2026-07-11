@@ -15686,6 +15686,7 @@ async def test_fail_pending_websocket_requests_only_suppresses_sequenced_downstr
     )
 
     emit_terminal_error.assert_awaited_once()
+    assert emit_terminal_error.await_args is not None
     assert emit_terminal_error.await_args.kwargs["request_state"] is unsequenced
 
 
