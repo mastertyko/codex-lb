@@ -431,6 +431,7 @@ class _WebSocketRequestState:
     useragent_group: str | None = None
     client_ip: str | None = None
     downstream_visible: bool = False
+    last_downstream_sequence_number: int | None = None
     suppress_next_created_downstream: bool = False
     replay_downstream_response_id: str | None = None
     draining_until_terminal: bool = False
@@ -547,6 +548,8 @@ class _WebSocketUpstreamControl:
     suppress_downstream_event: bool = False
     replay_request_state: _WebSocketRequestState | None = None
     downstream_texts: list[str] | None = None
+    downstream_sequence_request_state: _WebSocketRequestState | None = None
+    downstream_sequence_number: int | None = None
     seen_tool_call_keys: dict[tuple[str, str, str | None, str | None, str], None] = field(default_factory=dict)
 
 
@@ -587,6 +590,8 @@ def _websocket_replay_before_visible_output_refusal_reason(request_state: _WebSo
         return "missing_request_text"
     if request_state.replay_count >= 1:
         return "replay_count_exhausted"
+    if request_state.last_downstream_sequence_number is not None:
+        return "sequenced_downstream_frame"
     if request_state.downstream_visible:
         return "downstream_visible"
     has_retry_safe_fresh_payload = (

@@ -2694,8 +2694,12 @@ class _WebSocketMixin:
                     )
                     suppress_downstream_event = upstream_control.suppress_downstream_event
                     downstream_texts = upstream_control.downstream_texts
+                    downstream_sequence_request_state = upstream_control.downstream_sequence_request_state
+                    downstream_sequence_number = upstream_control.downstream_sequence_number
                     upstream_control.suppress_downstream_event = False
                     upstream_control.downstream_texts = None
+                    upstream_control.downstream_sequence_request_state = None
+                    upstream_control.downstream_sequence_number = None
                     if downstream_texts is not None:
                         for emitted_text in downstream_texts:
                             try:
@@ -2740,6 +2744,10 @@ class _WebSocketMixin:
                                 text=downstream_text,
                                 downstream_activity=downstream_activity,
                             )
+                            if downstream_sequence_request_state is not None and downstream_sequence_number is not None:
+                                downstream_sequence_request_state.last_downstream_sequence_number = (
+                                    downstream_sequence_number
+                                )
                         except Exception:
                             downstream_activity.mark_disconnected()
                             _facade().logger.debug(
@@ -2838,6 +2846,7 @@ class _WebSocketMixin:
                     except Exception:
                         _facade().logger.debug("Failed to close upstream websocket for replay", exc_info=True)
                     break
+                sequenced_downstream_replay_refused = "sequenced_downstream_frame" in replay_refusal_reasons
                 await proxy._fail_pending_websocket_requests(
                     account=account,
                     account_id_value=account_id_value,
@@ -2846,8 +2855,8 @@ class _WebSocketMixin:
                     error_code="stream_incomplete",
                     error_message=_upstream_websocket_disconnect_message(message),
                     api_key=api_key,
-                    websocket=websocket,
-                    client_send_lock=client_send_lock,
+                    websocket=None if sequenced_downstream_replay_refused else websocket,
+                    client_send_lock=None if sequenced_downstream_replay_refused else client_send_lock,
                     response_create_gate=response_create_gate,
                     downstream_activity=downstream_activity,
                     failure_phase="upstream",
@@ -2856,6 +2865,15 @@ class _WebSocketMixin:
                         replay_refusal_reasons,
                     ),
                 )
+                if sequenced_downstream_replay_refused:
+                    downstream_activity.mark_disconnected()
+                    try:
+                        await websocket.close(code=1011, reason="upstream replay requires a fresh request")
+                    except Exception:
+                        _facade().logger.debug(
+                            "Failed to close downstream websocket after sequenced replay refusal",
+                            exc_info=True,
+                        )
                 break
         except asyncio.CancelledError:
             raise
@@ -3001,6 +3019,10 @@ class _WebSocketMixin:
                 if payload is not None:
                     payload = _rewrite_websocket_downstream_response_id(payload, request_state)
                     text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+                    sequence_number = payload.get("sequence_number")
+                    if isinstance(sequence_number, int) and not isinstance(sequence_number, bool):
+                        upstream_control.downstream_sequence_request_state = request_state
+                        upstream_control.downstream_sequence_number = sequence_number
             if (
                 event_type in {"response.completed", "response.failed", "response.incomplete", "error"}
                 and pending_requests
@@ -3301,6 +3323,7 @@ class _WebSocketMixin:
                 can_retry_security_work = (
                     not account.security_work_authorized
                     and not has_other_pending_requests
+                    and request_state.last_downstream_sequence_number is None
                     and request_state.response_id is None
                     and request_state.replay_count < 1
                     and bool(request_state.request_text)
