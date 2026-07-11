@@ -317,43 +317,47 @@ def _latest_by_account_sqlite(
     window: str | None,
     account_ids: list[str] | None,
 ) -> dict[str, UsageHistory]:
-    if account_ids is None:
-        account_sql = "select id from accounts"
-        account_params: list[object] = []
-    elif not account_ids:
-        return {}
-    else:
+    account_filter = ""
+    account_params: list[object] = []
+    if account_ids is not None:
+        if not account_ids:
+            return {}
         placeholders = ",".join("?" for _ in account_ids)
-        account_sql = f"select id from accounts where id in ({placeholders})"
+        account_filter = f"where a.id in ({placeholders})"
         account_params = list(account_ids)
 
     if not window or window == "primary":
-        window_clause = "coalesce(window, 'primary') = 'primary'"
+        window_clause = "coalesce(candidate.window, 'primary') = 'primary'"
         window_params: list[object] = []
     else:
-        window_clause = "window = ?"
+        window_clause = "candidate.window = ?"
         window_params = [window]
     latest_sql = f"""
-        select id, account_id, recorded_at, window, used_percent,
-               input_tokens, output_tokens, reset_at, window_minutes,
-               credits_has, credits_unlimited, credits_balance
-        from usage_history
-        where account_id = ?
-          and {window_clause}
-        order by recorded_at desc, id desc
-        limit 1
+        select history.id, history.account_id, history.recorded_at, history.window,
+               history.used_percent, history.input_tokens, history.output_tokens,
+               history.reset_at, history.window_minutes, history.credits_has,
+               history.credits_unlimited, history.credits_balance
+        from accounts as a
+        join usage_history as history
+          on history.id = (
+              select candidate.id
+              from usage_history as candidate
+              where candidate.account_id = a.id
+                and {window_clause}
+              order by candidate.recorded_at desc, candidate.id desc
+              limit 1
+          )
+        {account_filter}
     """
 
     latest: dict[str, UsageHistory] = {}
     with closing(sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)) as conn:
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA busy_timeout=30000")
-        accounts = [str(row[0]) for row in conn.execute(account_sql, account_params)]
-        for account_id in accounts:
-            row = conn.execute(latest_sql, [account_id, *window_params]).fetchone()
-            if row is not None:
-                entry = _usage_history_from_sqlite_row(row)
-                latest[entry.account_id] = entry
+        rows = conn.execute(latest_sql, [*window_params, *account_params])
+        for row in rows:
+            entry = _usage_history_from_sqlite_row(row)
+            latest[entry.account_id] = entry
     return latest
 
 
