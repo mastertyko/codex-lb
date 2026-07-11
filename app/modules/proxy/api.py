@@ -2646,13 +2646,43 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
 
     registry = get_model_registry()
     models = registry.get_models_with_fallback()
+    metadata_models = registry.get_models_for_metadata()
     source_models = [
         model
         for model in await _list_enabled_source_catalog_models(api_key, require_responses=True)
         if model.raw.get("supports_streaming") is True
     ]
+    visible_source_models = []
+    for source_model in source_models:
+        if visibility_allowed_models is None:
+            if exact_source_allowed_models is not None:
+                if source_model.slug not in exact_source_allowed_models:
+                    continue
+            elif not is_public_model(source_model, allowed_models):
+                continue
+        visible_source_models.append(source_model)
+    visible_source_models.sort(
+        key=lambda model: (
+            _effective_source_codex_visibility(
+                model,
+                visibility_allowed_models=visibility_allowed_models,
+                exact_source_allowed_models=exact_source_allowed_models,
+            )
+            != "list"
+        )
+    )
+    source_model_slugs = {
+        model.slug
+        for model in visible_source_models
+        if _effective_source_codex_visibility(
+            model,
+            visibility_allowed_models=visibility_allowed_models,
+            exact_source_allowed_models=exact_source_allowed_models,
+        )
+        == "list"
+    }
 
-    if not models and not source_models:
+    if not models and not metadata_models and not source_models:
         await _release_reservation(reservation)
         return JSONResponse(content=CodexModelsResponse(models=[], data=[]).model_dump(mode="json"))
 
@@ -2679,15 +2709,17 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
         seen_slugs.add(slug)
         if model.supported_in_api and entry.visibility == "list":
             data.append(_to_model_list_item(slug, model, created=_model_list_created_at(model)))
-    for model in source_models:
+    for slug, model in metadata_models.items():
+        if slug in models or slug in source_model_slugs or not _is_codex_backend_catalog_model(model):
+            continue
+        if visibility_allowed_models is None and allowed_models is not None and slug not in allowed_models:
+            continue
+        entries.append(_to_codex_model_entry(model, visibility="hide"))
+        seen_slugs.add(slug)
+    for model in visible_source_models:
         if model.slug in seen_slugs:
             continue
         if visibility_allowed_models is None:
-            if exact_source_allowed_models is not None:
-                if model.slug not in exact_source_allowed_models:
-                    continue
-            elif not is_public_model(model, allowed_models):
-                continue
             entry = _to_codex_model_entry(model)
             entries.append(entry)
             seen_slugs.add(model.slug)
@@ -2696,8 +2728,10 @@ async def _build_codex_models_response(api_key: ApiKeyData | None) -> Response:
             continue
         entry = _to_codex_model_entry(
             model,
-            visibility=(
-                "list" if exact_source_allowed_models is None or model.slug in exact_source_allowed_models else "hide"
+            visibility=_effective_source_codex_visibility(
+                model,
+                visibility_allowed_models=visibility_allowed_models,
+                exact_source_allowed_models=exact_source_allowed_models,
             ),
         )
         entries.append(entry)
@@ -2962,6 +2996,24 @@ def _v1_supports_vision(model: UpstreamModel) -> bool:
 def _model_visibility(model: UpstreamModel) -> str:
     visibility = model.raw.get("visibility")
     return visibility if isinstance(visibility, str) else "list"
+
+
+def _effective_source_codex_visibility(
+    model: UpstreamModel,
+    *,
+    visibility_allowed_models: set[str] | None,
+    exact_source_allowed_models: set[str] | None,
+) -> str:
+    raw_visibility = _model_visibility(model)
+    if raw_visibility != "list":
+        return raw_visibility
+    if (
+        visibility_allowed_models is not None
+        and exact_source_allowed_models is not None
+        and model.slug not in exact_source_allowed_models
+    ):
+        return "hide"
+    return "list"
 
 
 def _to_model_metadata(model: UpstreamModel) -> ModelMetadata:
