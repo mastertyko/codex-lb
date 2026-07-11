@@ -1002,12 +1002,21 @@ def _remaining_total_timeout(timeout_seconds: float | None, started_at: float, n
 
 
 def _find_sse_separator(buffer: bytes | bytearray) -> tuple[int, int] | None:
-    separators = (b"\r\n\r\n", b"\n\n", b"\r\r")
-    positions = [(buffer.find(separator), len(separator)) for separator in separators]
-    valid_positions = [position for position in positions if position[0] >= 0]
-    if not valid_positions:
-        return None
-    return min(valid_positions, key=lambda item: item[0])
+    lf_index = buffer.find(b"\n\n")
+    if b"\r" not in buffer:
+        return (lf_index, 2) if lf_index >= 0 else None
+
+    best_index = lf_index
+    best_length = 2
+    crlf_index = buffer.find(b"\r\n\r\n")
+    if crlf_index >= 0 and (best_index < 0 or crlf_index < best_index):
+        best_index = crlf_index
+        best_length = 4
+    cr_index = buffer.find(b"\r\r")
+    if cr_index >= 0 and (best_index < 0 or cr_index < best_index):
+        best_index = cr_index
+        best_length = 2
+    return (best_index, best_length) if best_index >= 0 else None
 
 
 def _pop_sse_event(buffer: bytearray) -> bytes | None:

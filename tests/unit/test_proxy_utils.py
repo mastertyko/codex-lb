@@ -4456,6 +4456,18 @@ async def test_iter_sse_events_accepts_cr_only_blank_line_separator():
 
 
 @pytest.mark.asyncio
+async def test_iter_sse_events_preserves_mixed_separator_order():
+    response = _DummyResponse(
+        [b'data: {"sequence":1}\r\rdata: {"sequence":2}\n\n']
+    )
+    stream = proxy_module._iter_sse_events(cast(proxy_module.SSEResponse, response), 1.0, 1024)
+
+    chunks = [chunk async for chunk in stream]
+
+    assert chunks == ['data: {"sequence":1}\r\r', 'data: {"sequence":2}\n\n']
+
+
+@pytest.mark.asyncio
 async def test_iter_sse_events_raises_on_event_size_limit():
     large_data = b"A" * 1024
     response = _DummyResponse([b"data: ", large_data])
