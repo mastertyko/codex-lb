@@ -593,14 +593,31 @@ def select_account(
         selected = min(available, key=lambda state: _reset_drain_sort_key(state, current))
         return SelectionResult(selected, None)
 
-    healthy = [s for s in available if s.health_tier == HEALTH_TIER_HEALTHY]
-    probing = [s for s in available if s.health_tier == HEALTH_TIER_PROBING]
-    draining = [s for s in available if s.health_tier == HEALTH_TIER_DRAINING]
-    health_pool = healthy or probing or draining or available
-    burn_first = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_BURN_FIRST]
-    normal = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_NORMAL]
-    preserve = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_PRESERVE]
-    effective_pool = burn_first or normal or preserve or health_pool
+    best_pool_priority = 12
+    effective_pool: list[AccountState] = []
+    for state in available:
+        if state.health_tier == HEALTH_TIER_HEALTHY:
+            priority = 0
+        elif state.health_tier == HEALTH_TIER_PROBING:
+            priority = 3
+        elif state.health_tier == HEALTH_TIER_DRAINING:
+            priority = 6
+        else:
+            priority = 9
+
+        if state.routing_policy == ROUTING_POLICY_BURN_FIRST:
+            pass
+        elif state.routing_policy == ROUTING_POLICY_PRESERVE:
+            priority += 2
+        else:
+            priority += 1
+
+        if priority < best_pool_priority:
+            best_pool_priority = priority
+            effective_pool.clear()
+            effective_pool.append(state)
+        elif priority == best_pool_priority:
+            effective_pool.append(state)
     effective_prefer_earlier_reset = prefer_earlier_reset and routing_strategy != "relative_availability"
 
     if routing_strategy == "round_robin":
