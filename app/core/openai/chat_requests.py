@@ -20,19 +20,17 @@ from app.core.utils.json_guards import is_json_list, is_json_mapping
 
 _SUPPORTED_CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 _TEXT_CONTENT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
-_CHAT_TO_RESPONSES_EXCLUDED_FIELDS = frozenset(
-    {
-        "messages",
-        "tools",
-        "tool_choice",
-        "response_format",
-        "stream_options",
-        "store",
-        "n",
-        "max_tokens",
-        "max_completion_tokens",
-    }
-)
+_CHAT_TO_RESPONSES_EXCLUDED_FIELDS: set[str] = {
+    "messages",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "stream_options",
+    "store",
+    "n",
+    "max_tokens",
+    "max_completion_tokens",
+}
 
 
 def _content_parts(content: JsonValue) -> list[JsonValue]:
