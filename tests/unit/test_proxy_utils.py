@@ -4466,18 +4466,23 @@ async def test_iter_sse_events_raises_on_event_size_limit():
 
 
 @pytest.mark.asyncio
-async def test_iter_sse_events_raises_idle_timeout(monkeypatch):
-    response = _DummyResponse([b'data: {"type":"response.in_progress"}\n\n'])
+async def test_iter_sse_events_raises_idle_timeout():
+    class _BlockingContent:
+        async def iter_chunked(self, size: int):
+            await asyncio.Future()
+            if size < 0:
+                yield b""
 
-    async def fake_wait(tasks, *args, **kwargs):
-        task = next(iter(tasks))
-        task.cancel()
-        return set(), set(tasks)
-
-    monkeypatch.setattr(proxy_module.asyncio, "wait", fake_wait)
+    class _BlockingResponse:
+        def __init__(self) -> None:
+            self.content = _BlockingContent()
 
     with pytest.raises(proxy_module.StreamIdleTimeoutError):
-        async for _ in proxy_module._iter_sse_events(cast(proxy_module.SSEResponse, response), 1.0, 1024):
+        async for _ in proxy_module._iter_sse_events(
+            cast(proxy_module.SSEResponse, _BlockingResponse()),
+            0.001,
+            1024,
+        ):
             pass
 
 
