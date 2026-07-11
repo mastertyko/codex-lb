@@ -21126,7 +21126,7 @@ def test_sanitize_websocket_connect_failure_rewrites_previous_response_not_found
         "same_session=true"
     )
     assert request_state.upstream_error_code_override == "previous_response_not_found"
-    assert "resp_prev_anchor" not in cast(str, request_state.failure_detail_override)
+    assert "resp_prev_anchor" not in request_state.failure_detail_override
     assert (
         "diagnostics=previous_response_source=client_supplied fresh_replay_available=true "
         "owner_lookup_source=request_logs owner_lookup_outcome=hit "
