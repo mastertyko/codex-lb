@@ -1019,13 +1019,13 @@ def _find_sse_separator(buffer: bytes | bytearray) -> tuple[int, int] | None:
     return (best_index, best_length) if best_index >= 0 else None
 
 
-def _pop_sse_event(buffer: bytearray) -> bytes | None:
+def _pop_sse_event(buffer: bytearray) -> bytearray | None:
     separator = _find_sse_separator(buffer)
     if separator is None:
         return None
     index, separator_len = separator
     event_end = index + separator_len
-    event = bytes(buffer[:event_end])
+    event = buffer[:event_end]
     del buffer[:event_end]
     return event
 
