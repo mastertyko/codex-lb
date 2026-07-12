@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TRANSPORT_HTTP = "http"
 _REQUEST_TRANSPORT_WEBSOCKET = "websocket"
+_PENDING_WEBSOCKET_RESERVATION_BATCH_RETRY_ACTION = (
+    "release_pending_websocket_reservation_batch_after_failed_initial_release"
+)
+_PENDING_WEBSOCKET_RESERVATION_BATCH_RETRY_TASK_PREFIX = f"proxy-{_PENDING_WEBSOCKET_RESERVATION_BATCH_RETRY_ACTION}-"
+_PENDING_WEBSOCKET_POST_TAKE_CLEANUP_ACTION = "finalize_pending_websocket_requests_after_reservation_take"
+_PENDING_WEBSOCKET_POST_TAKE_CLEANUP_TASK_PREFIX = f"proxy-{_PENDING_WEBSOCKET_POST_TAKE_CLEANUP_ACTION}-"
 _WEBSOCKET_FULL_REPLAY_WAIT_MIN_ITEMS = 20
 _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS = 0.05
 _HARD_HTTP_BRIDGE_AFFINITY_KINDS = frozenset(
@@ -43,6 +49,16 @@ _HARD_HTTP_BRIDGE_AFFINITY_KINDS = frozenset(
 _ACCOUNT_SELECTION_RECOVERY_MIN_SLEEP_SECONDS = 1.0
 _ACCOUNT_SELECTION_RECOVERY_DEFAULT_SLEEP_SECONDS = 30.0
 _ACCOUNT_SELECTION_RECOVERY_MAX_SLEEP_SECONDS = 300.0
+_HTTPBridgeCloseReason = Literal[
+    "account_binding_changed",
+    "capacity_evict",
+    "creation_aborted",
+    "idle_prune",
+    "local_terminal_error",
+    "registry_detach",
+    "retire_after_drain",
+    "shutdown",
+]
 _ACCOUNT_SELECTION_RECOVERY_HEARTBEAT_SECONDS = 10.0
 _ACCOUNT_SELECTION_RETRY_HINT_RE = re.compile(r"try again in\s+([0-9]+(?:\.[0-9]+)?)s", re.IGNORECASE)
 _LOCAL_ACCOUNT_CAP_ERROR_CODES = frozenset({"account_response_create_cap", "account_stream_cap"})
@@ -426,6 +442,9 @@ class _WebSocketRequestState:
     error_message_override: str | None = None
     error_type_override: str | None = None
     error_param_override: str | None = None
+    failure_phase_override: str | None = None
+    failure_detail_override: str | None = None
+    upstream_error_code_override: str | None = None
     error_http_status_override: int | None = None
     response_event_count: int = 0
     previous_response_not_found_rewritten: bool = False
@@ -463,6 +482,19 @@ class _WebSocketRequestState:
     account_capacity_wait_reason: str | None = None
     account_capacity_wait_started_at: float | None = None
     account_capacity_wait_retry_after_seconds: float | None = None
+
+
+def _annotate_http_bridge_close_failure(
+    request_state: _WebSocketRequestState,
+    *,
+    reason: _HTTPBridgeCloseReason,
+) -> None:
+    draining = request_state.draining_until_terminal
+    close_detail = f"http_bridge_session_close close_reason={reason} draining_until_terminal={str(draining).lower()}"
+    existing_detail = request_state.failure_detail_override
+    request_state.failure_detail_override = f"{existing_detail} {close_detail}" if existing_detail else close_detail
+    if request_state.failure_phase_override is None:
+        request_state.failure_phase_override = "downstream" if draining else "bridge"
 
 
 @dataclass(frozen=True, slots=True)
@@ -638,6 +670,9 @@ def _clear_websocket_request_error_overrides(request_state: _WebSocketRequestSta
     request_state.error_message_override = None
     request_state.error_type_override = None
     request_state.error_param_override = None
+    request_state.failure_phase_override = None
+    request_state.failure_detail_override = None
+    request_state.upstream_error_code_override = None
     request_state.error_http_status_override = None
 
 

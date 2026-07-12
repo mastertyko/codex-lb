@@ -11,6 +11,7 @@ import anyio
 import pytest
 
 from app.core.crypto import TokenEncryptor
+from app.modules.api_keys.service import ApiKeyUsageReservationData
 from app.modules.proxy._service.support import (
     _REQUEST_TRANSPORT_HTTP,
     _REQUEST_TRANSPORT_WEBSOCKET,
@@ -25,6 +26,7 @@ class _DummyWebSocketService(_WebSocketMixin):
     def __init__(self) -> None:
         self.request_log_calls: list[dict[str, object]] = []
         self.remembered_response_ids: list[str] = []
+        self._background_cleanup_tasks: set[asyncio.Task[None]] = set()
         self._encryptor = TokenEncryptor()
 
         class _LoadBalancer:
@@ -47,6 +49,26 @@ class _DummyWebSocketService(_WebSocketMixin):
 
     def _cancel_request_state_api_key_reservation_heartbeat(self, _request_state: _WebSocketRequestState) -> None:
         return None
+
+    def _take_websocket_request_state_reservation(
+        self,
+        request_state: _WebSocketRequestState,
+    ) -> ApiKeyUsageReservationData | None:
+        self._cancel_request_state_api_key_reservation_heartbeat(request_state)
+        reservation = request_state.api_key_reservation
+        request_state.api_key_reservation = None
+        return reservation
+
+    def _track_cancel_safe_cleanup_task(
+        self,
+        task: asyncio.Task[None],
+        *,
+        action: str,
+        request_id: str | None,
+    ) -> None:
+        del action, request_id
+        self._background_cleanup_tasks.add(task)
+        task.add_done_callback(self._background_cleanup_tasks.discard)
 
     async def _settle_stream_api_key_usage(self, *_args: object, **_kwargs: object) -> bool:
         return True
@@ -364,6 +386,9 @@ async def test_fail_pending_websocket_requests_records_bridge_upstream_transport
             "status": "error",
             "error_code": "stream_incomplete",
             "error_message": "Upstream websocket closed before response.completed",
+            "failure_phase": None,
+            "failure_detail": None,
+            "upstream_error_code": None,
             "reasoning_effort": None,
             "transport": "http",
             "upstream_transport": "websocket",

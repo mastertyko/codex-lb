@@ -1081,7 +1081,7 @@ class _HTTPBridgeRequestSubmitMixin:
         if not should_reconnect:
             return False
 
-        await self._close_http_bridge_session(session)
+        await self._close_http_bridge_session(session, reason="retire_after_drain")
         return True
 
     async def _retire_stale_pending_http_bridge_session(

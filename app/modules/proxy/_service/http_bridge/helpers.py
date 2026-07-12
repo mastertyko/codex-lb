@@ -120,6 +120,7 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.support import (
     _HARD_HTTP_BRIDGE_AFFINITY_KINDS,  # noqa: F401
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
+    _HTTPBridgeCloseReason,
     _HTTPBridgeSession,
     _HTTPBridgeSessionKey,
     _WebSocketRequestState,
@@ -607,10 +608,10 @@ async def _close_http_bridge_session_bounded(
     service: Any,
     session: "_HTTPBridgeSession",
     *,
-    reason: str,
+    reason: _HTTPBridgeCloseReason,
 ) -> None:
     close_task = asyncio.create_task(
-        service._close_http_bridge_session(session),
+        service._close_http_bridge_session(session, reason=reason),
         name=f"http-bridge-close-{_hash_identifier(session.key.affinity_key)}",
     )
 

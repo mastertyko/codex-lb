@@ -27,7 +27,7 @@ from app.core.clients.proxy_websocket import (
 from app.core.config.settings import Settings
 from app.core.errors import openai_error
 from app.core.utils.request_id import get_request_id, reset_request_scope_id, set_request_scope_id
-from app.db.models import AccountStatus, HttpBridgeSessionState
+from app.db.models import Account, AccountStatus, HttpBridgeSessionState
 from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service.http_bridge import helpers as http_bridge_helpers_module
 from app.modules.proxy._service.http_bridge import mixin as http_bridge_mixin_module
@@ -5308,7 +5308,7 @@ async def test_close_http_bridge_session_fails_pending_downstream_requests() -> 
         idle_ttl_seconds=120.0,
     )
 
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
     failed_event = await asyncio.wait_for(event_queue.get(), timeout=1.0)
     assert failed_event is not None
@@ -5317,6 +5317,183 @@ async def test_close_http_bridge_session_fails_pending_downstream_requests() -> 
     assert await asyncio.wait_for(event_queue.get(), timeout=1.0) is None
     assert list(session.pending_requests) == []
     assert session.queued_request_count == 0
+
+
+@pytest.mark.asyncio
+async def test_idle_prune_close_attributes_draining_pending_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    account = Account(
+        id="acc-idle-prune-draining",
+        chatgpt_account_id="acc-idle-prune-draining",
+        email="idle-prune-draining@example.com",
+        plan_type="plus",
+        access_token_encrypted=b"access-token",
+        refresh_token_encrypted=b"refresh-token",
+        id_token_encrypted=b"id-token",
+        last_refresh=datetime.now(timezone.utc),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    reservation = proxy_service.ApiKeyUsageReservationData(
+        reservation_id="resv-idle-prune-draining",
+        key_id="key-idle-prune-draining",
+        model="gpt-5.6-sol",
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-idle-prune-draining",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=reservation,
+        started_at=time.monotonic() - 123.0,
+        event_queue=asyncio.Queue(),
+        transport="http",
+        upstream_transport="websocket",
+    )
+    session = _make_bridge_session(
+        key_value="idle-prune-draining",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.account = account
+    session.last_used_at = time.monotonic() - 123.0
+    service._http_bridge_sessions[session.key] = session
+    reservation_release_started = asyncio.Event()
+    allow_reservation_release = asyncio.Event()
+    release_events: list[str] = []
+
+    async def block_detach_reservation_release(released_reservation):
+        assert request_state.api_key_reservation is None
+        if released_reservation is reservation:
+            reservation_release_started.set()
+            await allow_reservation_release.wait()
+            release_events.append("release:reservation")
+        else:
+            assert released_reservation is None
+            release_events.append("release:none")
+
+    release_reservation = AsyncMock(side_effect=block_detach_reservation_release)
+    handle_stream_error = AsyncMock()
+    write_request_log = AsyncMock()
+    monkeypatch.setattr(service, "_release_websocket_reservation", release_reservation)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(
+        service,
+        "_retire_http_bridge_after_drain_if_ready",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(service, "_write_request_log", write_request_log)
+    monkeypatch.setattr(service._load_balancer, "release_account_lease", AsyncMock())
+
+    detach_task = asyncio.create_task(service._detach_http_bridge_request(session, request_state=request_state))
+    await asyncio.wait_for(reservation_release_started.wait(), timeout=1.0)
+
+    assert request_state.draining_until_terminal is True
+    assert request_state.api_key_reservation is None
+    assert request_state in session.pending_requests
+    assert session.queued_request_count == 0
+    pruned = service._prune_http_bridge_sessions_locked()
+    assert pruned == [(session, "idle_prune")]
+
+    pruned_session, close_reason = pruned[0]
+    await service._close_http_bridge_session(pruned_session, reason=close_reason)
+
+    handle_stream_error.assert_not_awaited()
+    write_request_log.assert_awaited_once()
+    write_call = write_request_log.await_args
+    assert write_call is not None
+    assert write_call.kwargs["error_code"] == "stream_incomplete"
+    assert write_call.kwargs["failure_phase"] == "downstream"
+    assert write_call.kwargs["failure_detail"] == (
+        "http_bridge_session_close close_reason=idle_prune draining_until_terminal=true"
+    )
+
+    allow_reservation_release.set()
+    assert await asyncio.wait_for(detach_task, timeout=1.0) is True
+    assert release_events == ["release:reservation"]
+    assert [await_call.args for await_call in release_reservation.await_args_list] == [(reservation,)]
+
+
+@pytest.mark.asyncio
+async def test_prune_closed_session_attributes_registry_detach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-closed-registry-detach",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        event_queue=asyncio.Queue(),
+        transport="http",
+        upstream_transport="websocket",
+    )
+    session = _make_bridge_session(
+        key_value="closed-registry-detach",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    session.closed = True
+    service._http_bridge_sessions[session.key] = session
+    write_request_log = AsyncMock()
+    monkeypatch.setattr(service, "_write_request_log", write_request_log)
+
+    pruned = service._prune_http_bridge_sessions_locked()
+
+    assert pruned == [(session, "registry_detach")]
+    assert session.key not in service._http_bridge_sessions
+    pruned_session, close_reason = pruned[0]
+    await service._close_http_bridge_session(pruned_session, reason=close_reason)
+
+    write_request_log.assert_awaited_once()
+    write_call = write_request_log.await_args
+    assert write_call is not None
+    assert write_call.kwargs["error_code"] == "stream_incomplete"
+    assert write_call.kwargs["failure_phase"] == "bridge"
+    assert write_call.kwargs["failure_detail"] == (
+        "http_bridge_session_close close_reason=registry_detach draining_until_terminal=false"
+    )
+
+
+@pytest.mark.asyncio
+async def test_close_http_bridge_session_preserves_existing_failure_attribution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-close-existing-attribution",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        transport="http",
+        upstream_transport="websocket",
+        failure_phase_override="upstream",
+        failure_detail_override="upstream_ws_reader_crashed_before_terminal_event",
+    )
+    session = _make_bridge_session(
+        key_value="close-existing-attribution",
+        pending_requests=deque([request_state]),
+        queued_request_count=1,
+    )
+    write_request_log = AsyncMock()
+    monkeypatch.setattr(service, "_write_request_log", write_request_log)
+
+    await service._close_http_bridge_session(session, reason="shutdown")
+
+    write_request_log.assert_awaited_once()
+    write_call = write_request_log.await_args
+    assert write_call is not None
+    assert write_call.kwargs["failure_phase"] == "upstream"
+    assert write_call.kwargs["failure_detail"] == (
+        "upstream_ws_reader_crashed_before_terminal_event "
+        "http_bridge_session_close close_reason=shutdown draining_until_terminal=false"
+    )
 
 
 @pytest.mark.asyncio
@@ -5349,7 +5526,7 @@ async def test_close_http_bridge_session_releases_lease_before_pending_cleanup_w
     await asyncio.wait_for(lock_acquired.wait(), timeout=1.0)
     monkeypatch.setattr(service._load_balancer, "release_account_lease", release_account_lease)
 
-    close_task = asyncio.create_task(service._close_http_bridge_session(session))
+    close_task = asyncio.create_task(service._close_http_bridge_session(session, reason="shutdown"))
     try:
         await asyncio.wait_for(lease_released.wait(), timeout=1.0)
         assert session.account_lease is None
@@ -5383,7 +5560,7 @@ async def test_close_http_bridge_session_continues_when_lease_release_fails(
 
     monkeypatch.setattr(service._load_balancer, "release_account_lease", release_account_lease)
 
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
     assert session.account_lease is None
     close.assert_awaited_once()
@@ -5400,9 +5577,10 @@ async def test_close_http_bridge_session_bounded_timeout_keeps_close_task_runnin
     close_finished = asyncio.Event()
     close_cancelled = False
 
-    async def close_http_bridge_session(target: proxy_service._HTTPBridgeSession) -> None:
+    async def close_http_bridge_session(target: proxy_service._HTTPBridgeSession, *, reason: str) -> None:
         nonlocal close_cancelled
         assert target is session
+        assert reason == "shutdown"
         close_started.set()
         try:
             await release_close.wait()
@@ -5415,7 +5593,7 @@ async def test_close_http_bridge_session_bounded_timeout_keeps_close_task_runnin
     monkeypatch.setattr(proxy_service, "_HTTP_BRIDGE_BACKGROUND_CLOSE_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(service, "_close_http_bridge_session", close_http_bridge_session)
 
-    await service._close_http_bridge_session_bounded(session, reason="test")
+    await service._close_http_bridge_session_bounded(session, reason="shutdown")
 
     await asyncio.wait_for(close_started.wait(), timeout=1.0)
     assert close_cancelled is False
@@ -5442,9 +5620,10 @@ async def test_close_http_bridge_session_bounded_cancellation_keeps_close_task_t
     close_finished = asyncio.Event()
     close_cancelled = False
 
-    async def close_http_bridge_session(target: proxy_service._HTTPBridgeSession) -> None:
+    async def close_http_bridge_session(target: proxy_service._HTTPBridgeSession, *, reason: str) -> None:
         nonlocal close_cancelled
         assert target is session
+        assert reason == "shutdown"
         close_started.set()
         try:
             await release_close.wait()
@@ -5455,7 +5634,7 @@ async def test_close_http_bridge_session_bounded_cancellation_keeps_close_task_t
             close_finished.set()
 
     monkeypatch.setattr(service, "_close_http_bridge_session", close_http_bridge_session)
-    bounded_task = asyncio.create_task(service._close_http_bridge_session_bounded(session, reason="test"))
+    bounded_task = asyncio.create_task(service._close_http_bridge_session_bounded(session, reason="shutdown"))
     await asyncio.wait_for(close_started.wait(), timeout=1.0)
 
     bounded_task.cancel()
@@ -8489,7 +8668,7 @@ async def test_stream_via_http_bridge_rolls_over_session_after_context_length_ex
     assert exc_info.value.status_code == 400
     assert exc_info.value.payload["error"]["code"] == "context_length_exceeded"
     assert key not in service._http_bridge_sessions
-    close_session.assert_awaited_once_with(session)
+    close_session.assert_awaited_once_with(session, reason="local_terminal_error")
     assert isinstance(failed_block, str)
     assert '"type":"response.failed"' in failed_block
     assert '"code":"stream_incomplete"' in failed_block
@@ -10396,7 +10575,7 @@ async def test_get_or_create_http_bridge_session_closes_lru_before_replacement_c
         reason: str,
     ) -> None:
         assert session is existing
-        assert reason == "registry_detach"
+        assert reason == "capacity_evict"
         events.append("close")
         session.closed = True
 
@@ -10458,7 +10637,7 @@ async def test_get_or_create_http_bridge_session_cancel_during_lru_close_cleans_
         reason: str,
     ) -> None:
         assert session is existing
-        assert reason == "registry_detach"
+        assert reason == "capacity_evict"
         close_started.set()
         await release_close.wait()
 
@@ -10770,7 +10949,7 @@ async def test_get_or_create_http_bridge_session_late_owner_after_inflight_evict
     assert owner_exc_info.value.status_code == 429
     assert owner_exc_info.value.payload["error"]["code"] == "capacity_exhausted_active_sessions"
     assert key not in service._http_bridge_sessions
-    close_http_bridge_session.assert_awaited_once_with(created)
+    close_http_bridge_session.assert_awaited_once_with(created, reason="creation_aborted")
 
 
 @pytest.mark.asyncio
@@ -12093,12 +12272,57 @@ def test_websocket_admission_rejection_cancels_reservation_heartbeat_before_rele
     assert "_release_websocket_reservation(request_state.api_key_reservation)" not in source
 
 
-def test_websocket_request_state_reservation_release_cancels_heartbeat_before_release() -> None:
-    source = inspect.getsource(proxy_service.ProxyService._release_websocket_request_state_reservation)
-
-    assert source.index("_cancel_request_state_api_key_reservation_heartbeat") < source.index(
-        "_release_websocket_reservation"
+@pytest.mark.asyncio
+async def test_websocket_request_state_reservation_release_takes_ownership_before_await(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    reservation = proxy_service.ApiKeyUsageReservationData(
+        reservation_id="resv-take-before-await",
+        key_id="key-take-before-await",
+        model="gpt-5.6-sol",
     )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-take-before-await",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=reservation,
+        started_at=time.monotonic(),
+    )
+    events: list[str] = []
+
+    def record_heartbeat_cancel(cancelled_state: object) -> None:
+        assert cancelled_state is request_state
+        events.append("cancel")
+
+    async def record_release(released_reservation: proxy_service.ApiKeyUsageReservationData | None) -> None:
+        assert request_state.api_key_reservation is None
+        release_id = released_reservation.reservation_id if released_reservation is not None else "none"
+        events.append(f"release:{release_id}")
+
+    release_reservation = AsyncMock(side_effect=record_release)
+    monkeypatch.setattr(
+        service,
+        "_cancel_request_state_api_key_reservation_heartbeat",
+        Mock(side_effect=record_heartbeat_cancel),
+    )
+    monkeypatch.setattr(service, "_release_websocket_reservation", release_reservation)
+
+    await service._release_websocket_request_state_reservation(request_state)
+    await service._release_websocket_request_state_reservation(request_state)
+
+    assert request_state.api_key_reservation is None
+    assert events == [
+        "cancel",
+        "release:resv-take-before-await",
+        "cancel",
+        "release:none",
+    ]
+    assert [await_call.args for await_call in release_reservation.await_args_list] == [
+        (reservation,),
+        (None,),
+    ]
 
 
 @pytest.mark.asyncio

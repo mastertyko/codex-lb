@@ -51,7 +51,7 @@ async def _cleanup_http_bridge_sessions(app_instance):
         service._http_bridge_turn_state_index.clear()
         service._http_bridge_previous_response_index.clear()
     for session in sessions:
-        await service._close_http_bridge_session(session)
+        await service._close_http_bridge_session(session, reason="shutdown")
     for inflight_future in inflight_sessions:
         if not inflight_future.done():
             inflight_future.cancel()
@@ -1691,7 +1691,7 @@ async def test_v1_responses_http_bridge_creation_honors_prefer_earlier_reset(asy
     )
 
     assert select_calls == [(True, "priority")]
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -2366,7 +2366,7 @@ async def test_v1_responses_http_bridge_replayed_turn_state_alias_preserves_owne
     )
     await service._reconnect_http_bridge_session(replayed, request_state=request_state)
     assert connect_headers_seen[-1]["x-codex-turn-state"] == replay_turn_state
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -2608,7 +2608,7 @@ async def test_v1_responses_http_bridge_turn_state_alias_respects_api_key_isolat
     exc = exc_info.value
     assert exc.status_code == 409
     assert exc.payload["error"].get("code") == "bridge_instance_mismatch"
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -2797,7 +2797,7 @@ async def test_v1_responses_http_bridge_preserves_prior_turn_state_aliases(
     assert replayed is session
     assert "http_turn_alias_a" in replayed.downstream_turn_state_aliases
     assert "http_turn_alias_b" in replayed.downstream_turn_state_aliases
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -2896,7 +2896,7 @@ async def test_v1_responses_http_bridge_close_waits_for_turn_state_index_lock(
     alias_key = proxy_module._http_bridge_turn_state_alias_key("http_turn_close_lock", session.key.api_key_id)
 
     async with service._http_bridge_lock:
-        close_task = asyncio.create_task(service._close_http_bridge_session(session))
+        close_task = asyncio.create_task(service._close_http_bridge_session(session, reason="shutdown"))
         await asyncio.sleep(0)
         assert not close_task.done()
         assert service._http_bridge_turn_state_index[alias_key] == session.key
@@ -3857,7 +3857,7 @@ async def test_get_or_create_http_bridge_session_honors_passed_prompt_cache_idle
     )
 
     assert session.idle_ttl_seconds == 1800.0
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -6489,7 +6489,7 @@ async def test_v1_responses_http_bridge_does_not_evict_active_session_when_pool_
     exc = exc_info.value
     assert exc.status_code == 429
     assert hanging_upstream.closed is False
-    await service._close_http_bridge_session(first_session)
+    await service._close_http_bridge_session(first_session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -6636,7 +6636,7 @@ async def test_v1_responses_http_bridge_times_out_queued_request_on_bounded_star
         assert first_session.queued_request_count == 0
 
     first_session.response_create_gate.release()
-    await service._close_http_bridge_session(first_session)
+    await service._close_http_bridge_session(first_session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -6771,7 +6771,7 @@ async def test_v1_responses_http_bridge_enforces_queue_limit_atomically_for_same
     exc = exc_info.value
     assert exc.status_code == 429
     assert session.queued_request_count == 1
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
 
 @pytest.mark.asyncio
@@ -8493,7 +8493,7 @@ async def test_v1_responses_http_bridge_cancellation_releases_queued_slot(async_
     async with session.pending_lock:
         assert list(session.pending_requests) == []
     session.response_create_gate.release()
-    await service._close_http_bridge_session(session)
+    await service._close_http_bridge_session(session, reason="shutdown")
 
 
 @pytest.mark.asyncio

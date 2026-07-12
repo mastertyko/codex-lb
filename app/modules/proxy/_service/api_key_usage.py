@@ -114,21 +114,32 @@ class _ApiKeyUsageMixin:
     async def _release_websocket_reservation(
         self,
         reservation: ApiKeyUsageReservationData | None,
+        *,
+        shield_from_cancellation: bool = True,
     ) -> None:
         if reservation is None:
             return
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
-        with anyio.CancelScope(shield=True):
+        with anyio.CancelScope(shield=shield_from_cancellation):
             async with proxy._repo_factory() as repos:
                 service = _service_api_keys_service()(repos.api_keys)
                 await service.release_usage_reservation(reservation.reservation_id)
+
+    def _take_websocket_request_state_reservation(
+        self,
+        request_state: _WebSocketRequestState,
+    ) -> ApiKeyUsageReservationData | None:
+        self._cancel_request_state_api_key_reservation_heartbeat(request_state)
+        reservation = request_state.api_key_reservation
+        request_state.api_key_reservation = None
+        return reservation
 
     async def _release_websocket_request_state_reservation(
         self,
         request_state: _WebSocketRequestState,
     ) -> None:
-        self._cancel_request_state_api_key_reservation_heartbeat(request_state)
-        await self._release_websocket_reservation(request_state.api_key_reservation)
+        reservation = self._take_websocket_request_state_reservation(request_state)
+        await self._release_websocket_reservation(reservation)
 
     async def _maybe_touch_api_key_reservation(
         self,
@@ -413,15 +424,17 @@ class _ApiKeyUsageMixin:
 
         task.add_done_callback(_settlement_done)
 
-    def _schedule_cancel_safe_cleanup(
+    def _track_cancel_safe_cleanup_task(
         self,
-        coro: Coroutine[Any, Any, None],
+        task: asyncio.Task[None],
         *,
         action: str,
         request_id: str,
     ) -> None:
-        task = asyncio.create_task(coro, name=f"proxy-{action}-{request_id}")
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
+        if task in proxy._background_cleanup_tasks:
+            return
+        task.set_name(f"proxy-{action}-{request_id}")
         proxy._background_cleanup_tasks.add(task)
 
         def _cleanup_done(done_task: asyncio.Task[None]) -> None:
@@ -439,6 +452,16 @@ class _ApiKeyUsageMixin:
                 )
 
         task.add_done_callback(_cleanup_done)
+
+    def _schedule_cancel_safe_cleanup(
+        self,
+        coro: Coroutine[Any, Any, None],
+        *,
+        action: str,
+        request_id: str,
+    ) -> None:
+        task = asyncio.create_task(coro)
+        self._track_cancel_safe_cleanup_task(task, action=action, request_id=request_id)
 
     async def _release_unsettled_stream_api_key_usage(
         self,

@@ -1800,8 +1800,9 @@ class _HTTPBridgeStreamingMixin:
             error_message=error_message,
             api_key=None,
             response_create_gate=session.response_create_gate,
+            http_bridge_close_reason="local_terminal_error",
         )
-        await self._close_http_bridge_session(session)
+        await self._close_http_bridge_session(session, reason="local_terminal_error")
 
     async def _stream_http_bridge_session_events(
         self: Any,
