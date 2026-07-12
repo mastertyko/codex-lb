@@ -4,6 +4,8 @@ The persistent HTTP Responses bridge optimization in local commit `f787f10c` cha
 
 The release candidate therefore keeps beta.3's HTTP runtime unchanged, reapplies non-overlapping core and usage optimizations, ports the measured direct-WebSocket parse-once/bounded-fairness delta into the current upstream reader, and layers finite close attribution plus shared cleanup ownership on top. Request logs already expose nullable `failure_phase` and `failure_detail`, so no database or response schema change is necessary.
 
+History reconciliation adds a second integration constraint: the verified candidate tree must first absorb every non-superseded local-main contract without replacing beta.3's overlapping continuity implementations. The activity endpoint is restored as an isolated module/router/repository read path; stale-anchor diagnostics are derived from beta.3 request state and owner records only on fail-closed paths; already-implemented query and archive-attribution requirements are synchronized into main specs.
+
 ## Goals / Non-Goals
 
 **Goals:**
@@ -13,15 +15,16 @@ The release candidate therefore keeps beta.3's HTTP runtime unchanged, reapplies
 - Make every local bridge session-close failure attributable to a finite close reason and the request's actual draining state.
 - Preserve `stream_incomplete`, request-specific failure overrides, and privacy boundaries while preventing draining-only local closes from mutating account health and preserving the existing single non-draining penalty only after reservation settlement.
 - Keep the HTTP benchmark behaviorally representative of production after the restore.
+- Restore local-main activity polling, stale-anchor diagnostics, query-performance requirements, and malformed-created archive attribution without changing beta.3 replay eligibility or hot-path scheduling.
 
 **Non-Goals:**
 
 - Claim that the optimized relay caused the canary failures.
 - Use benchmark ready-task timing as evidence to change beta.3 HTTP relay scheduling without a separate reviewed canary.
 - Suppress, reclassify away, or retry `stream_incomplete` failures.
-- Change database schemas, public APIs, dependencies, bridge admission, routing, idle TTL, or durable ownership.
+- Change database schemas, dependencies, bridge admission, routing, idle TTL, durable ownership, or public APIs beyond restoring local `GET /api/activity/state`.
 - Weaken or replace beta.3 admission, reconnect-affinity, incomplete-reason, owner-replay, sequence, migration, version, dependency, or unrelated release behavior.
-- Build, deploy, push, or merge this candidate into `main`.
+- Build, deploy, push, or canary the candidate; history reconciliation is limited to a local candidate-first merge whose tree is proven identical to the verified pre-merge candidate.
 
 ## Decisions
 
@@ -53,6 +56,14 @@ Alternative: filter draining requests out of the cleanup list. Rejected because 
 
 Keep the real HTTP relay benchmark on beta.3 production scheduling and retain finite prebuffered-burst routing and ownership, archive attribution, order, cancellation, contention, receive timeout, terminal sentinel, cleanup, fast-consumer, and backlogged-consumer checks. Remove the ready-enqueue scheduling assertion and update the locked digest only because its correctness payload no longer includes that assertion; update timing references only when a measured beta.3-runtime baseline justifies it.
 
+### Layer local-main contracts around authoritative beta.3 continuity state
+
+Keep beta.3's replay refusal, full-resend safety, reconnect affinity, incomplete-reason, and sequence rules as the behavior source of truth. Add stale-anchor fields to the existing request state only to record accepted-anchor provenance, request-log owner metadata, replay availability from the current safety predicate, age, and same-session status. Account-only cache hits cannot prove row metadata, so they remain explicit `unknown`; no field may alter replay eligibility or expose a raw anchor.
+
+Restore `GET /api/activity/state` through the existing dependency/provider and API router patterns. Its repository query aggregates only the requested warmup-excluded window, while the service owns deterministic scoring and stale-cache fallback. This isolation keeps the performance candidate's relay/query hot paths unchanged. Synchronize the already-implemented query-cache and malformed archive-attribution contracts into main and active specs rather than copying the local performance archive topology or the superseded HTTP fast-path requirement.
+
+Alternative: cherry-pick the activity and stale-diagnostic commits wholesale. Rejected because the activity commit's router and repository pieces are portable but its archived OpenSpec topology is not the active source of truth, while the stale-diagnostic commit predates beta.3's owner/replay structures and would overwrite authoritative upstream behavior.
+
 ## Risks / Trade-offs
 
 - Restoring the default lock increases relay CPU/scheduler cost → accept the measured cost for release safety and continue reporting it through the retained benchmark.
@@ -67,10 +78,10 @@ Keep the real HTTP relay benchmark on beta.3 production scheduling and retain fi
 
 1. Verify the annotated beta.3 tag target and GitHub-signed release commit, then map overlapping upstream PRs and local commits.
 2. Create a focused branch at the verified tag and reapply only non-overlapping core, usage, relay, benchmark, attribution, and cleanup deltas.
-3. Preserve beta.3 bridge/replay invariants while reconciling the active OpenSpec and main performance requirements.
-4. Run the previously hanging immediate-follow-up regression, adjacent upstream close/replay/incomplete/cancellation tests, and all touched focused suites.
-5. Commit the focused implementation before exact-final-SHA full tests, migrations, static/OpenSpec gates, and all four deterministic benchmarks.
-6. Leave the verified branch local and active for independent audit; do not merge, push, deploy, or canary it.
+3. Inventory every local-main-only commit and classify its deltas as upstreamed, semantically ported, intentionally superseded, or missing before editing or merging.
+4. Port missing activity, stale-anchor, query-spec, and archive-attribution contracts around beta.3 source shapes; restore focused coverage; then run affected relay suites and final static/spec/migration/full gates.
+5. Preserve the already-verified four benchmark digests unless a contract-preservation edit changes a measured product hot path; activity aggregation and failure-only stale diagnostics do not change those benchmark paths.
+6. Commit the verified preservation work, record the candidate tree, create a candidate-first local history-reconciliation merge with prior `main` as the second parent, fast-forward local `main`, and prove exact tree identity without push, deploy, or canary work.
 
 ## Open Questions
 

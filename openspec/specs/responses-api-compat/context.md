@@ -146,6 +146,16 @@ Cursor-style model alias request:
 
 This forwards upstream as `model: "gpt-5.4-mini"` with `reasoning.effort: "high"`.
 
+## Stale-Anchor Diagnostic Context
+
+Stale-anchor metadata is emitted only when a direct WebSocket request fails closed after `previous_response_not_found`; it does not change replay eligibility, masking, reconnect affinity, or the client-visible error class. The diagnostic source is derived from the accepted request shape: an anchor already present is `client_supplied`, an anchor added by codex-lb continuity logic is `proxy_injected`, and unavailable provenance remains explicit as `unknown`.
+
+Replay availability is computed from the current beta.3 replay-safety predicate rather than from the mere presence of cached text. Owner lookup returns the matched request-log timestamp and session id when the repository can prove them. Account-only request-cache hits deliberately retain unknown age and same-session metadata instead of borrowing values from the current request.
+
+For example, a proxy-injected stale anchor with a request-cache owner hit and no safe fresh body records low-cardinality fields equivalent to `previous_response_source=proxy_injected`, `fresh_replay_available=false`, `owner_lookup_source=request_cache`, `owner_lookup_outcome=hit`, `previous_response_age_seconds=unknown`, and `same_session=unknown`. Raw response ids and payload content are excluded from both operator logs and persisted failure detail.
+
+Operators should use source, replay availability, owner outcome/source, age, and same-session status to distinguish stale upstream ownership from missing local metadata. An explicit `unknown` means the service could not prove the value; it must not be interpreted as false or as evidence of a different session.
+
 ## Operational Notes
 
 - Pre-release: run unit/integration tests and optional OpenAI client compatibility tests.

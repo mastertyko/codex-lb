@@ -85,3 +85,11 @@
 - [x] 14.3 Port the direct-WebSocket parse-once and bounded-fairness optimization into the beta.3 reader without weakening reconnect affinity, incomplete reasons, safe owner replay, or sequenced-replay refusal; retain the deterministic WebSocket benchmark.
 - [x] 14.4 Retain beta.3 HTTP scheduling, add finite close attribution, and port reservation-before-health, draining and unsettled neutrality, bounded batch retry, one tracked post-take child, exactly-once local finalizers, shutdown quiescence, and unusable-upstream state-before-terminal ordering.
 - [x] 14.5 Reconcile delta and main specs, preserve beta.3 migrations and release metadata, and pass the immediate-follow-up regression plus adjacent upstream close/replay/incomplete/cancellation and touched focused suites before final gates.
+
+## 15. Preserve Current-Main Product Contracts
+
+- [x] 15.1 Inventory every current-local-`main` commit absent from the beta.3 candidate and classify each delta as upstreamed, semantically ported, intentionally superseded, or missing before history reconciliation.
+- [x] 15.2 Restore the privacy-safe `GET /api/activity/state` module, router registration, host-poller contract, main specification/context, and focused API/service regressions without changing persistence schemas.
+- [x] 15.3 Port stale-anchor source, replay, owner-lookup, age, same-session, and explicit-unknown diagnostics onto the beta.3 replay, incomplete-reason, reconnect-affinity, and sequenced-replay structures; restore request-log and direct-WebSocket regressions.
+- [x] 15.4 Reconcile the active delta specifications, design/context rationale, and main specifications, then rerun focused activity, stale-anchor, WebSocket, and HTTP-bridge suites plus final static, OpenSpec, migration, diff, and finite-timeout full-suite gates on the completed candidate.
+- [ ] 15.5 Verify final implementation completeness, correctness, and design coherence; record the exact pre-merge candidate tree; reconcile histories with current `main` as a merge parent while preserving that tree; fast-forward local `main`; and prove post-merge tree identity, clean refs/worktree, and focused smoke behavior.

@@ -108,3 +108,83 @@ When shared WebSocket-backed cleanup fails pending requests from either the pers
 - **THEN** the reader commits reconnect or retirement state before publishing the first terminal event
 - **AND** an immediate follow-up request cannot target the invalidated upstream socket
 - **AND** downstream-disconnect, per-request-expiry, transparent-replay, and other paths that intentionally keep or replay the upstream socket do not force reconnect solely because they finalize a request
+
+### Requirement: Privacy-safe activity state endpoint
+
+The system SHALL expose a read-only `GET /api/activity/state` endpoint for local and personal observability clients. The endpoint SHALL be reachable without dashboard-session or API-key credentials so credentialless local pollers can use it. The endpoint SHALL derive its response from warmup-excluded request-log aggregates and SHALL return only aggregate activity data: a normalized activity value, source and freshness status, generated/since timestamps, the effective query window, request and error counts, token totals, and aggregate cost.
+
+The normalized `activity` value MUST be between `0.0` and `1.0` inclusive. The response MUST NOT contain request ids, account ids, API keys, model names, prompts, response text, error messages, top-error values, or other per-request correlation data.
+
+The scoring calculation SHALL treat `cachedInputTokens` as a subset of `inputTokens`, SHALL count the cached subset at 25% of uncached input weight without double-counting it, and SHALL reserve 85% of the normalized score for the strongest non-error signal plus 15% for error pressure. A saturated non-error signal together with saturated error pressure SHALL produce `activity = 1.0`.
+
+#### Scenario: Credentialless poller reaches the endpoint
+- **WHEN** a client sends `GET /api/activity/state` without dashboard-session credentials, an API key, or an `Authorization` header
+- **THEN** the endpoint returns HTTP 200 with the aggregate activity response
+
+#### Scenario: Recent request logs are aggregated
+- **WHEN** a client requests `/api/activity/state` and non-warmup request logs exist inside the effective window
+- **THEN** the response reports aggregate request, error, token, cached-token, and cost values from those logs
+- **AND** `activity` is a bounded value in the inclusive range `0.0` through `1.0`
+- **AND** warmup request logs do not affect the response
+
+#### Scenario: Idle runtime reports zero activity
+- **WHEN** no qualifying request-log activity exists inside the effective window
+- **THEN** the endpoint returns HTTP 200
+- **AND** `activity` equals `0.0`
+- **AND** all aggregate counters and aggregate cost equal zero
+- **AND** the source status indicates that the live query succeeded rather than that the result is stale
+
+#### Scenario: Response excludes sensitive and per-request data
+- **WHEN** qualifying request logs contain account identifiers, API-key identifiers, model names, error details, prompts, or response content
+- **THEN** the endpoint response contains none of those values or fields
+- **AND** the response cannot be used to correlate an individual request
+
+#### Scenario: Cached input is weighted once
+- **WHEN** aggregate input tokens include a cached-input subset
+- **THEN** the cached subset is removed from the uncached-input portion before scoring
+- **AND** the cached subset contributes at 25% of uncached input weight
+
+#### Scenario: Full activity is reachable
+- **WHEN** at least one non-error activity signal and the error-pressure signal both reach their full thresholds
+- **THEN** the endpoint reports `activity = 1.0`
+
+#### Scenario: Query window is bounded
+- **WHEN** a client omits `windowSeconds`
+- **THEN** the service uses a 120-second effective window
+- **WHEN** a client requests a window shorter than 10 seconds or longer than 3600 seconds
+- **THEN** the service clamps the effective window to 10 seconds or 3600 seconds respectively
+- **AND** the response reports the clamped effective window
+
+
+## MODIFIED Requirements
+
+### Requirement: Full upstream conversation archive
+
+The proxy MUST provide an opt-in durable archive of Codex-to-upstream conversation traffic. When enabled, the archive MUST write gzip-compressed newline-delimited JSON records for upstream request payloads, streamed Responses events, compact response payloads, and websocket text or binary frames without performing gzip file I/O in the request event loop during normal operation. The archive writer queue MUST be bounded and MUST apply synchronous write backpressure instead of growing without limit when the background writer is saturated. Archive records MUST include request id, timestamp, direction, traffic kind, transport, account id when known, upstream target metadata, redacted headers, and the full payload or frame body. Credential-bearing headers such as authorization, cookies, proxy authorization, token headers, and API key headers MUST be redacted before persistence. JSON records MUST preserve non-ASCII payload text as UTF-8 rather than Unicode escape sequences. When disabled, no archive file MUST be created by the archive writer.
+
+Direct-WebSocket inbound frames MUST be attributed to the same pending request selected by downstream response matching. A `response.created` frame without a string response id MUST remain unattributed and MUST NOT fall through to the first unassigned pending request.
+
+#### Scenario: Operator enables archive for audit
+
+- **WHEN** `CODEX_LB_CONVERSATION_ARCHIVE_ENABLED=true`
+- **AND** a Codex Responses request is proxied upstream
+- **THEN** the archive records both the outbound upstream payload and inbound upstream events or response body as gzip JSONL
+- **AND** credential-bearing headers are stored as redacted values
+
+#### Scenario: Archive remains disabled by default
+
+- **WHEN** the archive setting is not enabled
+- **THEN** the archive writer does not create conversation archive files
+
+#### Scenario: Operator views archived traffic
+
+- **GIVEN** conversation archive files exist as `.jsonl.gz` or legacy `.jsonl`
+- **WHEN** an authenticated dashboard operator opens an existing request log detail
+- **THEN** the dashboard can find matching archive records by request id across archive files and display payload plus metadata for that request
+
+#### Scenario: Malformed created frame remains unattributed
+
+- **GIVEN** one or more direct-WebSocket requests are pending archive attribution
+- **WHEN** upstream sends `response.created` without a string response id
+- **THEN** the inbound archive record has no request id attribution
+- **AND** no pending request is claimed by that malformed frame
