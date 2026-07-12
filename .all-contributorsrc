@@ -993,6 +993,16 @@
       "contributions": [
         "code"
       ]
+    },
+    {
+      "login": "jamesx0416",
+      "name": "James",
+      "avatar_url": "https://avatars.githubusercontent.com/u/105842516?v=4",
+      "profile": "https://github.com/jamesx0416",
+      "contributions": [
+        "code",
+        "test"
+      ]
     }
   ],
   "contributorsPerLine": 7,

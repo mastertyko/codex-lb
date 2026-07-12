@@ -612,6 +612,17 @@ def test_backend_responses_websocket_proxies_upstream_and_persists_log(app_insta
             "text",
             text=json.dumps(
                 {
+                    "type": "response.output_text.delta",
+                    "response_id": "resp_ws_1",
+                    "delta": "hello",
+                },
+                separators=(",", ":"),
+            ),
+        ),
+        _FakeUpstreamMessage(
+            "text",
+            text=json.dumps(
+                {
                     "type": "response.completed",
                     "response": {
                         "id": "resp_ws_1",
@@ -728,9 +739,11 @@ def test_backend_responses_websocket_proxies_upstream_and_persists_log(app_insta
             websocket.send_text(json.dumps(request_payload))
             first = json.loads(websocket.receive_text())
             second = json.loads(websocket.receive_text())
+            third = json.loads(websocket.receive_text())
 
     assert first["type"] == "response.created"
-    assert second["type"] == "response.completed"
+    assert second["type"] == "response.output_text.delta"
+    assert third["type"] == "response.completed"
     seen_headers = cast(dict[str, str], seen["headers"])
     assert seen_headers["session_id"] == "thread-ws-1"
     assert seen_headers["openai-beta"] == "responses_websockets=2026-02-06"
@@ -780,6 +793,13 @@ def test_backend_responses_websocket_proxies_upstream_and_persists_log(app_insta
     assert log["status"] == "success"
     assert log["input_tokens"] == 3
     assert log["output_tokens"] == 5
+    latency_first_upstream_event_ms = log["latency_first_upstream_event_ms"]
+    latency_response_created_ms = log["latency_response_created_ms"]
+    latency_first_token_ms = log["latency_first_token_ms"]
+    assert isinstance(latency_first_upstream_event_ms, int)
+    assert isinstance(latency_response_created_ms, int)
+    assert isinstance(latency_first_token_ms, int)
+    assert latency_first_upstream_event_ms <= latency_response_created_ms <= latency_first_token_ms
 
 
 def test_backend_responses_websocket_forwards_client_tools_byte_identical(app_instance, monkeypatch):
