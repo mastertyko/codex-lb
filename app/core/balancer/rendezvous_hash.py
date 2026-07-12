@@ -15,7 +15,11 @@ def select_node(key: str, nodes: Sequence[str]) -> str | None:
     if len(nodes) == 1:
         return nodes[0]
 
+    prefix_hash = sha256(f"{key}:".encode())
+
     def _score(node: str) -> bytes:
-        return sha256(f"{key}:{node}".encode()).digest()
+        digest = prefix_hash.copy()
+        digest.update(node.encode())
+        return digest.digest()
 
     return max(nodes, key=_score)

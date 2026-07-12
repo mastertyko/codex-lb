@@ -20,6 +20,17 @@ from app.core.utils.json_guards import is_json_list, is_json_mapping
 
 _SUPPORTED_CHAT_ROLES = frozenset({"system", "developer", "user", "assistant", "tool"})
 _TEXT_CONTENT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
+_CHAT_TO_RESPONSES_EXCLUDED_FIELDS: set[str] = {
+    "messages",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "stream_options",
+    "store",
+    "n",
+    "max_tokens",
+    "max_completion_tokens",
+}
 
 
 def _content_parts(content: JsonValue) -> list[JsonValue]:
@@ -131,16 +142,16 @@ class ChatCompletionsRequest(BaseModel):
         return self
 
     def to_responses_request(self) -> ResponsesRequest:
-        data = self.model_dump(mode="json", exclude_none=True)
-        messages = data.pop("messages", None)
-        data.pop("store", None)
-        data.pop("n", None)
-        data.pop("max_tokens", None)
-        data.pop("max_completion_tokens", None)
-        response_format = data.pop("response_format", None)
-        stream_options = data.pop("stream_options", None)
-        raw_tools = data.pop("tools", [])
-        raw_tool_choice = data.pop("tool_choice", None)
+        messages = self.messages
+        response_format = self.response_format
+        stream_options = self.stream_options
+        raw_tools = self.tools
+        raw_tool_choice = self.tool_choice
+        data = self.model_dump(
+            mode="json",
+            exclude_none=True,
+            exclude=_CHAT_TO_RESPONSES_EXCLUDED_FIELDS,
+        )
         reasoning_effort = data.pop("reasoning_effort", None)
         preserve_instruction_roles = _is_json_object_response_format(response_format)
         if reasoning_effort is not None and "reasoning" not in data:
@@ -148,10 +159,8 @@ class ChatCompletionsRequest(BaseModel):
         normalize_reasoning_aliases(data)
         if response_format is not None:
             _apply_response_format(data, response_format)
-        if isinstance(stream_options, Mapping):
-            include_obfuscation = stream_options.get("include_obfuscation")
-            if include_obfuscation is not None:
-                data["stream_options"] = {"include_obfuscation": include_obfuscation}
+        if stream_options is not None and stream_options.include_obfuscation is not None:
+            data["stream_options"] = {"include_obfuscation": stream_options.include_obfuscation}
 
         if messages is None or (not messages and "input" in data):
             # Some OpenAI-compatible clients route Responses-shaped payloads

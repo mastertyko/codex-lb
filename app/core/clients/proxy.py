@@ -1002,21 +1002,30 @@ def _remaining_total_timeout(timeout_seconds: float | None, started_at: float, n
 
 
 def _find_sse_separator(buffer: bytes | bytearray) -> tuple[int, int] | None:
-    separators = (b"\r\n\r\n", b"\n\n", b"\r\r")
-    positions = [(buffer.find(separator), len(separator)) for separator in separators]
-    valid_positions = [position for position in positions if position[0] >= 0]
-    if not valid_positions:
-        return None
-    return min(valid_positions, key=lambda item: item[0])
+    lf_index = buffer.find(b"\n\n")
+    if b"\r" not in buffer:
+        return (lf_index, 2) if lf_index >= 0 else None
+
+    best_index = lf_index
+    best_length = 2
+    crlf_index = buffer.find(b"\r\n\r\n")
+    if crlf_index >= 0 and (best_index < 0 or crlf_index < best_index):
+        best_index = crlf_index
+        best_length = 4
+    cr_index = buffer.find(b"\r\r")
+    if cr_index >= 0 and (best_index < 0 or cr_index < best_index):
+        best_index = cr_index
+        best_length = 2
+    return (best_index, best_length) if best_index >= 0 else None
 
 
-def _pop_sse_event(buffer: bytearray) -> bytes | None:
+def _pop_sse_event(buffer: bytearray) -> bytearray | None:
     separator = _find_sse_separator(buffer)
     if separator is None:
         return None
     index, separator_len = separator
     event_end = index + separator_len
-    event = bytes(buffer[:event_end])
+    event = buffer[:event_end]
     del buffer[:event_end]
     return event
 
@@ -1026,34 +1035,20 @@ async def _iter_sse_events(
     idle_timeout_seconds: float,
     max_event_bytes: int,
 ) -> AsyncIterator[str]:
-    async def _next_chunk() -> bytes:
-        return await iterator.__anext__()
-
-    async def _cancel_pending_chunk(task: asyncio.Task[bytes]) -> None:
-        if task.done():
-            return
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
     buffer = bytearray()
     chunk_iterator = resp.content.iter_chunked(_SSE_READ_CHUNK_SIZE)
     iterator = chunk_iterator.__aiter__()
 
     while True:
-        next_chunk = asyncio.create_task(_next_chunk())
+        chunk_timeout = asyncio.timeout(idle_timeout_seconds)
         try:
-            done, _ = await asyncio.wait({next_chunk}, timeout=idle_timeout_seconds)
-            if not done:
-                await _cancel_pending_chunk(next_chunk)
-                raise StreamIdleTimeoutError()
-            chunk = await next_chunk
+            async with chunk_timeout:
+                chunk = await iterator.__anext__()
         except StopAsyncIteration:
             break
-        except asyncio.CancelledError:
-            await _cancel_pending_chunk(next_chunk)
+        except TimeoutError as exc:
+            if chunk_timeout.expired():
+                raise StreamIdleTimeoutError() from exc
             raise
 
         if not chunk:
