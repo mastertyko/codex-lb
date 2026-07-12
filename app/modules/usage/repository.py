@@ -317,43 +317,47 @@ def _latest_by_account_sqlite(
     window: str | None,
     account_ids: list[str] | None,
 ) -> dict[str, UsageHistory]:
-    if account_ids is None:
-        account_sql = "select id from accounts"
-        account_params: list[object] = []
-    elif not account_ids:
-        return {}
-    else:
+    account_filter = ""
+    account_params: list[object] = []
+    if account_ids is not None:
+        if not account_ids:
+            return {}
         placeholders = ",".join("?" for _ in account_ids)
-        account_sql = f"select id from accounts where id in ({placeholders})"
+        account_filter = f"where a.id in ({placeholders})"
         account_params = list(account_ids)
 
     if not window or window == "primary":
-        window_clause = "coalesce(window, 'primary') = 'primary'"
+        window_clause = "coalesce(candidate.window, 'primary') = 'primary'"
         window_params: list[object] = []
     else:
-        window_clause = "window = ?"
+        window_clause = "candidate.window = ?"
         window_params = [window]
     latest_sql = f"""
-        select id, account_id, recorded_at, window, used_percent,
-               input_tokens, output_tokens, reset_at, window_minutes,
-               credits_has, credits_unlimited, credits_balance
-        from usage_history
-        where account_id = ?
-          and {window_clause}
-        order by recorded_at desc, id desc
-        limit 1
+        select history.id, history.account_id, history.recorded_at, history.window,
+               history.used_percent, history.input_tokens, history.output_tokens,
+               history.reset_at, history.window_minutes, history.credits_has,
+               history.credits_unlimited, history.credits_balance
+        from accounts as a
+        join usage_history as history
+          on history.id = (
+              select candidate.id
+              from usage_history as candidate
+              where candidate.account_id = a.id
+                and {window_clause}
+              order by candidate.recorded_at desc, candidate.id desc
+              limit 1
+          )
+        {account_filter}
     """
 
     latest: dict[str, UsageHistory] = {}
     with closing(sqlite3.connect(db_path, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES)) as conn:
         conn.execute("PRAGMA query_only=ON")
         conn.execute("PRAGMA busy_timeout=30000")
-        accounts = [str(row[0]) for row in conn.execute(account_sql, account_params)]
-        for account_id in accounts:
-            row = conn.execute(latest_sql, [account_id, *window_params]).fetchone()
-            if row is not None:
-                entry = _usage_history_from_sqlite_row(row)
-                latest[entry.account_id] = entry
+        rows = conn.execute(latest_sql, [*window_params, *account_params])
+        for row in rows:
+            entry = _usage_history_from_sqlite_row(row)
+            latest[entry.account_id] = entry
     return latest
 
 
@@ -1129,7 +1133,7 @@ class AdditionalUsageRepository:
             return entries
 
         if dialect == "sqlite":
-            return await self._latest_by_scope_sqlite_probes(
+            return await self._latest_by_scope_sqlite(
                 scope,
                 window,
                 account_ids=account_ids,
@@ -1161,7 +1165,7 @@ class AdditionalUsageRepository:
         result = await self._session.execute(stmt)
         return {entry.account_id: entry for entry in result.scalars().all()}
 
-    async def _latest_by_scope_sqlite_probes(
+    async def _latest_by_scope_sqlite(
         self,
         scope: AdditionalQuotaQueryScope,
         window: str,
@@ -1172,38 +1176,49 @@ class AdditionalUsageRepository:
         account_values = list(account_ids) if account_ids is not None else None
         if account_values is not None and not account_values:
             return {}
-        account_stmt = select(AdditionalUsageHistory.account_id).where(
+
+        account_conditions = [
             _additional_quota_match_clause(scope),
             AdditionalUsageHistory.window == window,
-        )
+        ]
         if account_values is not None:
-            account_stmt = account_stmt.where(AdditionalUsageHistory.account_id.in_(account_values))
+            account_conditions.append(AdditionalUsageHistory.account_id.in_(account_values))
         if since is not None:
-            account_stmt = account_stmt.where(AdditionalUsageHistory.recorded_at >= since)
-        account_result = await self._session.execute(account_stmt.distinct())
-        latest: dict[str, AdditionalUsageHistory] = {}
-        for account_id in account_result.scalars().all():
-            latest_stmt = (
-                select(AdditionalUsageHistory)
-                .where(
-                    AdditionalUsageHistory.account_id == account_id,
-                    _additional_quota_match_clause(scope),
-                    AdditionalUsageHistory.window == window,
-                )
-                .order_by(
-                    AdditionalUsageHistory.recorded_at.desc(),
-                    AdditionalUsageHistory.used_percent.desc(),
-                    AdditionalUsageHistory.id.desc(),
-                )
-                .limit(1)
+            account_conditions.append(AdditionalUsageHistory.recorded_at >= since)
+        # Preserve the indexed latest-row probe while batching every account into one statement.
+        account_subquery = (
+            select(AdditionalUsageHistory.account_id.label("account_id"))
+            .where(*account_conditions)
+            .distinct()
+            .subquery("additional_accounts")
+        )
+
+        latest_conditions = [
+            AdditionalUsageHistory.account_id == account_subquery.c.account_id,
+            _additional_quota_match_clause(scope),
+            AdditionalUsageHistory.window == window,
+        ]
+        if since is not None:
+            latest_conditions.append(AdditionalUsageHistory.recorded_at >= since)
+        latest_id = (
+            select(AdditionalUsageHistory.id)
+            .where(*latest_conditions)
+            .order_by(
+                AdditionalUsageHistory.recorded_at.desc(),
+                AdditionalUsageHistory.used_percent.desc(),
+                AdditionalUsageHistory.id.desc(),
             )
-            if since is not None:
-                latest_stmt = latest_stmt.where(AdditionalUsageHistory.recorded_at >= since)
-            row_result = await self._session.execute(latest_stmt)
-            entry = row_result.scalar_one_or_none()
-            if entry is not None:
-                latest[entry.account_id] = entry
-        return latest
+            .limit(1)
+            .correlate(account_subquery)
+            .scalar_subquery()
+        )
+        latest_ids = select(latest_id.label("usage_id")).select_from(account_subquery).subquery("latest_additional_ids")
+        stmt = select(AdditionalUsageHistory).join(
+            latest_ids,
+            AdditionalUsageHistory.id == latest_ids.c.usage_id,
+        )
+        result = await self._session.execute(stmt)
+        return {entry.account_id: entry for entry in result.scalars().all()}
 
     async def latest_by_quota_key(
         self,
@@ -1219,7 +1234,7 @@ class AdditionalUsageRepository:
             scope = _resolve_additional_quota_query_scope(quota_key=quota_key)
             if scope is None:
                 raise ValueError("quota_key and window are required")
-            return await self._latest_by_scope_sqlite_probes(
+            return await self._latest_by_scope_sqlite(
                 scope,
                 window,
                 account_ids=account_ids,

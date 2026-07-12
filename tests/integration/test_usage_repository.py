@@ -235,6 +235,7 @@ async def test_additional_latest_by_account_sqlite_avoids_window_function_for_la
     emitted_sql = "\n".join(statements).lower()
     assert "row_number" not in emitted_sql
     assert " over " not in emitted_sql
+    assert sum(statement.lstrip().lower().startswith("select") for statement in statements) == 1
 
 
 @pytest.mark.asyncio
