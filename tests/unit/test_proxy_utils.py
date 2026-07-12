@@ -4457,9 +4457,7 @@ async def test_iter_sse_events_accepts_cr_only_blank_line_separator():
 
 @pytest.mark.asyncio
 async def test_iter_sse_events_preserves_mixed_separator_order():
-    response = _DummyResponse(
-        [b'data: {"sequence":1}\r\rdata: {"sequence":2}\n\n']
-    )
+    response = _DummyResponse([b'data: {"sequence":1}\r\rdata: {"sequence":2}\n\n'])
     stream = proxy_module._iter_sse_events(cast(proxy_module.SSEResponse, response), 1.0, 1024)
 
     chunks = [chunk async for chunk in stream]
@@ -15472,8 +15470,7 @@ def test_websocket_receive_timeout_honors_idle_when_equal_to_full_budget(monkeyp
     assert timeout.fail_all_pending is False
 
 
-@pytest.mark.asyncio
-async def test_websocket_archive_request_id_for_non_text_uses_single_pending_request() -> None:
+def test_websocket_archive_request_id_for_non_text_uses_single_pending_request() -> None:
     request_state = proxy_service._WebSocketRequestState(
         request_id="ws_req_binary_archive",
         model="gpt-5.1",
@@ -15484,17 +15481,15 @@ async def test_websocket_archive_request_id_for_non_text_uses_single_pending_req
         archive_request_id="archive_ws_req_binary",
     )
 
-    archive_request_id = await websocket_mixin_module._websocket_archive_request_id_for_message(
+    archive_request_id = websocket_mixin_module._websocket_archive_request_id_for_message(
         SimpleNamespace(kind="bytes", text=None),
         pending_requests=deque([request_state]),
-        pending_lock=anyio.Lock(),
     )
 
     assert archive_request_id == "archive_ws_req_binary"
 
 
-@pytest.mark.asyncio
-async def test_websocket_archive_request_id_for_non_text_keeps_ambiguous_frames_unattributed() -> None:
+def test_websocket_archive_request_id_for_non_text_keeps_ambiguous_frames_unattributed() -> None:
     first_request = proxy_service._WebSocketRequestState(
         request_id="ws_req_binary_archive_a",
         model="gpt-5.1",
@@ -15514,10 +15509,9 @@ async def test_websocket_archive_request_id_for_non_text_keeps_ambiguous_frames_
         archive_request_id="archive_ws_req_binary_b",
     )
 
-    archive_request_id = await websocket_mixin_module._websocket_archive_request_id_for_message(
+    archive_request_id = websocket_mixin_module._websocket_archive_request_id_for_message(
         SimpleNamespace(kind="bytes", text=None),
         pending_requests=deque([first_request, second_request]),
-        pending_lock=anyio.Lock(),
     )
 
     assert archive_request_id is None

@@ -6,6 +6,7 @@ import sys
 import time
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Iterator, Mapping, NoReturn, cast
 
@@ -63,7 +64,6 @@ from app.core.errors import (
 from app.core.exceptions import AppError, ProxyAuthError
 from app.core.openai.exceptions import ClientPayloadError
 from app.core.openai.models import OpenAIEvent
-from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import (
     ResponsesRequest,
 )
@@ -72,7 +72,7 @@ from app.core.types import JsonValue
 from app.core.upstream_proxy import UpstreamProxyRouteError
 from app.core.utils.request_id import get_request_id, reset_request_id, set_request_id
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
-from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.core.utils.sse import format_sse_event
 from app.core.utils.time import utcnow as utcnow
 from app.db.models import (
     Account,
@@ -440,7 +440,7 @@ from app.modules.proxy.request_policy import (
 )
 from app.modules.proxy.tool_call_dedupe import (
     mark_duplicate_tool_call_downstream_event,
-    rewrite_parallel_tool_call_text,
+    rewrite_parallel_tool_call_payload,
 )
 from app.modules.proxy.tool_call_dedupe import (
     response_id_from_payload as tool_call_response_id_from_payload,
@@ -473,6 +473,40 @@ def _archive_received_websocket_message(
         archive_received(message)
 
 
+_TERMINAL_WEBSOCKET_EVENT_TYPES = frozenset({"response.completed", "response.failed", "response.incomplete", "error"})
+_WEBSOCKET_RELAY_CHECKPOINT_INTERVAL = 32
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedUpstreamWebSocketText:
+    text: str
+    payload: dict[str, JsonValue] | None
+    event: OpenAIEvent | None
+    event_type: str | None
+
+
+def _parse_upstream_websocket_text(text: str) -> _ParsedUpstreamWebSocketText:
+    payload = _parse_websocket_payload(text)
+    rewritten_payload, changed, _removed_count = rewrite_parallel_tool_call_payload(payload)
+    if changed:
+        assert rewritten_payload is not None
+        payload = rewritten_payload
+        text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    event_type = _event_type_from_payload(None, payload)
+    event = None
+    if event_type in _TERMINAL_WEBSOCKET_EVENT_TYPES and payload is not None:
+        try:
+            event = OpenAIEvent.model_validate(payload)
+        except ValidationError:
+            event = None
+    return _ParsedUpstreamWebSocketText(
+        text=text,
+        payload=payload,
+        event=event,
+        event_type=event_type,
+    )
+
+
 def _websocket_archive_request_state_for_payload(
     pending_requests: deque[_WebSocketRequestState],
     *,
@@ -482,10 +516,11 @@ def _websocket_archive_request_state_for_payload(
 ) -> _WebSocketRequestState | None:
     response_id = _websocket_response_id(event, payload)
     if event_type == "response.created":
-        if response_id is not None:
-            existing = _find_websocket_request_state_by_response_id(pending_requests, response_id)
-            if existing is not None:
-                return existing
+        if response_id is None:
+            return None
+        existing = _find_websocket_request_state_by_response_id(pending_requests, response_id)
+        if existing is not None:
+            return existing
         for request_state in pending_requests:
             if request_state.response_id is None and _http_bridge_request_counts_against_queue(request_state):
                 return request_state
@@ -524,37 +559,26 @@ def _websocket_archive_request_state_for_payload(
     )
 
 
-async def _websocket_archive_request_id_for_message(
+def _websocket_archive_request_id_for_message(
     message: Any,
     *,
     pending_requests: deque[_WebSocketRequestState],
-    pending_lock: anyio.Lock,
+    parsed_text: _ParsedUpstreamWebSocketText | None = None,
 ) -> str | None:
+    # The relay calls this without an intervening await, so this read-only
+    # snapshot cannot interleave with another event-loop task's deque mutation.
     if message.kind != "text" or message.text is None:
-        async with pending_lock:
-            if len(pending_requests) == 1:
-                return pending_requests[0].archive_request_id
-            return None
-    event_block = f"data: {message.text}\n\n"
-    payload = parse_sse_data_json(event_block)
-    if payload is None:
-        try:
-            raw_payload = json.loads(message.text)
-        except json.JSONDecodeError:
-            raw_payload = None
-        if isinstance(raw_payload, dict):
-            payload = cast(dict[str, JsonValue], raw_payload)
-            event_block = format_sse_event(payload)
-    event = parse_sse_event(event_block)
-    event_type = _event_type_from_payload(event, payload)
-    async with pending_lock:
-        request_state = _websocket_archive_request_state_for_payload(
-            pending_requests,
-            event=event,
-            payload=payload,
-            event_type=event_type,
-        )
-        return None if request_state is None else request_state.archive_request_id
+        if len(pending_requests) == 1:
+            return pending_requests[0].archive_request_id
+        return None
+    parsed = parsed_text if parsed_text is not None else _parse_upstream_websocket_text(message.text)
+    request_state = _websocket_archive_request_state_for_payload(
+        pending_requests,
+        event=parsed.event,
+        payload=parsed.payload,
+        event_type=parsed.event_type,
+    )
+    return None if request_state is None else request_state.archive_request_id
 
 
 def _raise_proxy_budget_exhausted() -> NoReturn:
@@ -632,8 +656,8 @@ class _WebSocketMixin:
         prohibit_fast_mode = bool(getattr(settings, "prohibit_fast_mode", False))
         routing_strategy = _facade()._routing_strategy(settings)
         pending_requests: deque[_WebSocketRequestState] = deque()
-        pending_lock = anyio.Lock()
-        client_send_lock = anyio.Lock()
+        pending_lock = anyio.Lock(fast_acquire=True)
+        client_send_lock = anyio.Lock(fast_acquire=True)
         response_create_gate = asyncio.Semaphore(1)
         upstream: UpstreamResponsesWebSocket | None = None
         upstream_reader: asyncio.Task[None] | None = None
@@ -2555,6 +2579,7 @@ class _WebSocketMixin:
     ) -> None:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
+        received_since_checkpoint = _WEBSOCKET_RELAY_CHECKPOINT_INTERVAL - 1
         try:
             while True:
                 receive_timeout = await proxy._next_websocket_receive_timeout(
@@ -2576,14 +2601,24 @@ class _WebSocketMixin:
                             wait_timeout = (
                                 keepalive_interval if wait_timeout is None else min(wait_timeout, keepalive_interval)
                             )
-                        message = await asyncio.wait_for(
-                            upstream.receive(),
-                            timeout=wait_timeout,
+                        if wait_timeout is None:
+                            message = await upstream.receive()
+                        else:
+                            async with asyncio.timeout(wait_timeout):
+                                message = await upstream.receive()
+                        received_since_checkpoint += 1
+                        if received_since_checkpoint >= _WEBSOCKET_RELAY_CHECKPOINT_INTERVAL:
+                            received_since_checkpoint = 0
+                            await asyncio.sleep(0)
+                        parsed_text = (
+                            _parse_upstream_websocket_text(message.text)
+                            if message.kind == "text" and message.text is not None
+                            else None
                         )
-                        archive_request_id = await _websocket_archive_request_id_for_message(
+                        archive_request_id = _websocket_archive_request_id_for_message(
                             message,
                             pending_requests=pending_requests,
-                            pending_lock=pending_lock,
+                            parsed_text=parsed_text,
                         )
                         _archive_received_websocket_message(
                             upstream,
@@ -2673,6 +2708,7 @@ class _WebSocketMixin:
                         response_create_gate=response_create_gate,
                         continuity_state=continuity_state,
                         codex_session_affinity=codex_session_affinity,
+                        parsed_text=parsed_text,
                     )
                     suppress_downstream_event = upstream_control.suppress_downstream_event
                     downstream_texts = upstream_control.downstream_texts
@@ -2897,21 +2933,15 @@ class _WebSocketMixin:
         response_create_gate: asyncio.Semaphore,
         continuity_state: "_WebSocketContinuityState | None" = None,
         codex_session_affinity: bool = False,
+        parsed_text: _ParsedUpstreamWebSocketText | None = None,
     ) -> str:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
-        event_block = f"data: {text}\n\n"
-        payload = parse_sse_data_json(event_block)
-        if payload is None:
-            try:
-                raw_payload = json.loads(text)
-            except json.JSONDecodeError:
-                raw_payload = None
-            if isinstance(raw_payload, dict):
-                payload = cast(dict[str, JsonValue], raw_payload)
-                event_block = format_sse_event(payload)
-        event = parse_sse_event(event_block)
-        event_type = _event_type_from_payload(event, payload)
+        parsed = parsed_text if parsed_text is not None else _parse_upstream_websocket_text(text)
+        text = parsed.text
+        payload = parsed.payload
+        event = parsed.event
+        event_type = parsed.event_type
         response_id = _websocket_response_id(event, payload)
         error_message = _websocket_event_error_message(event_type, payload)
         is_typeless_error_event = (
@@ -2936,11 +2966,6 @@ class _WebSocketMixin:
             message=error_message,
         )
         previous_response_id_hint = _facade()._previous_response_id_from_not_found_message(error_message)
-        text, payload, event, event_type, _event_block = rewrite_parallel_tool_call_text(
-            text,
-            payload,
-            event_block=format_sse_event(payload) if payload is not None else f"data: {text}\n\n",
-        )
 
         async with pending_lock:
             request_state = None
@@ -3003,10 +3028,7 @@ class _WebSocketMixin:
                     if isinstance(sequence_number, int) and not isinstance(sequence_number, bool):
                         upstream_control.downstream_sequence_request_state = request_state
                         upstream_control.downstream_sequence_number = sequence_number
-            if (
-                event_type in {"response.completed", "response.failed", "response.incomplete", "error"}
-                and pending_requests
-            ):
+            if event_type in _TERMINAL_WEBSOCKET_EVENT_TYPES and pending_requests:
                 request_state = _pop_terminal_websocket_request_state(
                     pending_requests,
                     response_id=response_id,
@@ -3148,7 +3170,7 @@ class _WebSocketMixin:
                 upstream_control.suppress_downstream_event = True
             return text
 
-        if event_type not in {"response.completed", "response.failed", "response.incomplete", "error"}:
+        if event_type not in _TERMINAL_WEBSOCKET_EVENT_TYPES:
             await proxy._maybe_touch_request_state_api_key_reservation(
                 request_state,
                 api_key=request_state.api_key or api_key,

@@ -2428,6 +2428,38 @@ def test_v1_responses_websocket_archives_multiplexed_upstream_frames_by_response
     assert logs_by_request_id["resp_ws_second"]["archive_request_id"] == second_archive_request_id
 
 
+def test_websocket_archive_does_not_claim_malformed_created_without_response_id() -> None:
+    request_state = proxy_module._WebSocketRequestState(
+        request_id="req-malformed-created",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=0.0,
+        archive_request_id="archive-malformed-created",
+        awaiting_response_created=True,
+    )
+    message = _FakeUpstreamMessage(
+        "text",
+        text=json.dumps(
+            {
+                "type": "response.created",
+                "response": {"status": "in_progress"},
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    archive_request_id = websocket_mixin_module._websocket_archive_request_id_for_message(
+        message,
+        pending_requests=deque([request_state]),
+    )
+
+    assert archive_request_id is None
+    assert request_state.response_id is None
+    assert request_state.awaiting_response_created is True
+
+
 def test_v1_responses_websocket_accepts_and_reuses_generated_turn_state(app_instance, monkeypatch):
     fake_upstream = _FakeUpstreamWebSocket(
         [
