@@ -64,6 +64,7 @@ from app.modules.proxy.load_balancer import (
     RuntimeState,
     SelectionInputs,
     _filter_accounts_for_model,
+    _mapped_model_has_registry_entry,
 )
 from app.modules.proxy.repo_bundle import ProxyRepositories
 from app.modules.proxy.sticky_repository import StickySessionsRepository
@@ -27177,6 +27178,260 @@ def test_filter_accounts_for_model_treats_omit_equivalent_service_tiers_as_unfil
         account_a,
         account_b,
     ]
+
+
+def test_filter_accounts_for_model_uses_authoritative_account_capabilities(monkeypatch):
+    supported = _make_account("acc_filter_supported")
+    unsupported = _make_account("acc_filter_unsupported")
+
+    class Registry:
+        def account_ids_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.6-sol"
+            return frozenset({supported.id})
+
+        def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.6-sol"
+            return None
+
+    monkeypatch.setattr("app.modules.proxy.load_balancer.get_model_registry", lambda: Registry())
+
+    assert _filter_accounts_for_model([unsupported, supported], "gpt-5.6-sol") == [supported]
+
+
+@pytest.mark.asyncio
+async def test_cleared_registry_keeps_bootstrap_plan_gating_in_new_account_window(monkeypatch):
+    # Regression for the follow-on Codex P2: after the scheduler observes zero
+    # active accounts and clears the registry, an account can be added before the
+    # next refresh tick. In that window a canonical bootstrap model must still be
+    # recognized (so model/plan filtering runs) and an account whose plan does not
+    # support the model must be filtered out instead of being selected.
+    from app.core.openai.model_registry import ModelRegistry
+
+    registry = ModelRegistry(ttl_seconds=60.0)
+    await registry.clear()
+    monkeypatch.setattr("app.modules.proxy.load_balancer.get_model_registry", lambda: registry)
+
+    # Canonical bootstrap model is still recognized (not treated as absent).
+    assert _mapped_model_has_registry_entry("gpt-5.6-sol") is True
+
+    supported = _make_account("acc_cleared_supported")
+    supported.plan_type = "pro"
+    unsupported = _make_account("acc_cleared_unsupported")
+    unsupported.plan_type = "legacy_unlisted_plan"
+
+    # Plan gating still applies via the bootstrap catalog: the unsupported plan is
+    # excluded rather than selected during the pre-refresh window.
+    assert _filter_accounts_for_model([unsupported, supported], "gpt-5.6-sol") == [supported]
+
+
+def test_suppressed_catalog_model_remains_an_account_selection_blocker(monkeypatch):
+    class Registry:
+        def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+            return frozenset()
+
+        def is_suppressed_model(self, slug: str) -> bool:
+            return slug == "private-alpha"
+
+    monkeypatch.setattr("app.modules.proxy.load_balancer.get_model_registry", lambda: Registry())
+
+    # A suppressed known slug is not an operator-mapped unknown: it must enter
+    # model filtering and leave no eligible account to select.
+    assert _mapped_model_has_registry_entry("private-alpha") is True
+    assert _mapped_model_has_registry_entry("operator-mapped-slug") is False
+    account = _make_account("acc_suppressed_catalog")
+    account.plan_type = "plus"
+    assert _filter_accounts_for_model([account], "private-alpha") == []
+
+
+def test_http_bridge_session_rejects_account_without_requested_model(monkeypatch):
+    session = cast(
+        proxy_service._HTTPBridgeSession,
+        SimpleNamespace(account=_make_account("acc_bridge_wrong_model")),
+    )
+
+    class Registry:
+        def account_ids_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.6-sol"
+            return frozenset({"acc_other"})
+
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+
+    assert (
+        proxy_support._http_bridge_session_supports_service_tier(
+            session,
+            request_model="gpt-5.6-sol",
+            request_service_tier=None,
+        )
+        is False
+    )
+
+
+def test_http_bridge_session_degrades_when_registry_omits_owner(monkeypatch):
+    session = cast(
+        proxy_service._HTTPBridgeSession,
+        SimpleNamespace(account=_make_account("acc_bridge_new_owner")),
+    )
+
+    class Registry:
+        def get_snapshot(self) -> SimpleNamespace:
+            return SimpleNamespace(account_plans={"acc_stale_owner": "plus"})
+
+        def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.5"
+            return frozenset({"plus"})
+
+        def account_ids_for_model(self, slug: str) -> frozenset[str] | None:
+            raise AssertionError(f"stale model-account index enforced for {slug}")
+
+        def account_ids_for_model_service_tier(self, slug: str, requested_tier: str) -> frozenset[str] | None:
+            raise AssertionError(f"stale tier-account index enforced for {slug}:{requested_tier}")
+
+        def plan_types_for_model_service_tier(self, slug: str, requested_tier: str) -> frozenset[str] | None:
+            assert (slug, requested_tier) == ("gpt-5.5", "priority")
+            return frozenset({"plus"})
+
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+
+    assert (
+        proxy_support._http_bridge_session_supports_service_tier(
+            session,
+            request_model="gpt-5.5",
+            request_service_tier="priority",
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize("service_tier", ["auto", "default", " Auto "])
+def test_http_bridge_session_treats_omit_equivalent_service_tiers_as_unfiltered(monkeypatch, service_tier):
+    session = cast(
+        proxy_service._HTTPBridgeSession,
+        SimpleNamespace(account=_make_account("acc_bridge_omit_equivalent_tier")),
+    )
+
+    class Registry:
+        def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.5"
+            return None
+
+        def account_ids_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.5"
+            return frozenset({session.account.id})
+
+        def account_ids_for_model_service_tier(self, slug: str, requested_tier: str) -> frozenset[str] | None:
+            raise AssertionError(f"unexpected tier-specific account lookup for {slug}:{requested_tier}")
+
+        def plan_types_for_model_service_tier(self, slug: str, requested_tier: str) -> frozenset[str] | None:
+            raise AssertionError(f"unexpected tier-specific plan lookup for {slug}:{requested_tier}")
+
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+
+    assert (
+        proxy_support._http_bridge_session_supports_service_tier(
+            session,
+            request_model="gpt-5.5",
+            request_service_tier=service_tier,
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize("service_tier", [None, "auto", "default", " Default "])
+def test_http_bridge_session_preserves_model_plan_gate_for_omit_equivalent_tiers(monkeypatch, service_tier):
+    session = cast(
+        proxy_service._HTTPBridgeSession,
+        SimpleNamespace(account=_make_account("acc_bridge_bootstrap_plan_gate")),
+    )
+
+    class Registry:
+        def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.4"
+            return frozenset({"pro"})
+
+        def account_ids_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "gpt-5.4"
+            return None
+
+        def account_ids_for_model_service_tier(self, slug: str, requested_tier: str) -> frozenset[str] | None:
+            raise AssertionError(f"unexpected tier-specific account lookup for {slug}:{requested_tier}")
+
+        def plan_types_for_model_service_tier(self, slug: str, requested_tier: str) -> frozenset[str] | None:
+            raise AssertionError(f"unexpected tier-specific plan lookup for {slug}:{requested_tier}")
+
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+
+    assert (
+        proxy_support._http_bridge_session_supports_service_tier(
+            session,
+            request_model="gpt-5.4",
+            request_service_tier=service_tier,
+        )
+        is False
+    )
+
+    session.account.plan_type = "pro"
+    assert (
+        proxy_support._http_bridge_session_supports_service_tier(
+            session,
+            request_model="gpt-5.4",
+            request_service_tier=service_tier,
+        )
+        is True
+    )
+
+
+def test_http_bridge_session_rejects_suppressed_catalog_model(monkeypatch):
+    session = cast(
+        proxy_service._HTTPBridgeSession,
+        SimpleNamespace(account=_make_account("acc_bridge_suppressed_catalog")),
+    )
+
+    class Registry:
+        def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "private-alpha"
+            return frozenset()
+
+        def is_suppressed_model(self, slug: str) -> bool:
+            return slug == "private-alpha"
+
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+
+    assert (
+        proxy_support._http_bridge_session_supports_service_tier(
+            session,
+            request_model="private-alpha",
+            request_service_tier=None,
+        )
+        is False
+    )
+
+
+def test_http_bridge_session_allows_operator_mapped_unadvertised_model(monkeypatch):
+    session = cast(
+        proxy_service._HTTPBridgeSession,
+        SimpleNamespace(account=_make_account("acc_bridge_unadvertised")),
+    )
+
+    class Registry:
+        def plan_types_for_model(self, slug: str) -> frozenset[str] | None:
+            assert slug == "operator-mapped-slug"
+            # Authoritative-empty catalog for an operator-mapped, unadvertised slug.
+            return frozenset()
+
+        def account_ids_for_model(self, slug: str) -> frozenset[str] | None:
+            # Authoritative-empty catalog: no account advertises this slug.
+            return frozenset()
+
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+
+    assert (
+        proxy_support._http_bridge_session_supports_service_tier(
+            session,
+            request_model="operator-mapped-slug",
+            request_service_tier=None,
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
