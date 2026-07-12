@@ -32,6 +32,7 @@ from app.modules.proxy.load_balancer import (
     NO_PLAN_SUPPORT_FOR_MODEL,
     AccountLease,
     AccountState,
+    CatalogOmissionQuotaAdmission,
     LoadBalancer,
     RuntimeState,
 )
@@ -2432,13 +2433,14 @@ async def test_load_selection_inputs_excludes_paused_accounts_from_sticky_pool(m
     ("recorded_at_offset_seconds", "used_percent", "expect_selection", "expected_error_code"),
     [
         pytest.param(0, 20.0, True, None, id="fresh"),
+        pytest.param(None, 20.0, False, ADDITIONAL_QUOTA_DATA_UNAVAILABLE, id="missing"),
         pytest.param(-181, 20.0, False, ADDITIONAL_QUOTA_DATA_UNAVAILABLE, id="stale"),
         pytest.param(0, 100.0, False, ADDITIONAL_QUOTA_EXHAUSTED, id="exhausted"),
     ],
 )
 async def test_select_account_handles_mapped_quota_when_account_catalog_omits_model(
     monkeypatch,
-    recorded_at_offset_seconds: int,
+    recorded_at_offset_seconds: int | None,
     used_percent: float,
     expect_selection: bool,
     expected_error_code: str | None,
@@ -2460,16 +2462,20 @@ async def test_select_account_handles_mapped_quota_when_account_catalog_omits_mo
     usage_repo = StubUsageRepository(primary={account.id: primary_entry}, secondary={})
     sticky_repo = StubStickySessionsRepository()
     additional_usage_repo = StubAdditionalUsageRepository(
-        primary={
-            account.id: _additional_entry(
-                2,
-                account_id=account.id,
-                window="primary",
-                used_percent=used_percent,
-                reset_at=now_epoch + 300,
-                recorded_at=now + timedelta(seconds=recorded_at_offset_seconds),
-            )
-        }
+        primary=(
+            {}
+            if recorded_at_offset_seconds is None
+            else {
+                account.id: _additional_entry(
+                    2,
+                    account_id=account.id,
+                    window="primary",
+                    used_percent=used_percent,
+                    reset_at=now_epoch + 300,
+                    recorded_at=now + timedelta(seconds=recorded_at_offset_seconds),
+                )
+            }
+        )
     )
 
     monkeypatch.setattr(
@@ -2494,8 +2500,14 @@ async def test_select_account_handles_mapped_quota_when_account_catalog_omits_mo
     if expect_selection:
         assert selection.account is not None
         assert selection.account.id == account.id
+        assert selection.catalog_omission_quota_admission == CatalogOmissionQuotaAdmission(
+            normalized_model="gpt-5.3-codex-spark",
+            canonical_quota_key="codex_spark",
+            normalized_effective_service_tier=None,
+        )
     else:
         assert selection.account is None
+        assert selection.catalog_omission_quota_admission is None
     assert selection.error_code == expected_error_code
 
 
@@ -2557,6 +2569,7 @@ async def test_authoritative_catalog_controls_quota_exempt_plan_evidence_require
         assert selection.account.id == account.id
     else:
         assert selection.account is None
+    assert selection.catalog_omission_quota_admission is None
     assert selection.error_code == expected_error_code
 
 
@@ -2637,6 +2650,11 @@ async def test_select_account_preserves_service_tier_plan_filter_when_quota_over
     assert selection.account is not None
     assert selection.account.id == pro.id
     assert selection.error_code is None
+    assert selection.catalog_omission_quota_admission == CatalogOmissionQuotaAdmission(
+        normalized_model="gpt-5.3-codex-spark",
+        canonical_quota_key="codex_spark",
+        normalized_effective_service_tier="priority",
+    )
 
 
 @pytest.mark.asyncio
@@ -2721,6 +2739,7 @@ async def test_select_account_preserves_authoritative_service_tier_accounts_when
     assert selection.account is not None
     assert selection.account.id == tier_allowed.id
     assert [account.id for account in selection_inputs.accounts] == [tier_allowed.id]
+    assert selection.catalog_omission_quota_admission is None
 
 
 @pytest.mark.asyncio
@@ -2794,6 +2813,7 @@ async def test_explicit_additional_quota_cannot_override_model_account_catalog(
 
     assert selection.account is None
     assert selection.error_code == NO_PLAN_SUPPORT_FOR_MODEL
+    assert selection.catalog_omission_quota_admission is None
 
 
 @pytest.mark.asyncio

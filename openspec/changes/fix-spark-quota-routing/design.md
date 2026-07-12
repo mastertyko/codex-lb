@@ -8,6 +8,7 @@ The model registry aggregates general per-plan and per-account Codex catalogs. S
 - Let fresh model-specific additional-quota telemetry establish account-level support for mapped, separately metered models.
 - Preserve registry plan and service-tier restrictions.
 - Preserve fail-closed behavior for stale, missing, or exhausted additional-quota data and all existing health, cooldown, capacity, and routing gates.
+- Preserve HTTP bridge session reuse for an account admitted by that evidence without performing quota repository I/O in the synchronous reuse predicate.
 
 **Non-Goals:**
 - Do not add a generic fallback for unknown or unmapped models.
@@ -22,8 +23,13 @@ This keeps the exception narrow and evidence-backed. A catalog-supported account
 
 Explicit caller-supplied additional-limit filters do not activate this exception. Only a canonical model-to-quota mapping can override the general account catalog, preventing an unrelated quota key from bypassing model support.
 
+After final account selection, the selector records a frozen admission value only when the selected account ID belongs to the quota-admitted catalog-omission set. The value contains the normalized requested model, canonical quota key, and normalized effective service tier. HTTP bridge creation and reconnect copy that optional value with the selected account.
+
+The synchronous bridge reuse predicate may treat a current general account-catalog omission as admissible only when the session's recorded value exactly matches the requested model, its current canonical quota mapping, and effective service tier. A catalog-supported account continues through the normal account-level service-tier logic even if an older session carries omission provenance. Reconnect replaces or clears the value together with the newly selected account, so failover cannot inherit another selection's exception.
+
 ## Risks / Trade-offs
 
 - A malformed additional-quota registry could map a model incorrectly. Existing canonical registry loading, plan applicability, and fresh-data requirements constrain that risk.
 - Service-tier account affinity is less precise only for an account genuinely omitted from the general model catalog, because no model-specific account-tier entry exists to trust for that account. Plan-level service-tier filtering remains authoritative for that fallback; catalog-supported accounts continue to require the exact per-account service-tier index.
 - Fresh quota telemetry may temporarily disappear during refresh failures. Selection remains fail-closed with the existing additional-quota data-unavailable error.
+- Bridge reuse depends on a prior successful selection rather than re-reading quota telemetry. Binding the immutable admission value to the selected model, quota key, and service tier keeps that lifecycle exception no broader than the original selection decision.

@@ -6,7 +6,8 @@ Separately metered Codex models can remain usable through fresh per-account quot
 
 - Allow fresh additional-quota telemetry to provide account-specific eligibility evidence for a mapped, separately metered model when the general per-account catalog omits that model.
 - Preserve model plan and service-tier filtering before additional-quota availability, exhaustion, health, cooldown, and routing gates are evaluated.
-- Add regression coverage for an authoritative account catalog that omits Spark while a plan-compatible account has fresh, available Spark quota data.
+- Carry the exact normalized quota-backed catalog-omission admission decision into HTTP bridge sessions so compatible later turns can reuse the selected upstream without synchronous quota I/O.
+- Add regression coverage for fresh, missing, stale, and exhausted Spark quota evidence plus two-turn HTTP bridge reuse.
 
 ## Capabilities
 
@@ -20,6 +21,7 @@ None.
 
 ## Impact
 
-- Account candidate filtering in `app/modules/proxy/load_balancer.py`.
+- Account candidate filtering and admission provenance in `app/modules/proxy/load_balancer.py`.
+- HTTP bridge reuse in `app/modules/proxy/_service/support.py` and `app/modules/proxy/_service/http_bridge/mixin.py`.
 - Spark and future separately metered model routing that uses the additional-quota registry.
-- Focused load-balancer regression coverage; no API schema or database migration changes.
+- Focused load-balancer and bridge regression coverage; no API schema or database migration changes.

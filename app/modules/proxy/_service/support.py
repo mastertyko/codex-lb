@@ -30,7 +30,11 @@ from app.modules.api_keys.service import (
     ApiKeyUsageReservationData,
 )
 from app.modules.proxy.affinity import _AffinityPolicy
-from app.modules.proxy.load_balancer import AccountLease, AccountSelection
+from app.modules.proxy.load_balancer import (
+    AccountLease,
+    AccountSelection,
+    CatalogOmissionQuotaAdmission,
+)
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
@@ -670,6 +674,7 @@ class _HTTPBridgeSession:
     unanchored_reservation_id: str | None = None
     admission_waiter_count: int = 0
     request_service_tier: str | None = None
+    catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
     lifecycle_lock: anyio.Lock = field(default_factory=anyio.Lock)
     api_key: ApiKeyData | None = None
     codex_session: bool = False
@@ -734,7 +739,15 @@ def _http_bridge_session_supports_service_tier(
         if callable(account_ids_for_model) and account_indexes_cover_owner
         else None
     )
-    if model_account_ids is not None and session.account.id not in model_account_ids:
+    model_catalog_omits_account = model_account_ids is not None and session.account.id not in model_account_ids
+    quota_admission_matches = (
+        session.catalog_omission_quota_admission is not None
+        and session.catalog_omission_quota_admission.matches(
+            requested_model=request_model,
+            service_tier=request_service_tier,
+        )
+    )
+    if model_catalog_omits_account and not quota_admission_matches:
         return False
     # Keep bridge reuse aligned with account selection: clients commonly send
     # these omit-equivalent values explicitly, but neither selects a specific
@@ -749,7 +762,9 @@ def _http_bridge_session_supports_service_tier(
             else None
         )
         if allowed_account_ids is not None:
-            return session.account.id in allowed_account_ids
+            return session.account.id in allowed_account_ids or (
+                model_catalog_omits_account and quota_admission_matches
+            )
 
         allowed_plans = registry.plan_types_for_model_service_tier(request_model, request_service_tier)
     if allowed_plans is None:

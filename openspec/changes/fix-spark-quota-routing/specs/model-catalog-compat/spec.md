@@ -2,7 +2,7 @@
 
 ### Requirement: Fresh additional-quota evidence can establish account support
 
-For a model canonically mapped to a separately metered additional quota, account selection MUST allow fresh account-specific additional-quota telemetry to establish model support when an authoritative general per-account model catalog omits that model. The system MUST continue to enforce registry plan and service-tier restrictions and MUST apply the existing additional-quota freshness, exhaustion, account-health, cooldown, capacity, security, and routing gates before selecting an account. This behavior MUST NOT apply to unknown models or to an unrelated additional-limit key supplied independently of the requested model.
+For a model canonically mapped to a separately metered additional quota, account selection MUST allow fresh account-specific additional-quota telemetry to establish model support when an authoritative general per-account model catalog omits that model. The system MUST continue to enforce registry plan and service-tier restrictions and MUST apply the existing additional-quota freshness, exhaustion, account-health, cooldown, capacity, security, and routing gates before selecting an account. When such a selected account is bound to an HTTP bridge session, the session MUST remain reusable without synchronous quota I/O while normalized model, canonical quota key, and normalized effective service tier exactly match the recorded selection provenance. This behavior MUST NOT apply to unknown models or to an unrelated additional-limit key supplied independently of the requested model.
 
 #### Scenario: Fresh Spark quota overrides general account-catalog omission
 
@@ -11,6 +11,21 @@ For a model canonically mapped to a separately metered additional quota, account
 - **WHEN** account selection is requested for `gpt-5.3-codex-spark`
 - **THEN** the general account-catalog omission does not remove that account from consideration
 - **AND** the account proceeds through the remaining additional-quota and routing gates
+
+#### Scenario: Quota-admitted bridge session remains reusable
+
+- **GIVEN** an account omitted from the authoritative general account catalog was selected for `gpt-5.3-codex-spark` using fresh, non-exhausted `codex_spark` telemetry
+- **AND** an HTTP bridge session records that selection's normalized model, canonical quota key, and effective service tier
+- **WHEN** a later turn requests the same normalized model, canonical quota mapping, and effective service tier
+- **THEN** the existing bridge session remains reusable
+- **AND** the synchronous reuse check does not re-read quota telemetry
+
+#### Scenario: Bridge admission provenance is narrowly bound
+
+- **GIVEN** an HTTP bridge session carries quota-backed catalog-omission provenance
+- **WHEN** a later request has a different normalized model, canonical quota key, or effective service tier
+- **THEN** that provenance does not bypass the normal catalog and service-tier checks
+- **AND** a catalog-supported account rejected by the requested account-level service-tier index remains rejected
 
 #### Scenario: Catalog-supported account-level service-tier exclusion remains authoritative
 
@@ -35,6 +50,7 @@ For a model canonically mapped to a separately metered additional quota, account
 - **WHEN** account selection is requested
 - **THEN** selection fails with the existing additional-quota data-unavailable behavior
 - **AND** the system does not route based only on bootstrap metadata
+- **AND** no quota-backed HTTP bridge session is admitted from that failed selection
 
 #### Scenario: Explicit unrelated quota cannot bypass model support
 

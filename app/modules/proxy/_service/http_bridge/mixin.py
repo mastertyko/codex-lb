@@ -2091,6 +2091,7 @@ class _HTTPBridgeMixin(
             upstream_turn_state=_upstream_turn_state_from_socket(upstream),
             downstream_turn_state=None,
             account_lease=selected_account_lease,
+            catalog_omission_quota_admission=selection.catalog_omission_quota_admission,
         )
         _copy_websocket_route_metadata_to_session(session, request_state)
         session.upstream_reader = asyncio.create_task(self._relay_http_bridge_upstream_messages(session))
@@ -2379,6 +2380,7 @@ class _HTTPBridgeMixin(
             await self._load_balancer.release_account_lease(session.account_lease)
         session.account_lease = selected_account_lease
         session.account, session.headers, session.upstream = account, connect_headers, upstream
+        session.catalog_omission_quota_admission = selection.catalog_omission_quota_admission
         session.upstream_control = _WebSocketUpstreamControl()
         session.closed = False
         session.last_upstream_close_code = None

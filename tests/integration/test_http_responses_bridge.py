@@ -26,6 +26,7 @@ from app.core.utils.request_id import (
     set_request_id,
     set_request_scope_id,
 )
+from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, DashboardSettings
 from app.db.session import SessionLocal
 from app.dependencies import get_proxy_service_for_app
@@ -35,6 +36,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _reserve_http_bridge_unanchored_handoff,
 )
 from app.modules.proxy.load_balancer import AccountSelection
+from app.modules.usage.repository import AdditionalUsageRepository
 
 pytestmark = pytest.mark.integration
 _TEST_SYNC_TIMEOUT_SECONDS = 5.0
@@ -64,11 +66,11 @@ def _encode_jwt(payload: dict) -> str:
     return f"header.{body}.sig"
 
 
-def _make_auth_json(account_id: str, email: str) -> dict:
+def _make_auth_json(account_id: str, email: str, *, plan_type: str = "plus") -> dict:
     payload = {
         "email": email,
         "chatgpt_account_id": account_id,
-        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
+        "https://api.openai.com/auth": {"chatgpt_plan_type": plan_type},
     }
     return {
         "tokens": {
@@ -126,8 +128,8 @@ def _assert_created_text_delta_completed(events: list[dict]) -> None:
     assert events[1]["delta"] == "OK"
 
 
-async def _import_account(async_client, account_id: str, email: str) -> str:
-    auth_json = _make_auth_json(account_id, email)
+async def _import_account(async_client, account_id: str, email: str, *, plan_type: str = "plus") -> str:
+    auth_json = _make_auth_json(account_id, email, plan_type=plan_type)
     files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
     response = await async_client.post("/api/accounts/import", files=files)
     assert response.status_code == 200
@@ -1382,6 +1384,7 @@ def _make_dummy_bridge_session(session_key: proxy_module._HTTPBridgeSessionKey) 
         closed=False,
         account=SimpleNamespace(id=None, status=AccountStatus.ACTIVE, plan_type="plus"),
         request_model="gpt-5.4",
+        catalog_omission_quota_admission=None,
         pending_lock=anyio.Lock(),
         pending_requests=deque(),
         queued_request_count=0,
@@ -4001,6 +4004,86 @@ async def test_v1_responses_http_bridge_reuses_upstream_websocket_and_preserves_
     assert second_upstream_payload["client_metadata"]["x-openai-subagent"] == "collab_spawn"
     assert second_upstream_payload["client_metadata"]["x-codex-parent-thread-id"] == "parent-thread"
     assert second_upstream_payload["client_metadata"]["x-codex-window-id"] == "child-thread:0"
+
+
+@pytest.mark.asyncio
+async def test_v1_responses_http_bridge_reuses_quota_admitted_spark_account_omitted_from_catalog(
+    async_client,
+    monkeypatch,
+):
+    _install_bridge_settings(monkeypatch, enabled=True)
+    raw_account_id = "acc_http_bridge_spark_catalog_omission"
+    account_id = await _import_account(
+        async_client,
+        raw_account_id,
+        "http-bridge-spark-catalog-omission@example.com",
+        plan_type="pro",
+    )
+    account = await _get_account(account_id)
+    async with SessionLocal() as session:
+        additional_usage = AdditionalUsageRepository(session)
+        await additional_usage.add_entry(
+            account_id=account_id,
+            limit_name="GPT-5.3-Codex-Spark",
+            metered_feature="codex_bengalfox",
+            window="primary",
+            used_percent=0.0,
+            reset_at=None,
+            window_minutes=300,
+            recorded_at=utcnow(),
+        )
+
+    registry = SimpleNamespace(
+        get_snapshot=lambda: SimpleNamespace(account_plans={account_id: "pro"}),
+        account_ids_for_model=lambda _model: frozenset(),
+        plan_types_for_model=lambda _model: frozenset({"pro"}),
+    )
+    fake_upstream = _FakeBridgeUpstreamWebSocket()
+    connect_calls: list[tuple[str | None, str | None]] = []
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, base_url, session
+        connect_calls.append((account_id, account_id_header))
+        return fake_upstream
+
+    async def fail_legacy_stream(*args, **kwargs):
+        raise AssertionError("legacy core_stream_responses path must not be used when HTTP bridge is enabled")
+
+    monkeypatch.setattr("app.modules.proxy.load_balancer.get_model_registry", lambda: registry)
+    monkeypatch.setattr("app.modules.proxy._service.support.get_model_registry", lambda: registry)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fail_legacy_stream)
+
+    payload = {
+        "model": "gpt-5.3-codex-spark",
+        "instructions": "Return exactly OK.",
+        "input": "hello",
+        "prompt_cache_key": "http-bridge-spark-catalog-omission",
+    }
+    first = await async_client.post("/v1/responses", json=payload)
+    assert first.status_code == 200
+    first_body = first.json()
+
+    second = await async_client.post(
+        "/v1/responses",
+        json={**payload, "previous_response_id": first_body["id"]},
+    )
+    assert second.status_code == 200
+
+    assert connect_calls == [(account_id, account.chatgpt_account_id)]
+    assert len(fake_upstream.sent_text) == 2
 
 
 @pytest.mark.asyncio

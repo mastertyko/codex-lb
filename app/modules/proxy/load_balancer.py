@@ -138,12 +138,27 @@ class AccountLease:
     estimated_tokens: float = 0.0
 
 
+@dataclass(frozen=True, slots=True)
+class CatalogOmissionQuotaAdmission:
+    normalized_model: str
+    canonical_quota_key: str
+    normalized_effective_service_tier: str | None
+
+    def matches(self, *, requested_model: str, service_tier: str | None) -> bool:
+        return (
+            self.normalized_model == _normalize_model_id(requested_model)
+            and self.canonical_quota_key == _gated_limit_name_for_model(requested_model)
+            and self.normalized_effective_service_tier == _effective_model_service_tier(service_tier)
+        )
+
+
 @dataclass
 class AccountSelection:
     account: Account | None
     error_message: str | None
     error_code: str | None = None
     lease: AccountLease | None = None
+    catalog_omission_quota_admission: CatalogOmissionQuotaAdmission | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +199,7 @@ class _SelectionInputs:
     ignore_standard_quota_status: bool = False
     persist_standard_quota_status: bool = True
     routing_policy_override: str | None = None
+    quota_admitted_catalog_omission_account_ids: frozenset[str] = frozenset()
 
 
 SelectionInputs = _SelectionInputs
@@ -388,6 +404,9 @@ class LoadBalancer:
                     ignore_standard_quota_status=selection_inputs.ignore_standard_quota_status,
                     persist_standard_quota_status=selection_inputs.persist_standard_quota_status,
                     routing_policy_override=selection_inputs.routing_policy_override,
+                    quota_admitted_catalog_omission_account_ids=(
+                        selection_inputs.quota_admitted_catalog_omission_account_ids
+                    ),
                 )
             if excluded_ids and selection_inputs.accounts:
                 filtered_accounts = [account for account in selection_inputs.accounts if account.id not in excluded_ids]
@@ -415,6 +434,9 @@ class LoadBalancer:
                     ignore_standard_quota_status=selection_inputs.ignore_standard_quota_status,
                     persist_standard_quota_status=selection_inputs.persist_standard_quota_status,
                     routing_policy_override=selection_inputs.routing_policy_override,
+                    quota_admitted_catalog_omission_account_ids=(
+                        selection_inputs.quota_admitted_catalog_omission_account_ids
+                    ),
                 )
             return selection_inputs
 
@@ -829,7 +851,21 @@ class LoadBalancer:
             bool(sticky_key),
             model,
         )
-        return AccountSelection(account=selected_snapshot, error_message=None, error_code=None, lease=selected_lease)
+        return AccountSelection(
+            account=selected_snapshot,
+            error_message=None,
+            error_code=None,
+            lease=selected_lease,
+            catalog_omission_quota_admission=_catalog_omission_quota_admission(
+                account_id=selected_snapshot.id,
+                model=model,
+                service_tier=service_tier,
+                additional_limit_name=additional_limit_name,
+                quota_admitted_catalog_omission_account_ids=(
+                    selection_inputs.quota_admitted_catalog_omission_account_ids
+                ),
+            ),
+        )
 
     async def _load_selection_inputs(
         self,
@@ -1024,6 +1060,9 @@ class LoadBalancer:
                 latest_primary = standard_latest_primary
                 latest_secondary = standard_latest_secondary
                 ignore_standard_quota_account_ids = frozenset()
+            quota_admitted_catalog_omission_account_ids = frozenset(
+                account.id for account in accounts if account.id in model_catalog_omitted_account_ids
+            )
             selection_inputs = _SelectionInputs(
                 accounts=[_clone_account(account) for account in accounts],
                 latest_primary={
@@ -1041,6 +1080,7 @@ class LoadBalancer:
                 ignore_standard_quota_status=ignore_standard_quota_status,
                 persist_standard_quota_status=True,
                 routing_policy_override=routing_policy_override,
+                quota_admitted_catalog_omission_account_ids=quota_admitted_catalog_omission_account_ids,
             )
             await self._selection_inputs_cache.set(
                 _clone_selection_inputs(selection_inputs), key=cache_key, generation=load_generation
@@ -2561,6 +2601,39 @@ def _gated_limit_name_for_model(model: str | None) -> str | None:
     return get_additional_quota_key_for_model_id(model)
 
 
+def _normalize_model_id(model: str) -> str:
+    return model.strip().lower()
+
+
+def _effective_model_service_tier(service_tier: str | None) -> str | None:
+    normalized_service_tier = service_tier.strip().lower() if service_tier is not None else None
+    return None if normalized_service_tier in {None, "auto", "default"} else normalized_service_tier
+
+
+def _catalog_omission_quota_admission(
+    *,
+    account_id: str,
+    model: str | None,
+    service_tier: str | None,
+    additional_limit_name: str | None,
+    quota_admitted_catalog_omission_account_ids: frozenset[str],
+) -> CatalogOmissionQuotaAdmission | None:
+    if (
+        model is None
+        or additional_limit_name is not None
+        or account_id not in quota_admitted_catalog_omission_account_ids
+    ):
+        return None
+    quota_key = _gated_limit_name_for_model(model)
+    if quota_key is None:
+        return None
+    return CatalogOmissionQuotaAdmission(
+        normalized_model=_normalize_model_id(model),
+        canonical_quota_key=quota_key,
+        normalized_effective_service_tier=_effective_model_service_tier(service_tier),
+    )
+
+
 def _mapped_model_has_registry_entry(model: str | None) -> bool:
     if model is None:
         return False
@@ -2631,6 +2704,9 @@ def _clone_selection_inputs(selection_inputs: SelectionInputs) -> SelectionInput
         ignore_standard_quota_status=selection_inputs.ignore_standard_quota_status,
         persist_standard_quota_status=selection_inputs.persist_standard_quota_status,
         routing_policy_override=selection_inputs.routing_policy_override,
+        quota_admitted_catalog_omission_account_ids=frozenset(
+            selection_inputs.quota_admitted_catalog_omission_account_ids
+        ),
     )
 
 
