@@ -229,6 +229,7 @@ async def test_additional_latest_by_account_sqlite_avoids_window_function_for_la
         finally:
             event.remove(engine.sync_engine, "before_cursor_execute", capture_statement)
 
+    assert sum(statement.lstrip().lower().startswith("select") for statement in statements) == 1
     assert set(latest.keys()) == {"acc1", "acc2"}
     assert latest["acc1"].used_percent == 20.0
     assert latest["acc2"].used_percent == 30.0
