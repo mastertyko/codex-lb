@@ -49,8 +49,29 @@ Selector and dashboard hot-path reads MUST avoid unbounded SQL window-ranking ov
 - **WHEN** the schema migration for dashboard query hot paths is applied
 - **THEN** the migration MUST complete without duplicate-index failure
 
+### Requirement: Dashboard reads avoid hot-path full-history recomputation
+
+The system SHALL keep dashboard hot-path database reads bounded by the data needed for the requested response whenever the existing API contract allows it. Dashboard query shapes MUST NOT combine a limited page fetch with an unbounded window aggregate that forces the database to materialize the entire filtered result before returning the page.
+
+`GET /api/request-logs` MUST fetch request-log rows using a latest-first limited page query. If the response includes exact total metadata, the exact count MUST be computed using a separate count query or an equivalent cached/source-structured summary, not by adding `count(*) OVER()` to the paginated row query.
+
+#### Scenario: Request-log page query does not materialize the full filtered result
+
+- **GIVEN** the request-log table contains many rows matching the active filters
+- **WHEN** the dashboard requests `GET /api/request-logs?limit=25&offset=0`
+- **THEN** the row-fetch query returns only the requested page ordered by newest request first
+- **AND** the row-fetch query does not include `count(*) OVER()` or an equivalent unbounded window aggregate
+- **AND** the response still includes correct `total` and `hasMore` metadata
+
+#### Scenario: Source-structured summaries remain available for broader dashboard optimization
+
+- **GIVEN** a dashboard read repeatedly aggregates large raw histories such as request logs or usage history
+- **WHEN** the aggregation cost dominates dashboard latency
+- **THEN** the system MAY move that read to a cached, incremental, or source-structured summary so the dashboard does not repeatedly scan raw history on every poll
+- **AND** the summary contract MUST preserve the externally visible dashboard semantics
+
 ### Requirement: Dashboard overview memoizes per-account depletion EWMA state
-`GET /api/dashboard/overview` MUST cache per-account EWMA depletion state in memory so repeated polls do not re-walk the full in-window `usage_history` slice in the depletion cache check when its content is unchanged.
+`GET /api/dashboard/overview` MUST cache per-account EWMA depletion state in memory so repeated polls do not re-walk the full in-window `usage_history` slice in the depletion cache check when its content is unchanged. SQLite bulk history cache hits MUST avoid rebuilding or materializing the full cached history window when compact digest metadata proves older rows are unchanged; they MUST append newly inserted rows by monotonic row ID and reuse the cached grouped history for older rows. Repository-owned mutations that reassign or delete usage-history rows MUST clear the SQLite bulk history cache.
 
 #### Scenario: Repeated polls with unchanged history reuse cached EWMA state
 - **GIVEN** the dashboard service has previously computed depletion for an account
@@ -76,6 +97,25 @@ Selector and dashboard hot-path reads MUST avoid unbounded SQL window-ranking ov
 - **THEN** the service MUST rebuild the EWMA state from the corrected history slice
 - **AND** the recomputed rate-bearing metrics MUST reflect the corrected row content
 
+
+#### Scenario: SQLite bulk history cache hit appends only new rows
+- **GIVEN** a SQLite bulk usage-history query has already cached rows for an account/window set
+- **WHEN** a later query uses a narrower `since` timestamp and the database only has new rows with IDs greater than the cached max ID
+- **THEN** the repository fetches the new rows and appends them to the cached grouped history
+- **AND** it does not materialize the older cached rows as snapshots when compact digest metadata proves they are unchanged
+
+#### Scenario: Usage-history ownership mutation clears SQLite bulk history cache
+- **WHEN** an account merge or delete operation updates or deletes `usage_history` rows
+- **THEN** the repository clears the SQLite bulk history cache before serving future cached dashboard history reads
+
+### Requirement: Additional usage latest reads avoid SQLite window scans
+
+Additional usage latest-per-account reads on SQLite MUST avoid `row_number()` window-function scans over the full `additional_usage_history` table. They MUST select matching accounts, then use indexed latest-row lookups ordered by `recorded_at DESC, used_percent DESC, id DESC` while preserving canonical quota-key and alias matching semantics. Non-SQLite dialects MAY keep the set-based window-function query.
+
+#### Scenario: SQLite additional usage latest lookup uses indexed account probes
+- **WHEN** additional usage latest rows are requested for a quota key, window, and optional account set on SQLite
+- **THEN** the repository returns the same latest row per account as the set-based query
+- **AND** the SQLite path does not emit a `row_number()` window-function query
 
 ### Requirement: Selector retry hint is bounded by the auto-recovery window
 

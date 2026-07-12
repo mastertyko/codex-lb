@@ -14,4 +14,4 @@
 - [x] 3.1 Add integration regression coverage that verifies the hot-path emitted SQL does not use window ranking and preserves summary/latest-row semantics.
 - [x] 3.2 Run targeted pytest for dashboard/query OOM regressions.
 - [x] 3.3 Run ruff check, ruff format check, and ty check.
-- [ ] 3.4 Validate the OpenSpec change when the OpenSpec CLI is available.
+- [x] 3.4 Validate the OpenSpec change when the OpenSpec CLI is available.

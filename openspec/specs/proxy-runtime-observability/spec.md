@@ -27,7 +27,7 @@ When the proxy resolves or fails closed a continuity-sensitive follow-up request
 - **AND** Prometheus counters record the low-cardinality source or reason labels for that decision
 
 ### Requirement: Full upstream conversation archive
-The proxy MUST provide an opt-in durable archive of Codex-to-upstream conversation traffic. When enabled, the archive MUST write gzip-compressed newline-delimited JSON records for upstream request payloads, streamed Responses events, compact response payloads, and websocket text or binary frames without performing gzip file I/O in the request event loop during normal operation. The archive writer queue MUST be bounded and MUST apply synchronous write backpressure instead of growing without limit when the background writer is saturated. Archive records MUST include request id, timestamp, direction, traffic kind, transport, account id when known, upstream target metadata, redacted headers, and the full payload or frame body. Credential-bearing headers such as authorization, cookies, proxy authorization, token headers, and API key headers MUST be redacted before persistence. JSON records MUST preserve non-ASCII payload text as UTF-8 rather than Unicode escape sequences. When disabled, no archive file MUST be created by the archive writer.
+The proxy MUST provide an opt-in durable archive of Codex-to-upstream conversation traffic. When enabled, the archive MUST write gzip-compressed newline-delimited JSON records for upstream request payloads, streamed Responses events, compact response payloads, and websocket text or binary frames without performing gzip file I/O in the request event loop during normal operation. The archive writer queue MUST be bounded and MUST apply synchronous write backpressure instead of growing without limit when the background writer is saturated. Archive records MUST include request id, timestamp, direction, traffic kind, transport, account id when known, upstream target metadata, redacted headers, and the full payload or frame body. Credential-bearing headers such as authorization, cookies, proxy authorization, token headers, and API key headers MUST be redacted before persistence. JSON records MUST preserve non-ASCII payload text as UTF-8 rather than Unicode escape sequences. When disabled, no archive file MUST be created by the archive writer. Direct-WebSocket inbound frames MUST be attributed to the same pending request selected by downstream response matching. A `response.created` frame without a string response id MUST remain unattributed and MUST NOT fall through to the first unassigned pending request.
 
 #### Scenario: operator enables archive for audit
 - **WHEN** `CODEX_LB_CONVERSATION_ARCHIVE_ENABLED=true`
@@ -43,6 +43,12 @@ The proxy MUST provide an opt-in durable archive of Codex-to-upstream conversati
 - **GIVEN** conversation archive files exist as `.jsonl.gz` or legacy `.jsonl`
 - **WHEN** an authenticated dashboard operator opens an existing request log detail
 - **THEN** the dashboard can find matching archive records by request id across archive files and display payload plus metadata for that request
+
+#### Scenario: malformed created frame remains unattributed
+- **GIVEN** one or more direct-WebSocket requests are pending archive attribution
+- **WHEN** upstream sends `response.created` without a string response id
+- **THEN** the inbound archive record has no request id attribution
+- **AND** no pending request is claimed by that malformed frame
 
 ### Requirement: Optional upstream payload tracing
 When request-shape tracing for proxy routing is enabled, the system MUST log affinity decision metadata without exposing full prompt text or full cache keys. The trace MUST include request id, request kind, sticky kind, sticky-key source, whether a session header was present, whether a prompt-cache key was set/injected, and a stable tools hash when tools are present.
