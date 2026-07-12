@@ -33,11 +33,13 @@ from app.core.errors import openai_error
 from app.core.utils.request_id import get_request_id, reset_request_scope_id, set_request_scope_id
 from app.db.models import AccountStatus, HttpBridgeSessionState
 from app.modules.proxy import service as proxy_service
+from app.modules.proxy._service import support as proxy_support_module
 from app.modules.proxy._service.http_bridge import helpers as http_bridge_helpers_module
 from app.modules.proxy._service.http_bridge import mixin as http_bridge_mixin_module
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
 from app.modules.proxy.account_cache import clear_account_routing_unavailable, mark_account_routing_unavailable
 from app.modules.proxy.http_bridge_forwarding import OwnerForwardRelayFailure
+from app.modules.proxy.load_balancer import CatalogOmissionQuotaAdmission
 
 pytestmark = pytest.mark.unit
 
@@ -9525,6 +9527,106 @@ async def test_forwarded_unanchored_request_keeps_owner_side_fork_local_when_has
     assert resolved.key.strength == "hard"
     assert canonical.request_model == "gpt-5.2"
     owner_instance.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch_source", ["registered", "inflight"])
+async def test_forwarded_prompt_cache_mismatch_fork_stays_on_receiving_owner(
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch_source: str,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    service._ring_membership = None
+    settings = _make_app_settings(
+        http_responses_session_bridge_instance_id="instance-a",
+        http_responses_session_bridge_instance_ring=["instance-a", "instance-b"],
+    )
+    canonical_key = proxy_service._HTTPBridgeSessionKey("prompt_cache", "forwarded-prompt-1", None)
+    canonical = _make_bridge_session(key=canonical_key, key_value=canonical_key.affinity_key)
+    canonical.request_model = "gpt-5.3-codex-spark"
+    canonical.request_service_tier = None
+    canonical.account.plan_type = "pro"
+    canonical.catalog_omission_quota_admission = CatalogOmissionQuotaAdmission(
+        normalized_model="gpt-5.3-codex-spark",
+        canonical_quota_key="codex_spark",
+        normalized_effective_service_tier=None,
+    )
+    if mismatch_source == "registered":
+        service._http_bridge_sessions[canonical_key] = canonical
+    else:
+        inflight = asyncio.get_running_loop().create_future()
+        inflight.set_result(canonical)
+        service._http_bridge_inflight_sessions[canonical_key] = inflight
+
+    class Registry:
+        def account_ids_for_model(self, model: str) -> set[str]:
+            assert model == "gpt-5.3-codex-spark"
+            return set()
+
+        def plan_types_for_model(self, model: str) -> set[str]:
+            assert model == "gpt-5.3-codex-spark"
+            return {"pro"}
+
+        def get_snapshot(self) -> SimpleNamespace:
+            return SimpleNamespace(account_plans={canonical.account.id: "pro"})
+
+    async def create_session(key: proxy_service._HTTPBridgeSessionKey, **_kwargs: object):
+        return _make_bridge_session(key=key, key_value=key.affinity_key)
+
+    monkeypatch.setattr(service, "_prune_http_bridge_sessions_locked", Mock(return_value=[]))
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_session)
+    monkeypatch.setattr(service, "_claim_durable_http_bridge_session", AsyncMock())
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(proxy_support_module, "get_model_registry", lambda: Registry())
+
+    request_scope_id = "forwarded-request-scope"
+    expected_fork_key = proxy_service._HTTPBridgeSessionKey(
+        "internal_request_parallel",
+        "95427abf10b750a60b5a5d3528343e28c89e8c3a3e428ae51df95534cbf803b3",
+        None,
+    )
+    assert (
+        await http_bridge_helpers_module._http_bridge_owner_instance(
+            canonical_key,
+            settings,
+        )
+        == "instance-a"
+    )
+    assert (
+        await http_bridge_helpers_module._http_bridge_owner_instance(
+            expected_fork_key,
+            settings,
+        )
+        == "instance-b"
+    )
+
+    scope_token = set_request_scope_id(request_scope_id)
+    try:
+        resolved = await service._get_or_create_http_bridge_session(
+            canonical_key,
+            headers={},
+            affinity=proxy_service._AffinityPolicy(key=canonical_key.affinity_key),
+            api_key=None,
+            request_model="gpt-5.3-codex-spark",
+            request_service_tier="priority",
+            idle_ttl_seconds=120.0,
+            max_sessions=8,
+            allow_forward_to_owner=True,
+            forwarded_request=True,
+            forwarded_original_request_unanchored=False,
+            forwarded_affinity_kind="prompt_cache",
+            forwarded_affinity_key=canonical_key.affinity_key,
+        )
+    finally:
+        reset_request_scope_id(scope_token)
+
+    assert isinstance(resolved, proxy_service._HTTPBridgeSession)
+    assert resolved.key == expected_fork_key
+    assert canonical.closed is False
+    assert canonical.request_model == "gpt-5.3-codex-spark"
+    assert canonical.request_service_tier is None
+    if mismatch_source == "registered":
+        assert service._http_bridge_sessions[canonical_key] is canonical
 
 
 @pytest.mark.asyncio

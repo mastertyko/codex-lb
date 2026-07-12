@@ -4395,6 +4395,201 @@ async def test_v1_responses_http_bridge_forks_incompatible_prompt_cache_waiter_w
 
 
 @pytest.mark.asyncio
+async def test_forwarded_priority_prompt_cache_mismatch_forks_on_canonical_owner(
+    async_client,
+    app_instance,
+    monkeypatch,
+):
+    from app.core.middleware import request_id as request_id_middleware_module
+    from app.modules.proxy import api as proxy_api_module
+    from app.modules.proxy.http_bridge_forwarding import HTTPBridgeForwardContext, build_owner_forward_headers
+
+    owner_settings = _make_app_settings(
+        enabled=True,
+        instance_id="instance-a",
+        instance_ring=["instance-a", "instance-b"],
+    )
+    origin_settings = _make_app_settings(
+        enabled=True,
+        instance_id="instance-b",
+        instance_ring=["instance-a", "instance-b"],
+    )
+    _install_proxy_settings(
+        monkeypatch,
+        app_settings=owner_settings,
+        dashboard_settings=_make_dashboard_settings(),
+    )
+    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: owner_settings)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_forwarded_prompt_mismatch",
+        "http-bridge-forwarded-prompt-mismatch@example.com",
+        plan_type="pro",
+    )
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+
+    class Registry:
+        def get_snapshot(self):
+            return SimpleNamespace(account_plans={account_id: "pro"})
+
+        def account_ids_for_model(self, model: str) -> frozenset[str]:
+            assert model == "gpt-5.3-codex-spark"
+            return frozenset()
+
+        def plan_types_for_model(self, model: str) -> frozenset[str]:
+            assert model == "gpt-5.3-codex-spark"
+            return frozenset({"pro"})
+
+        def account_ids_for_model_service_tier(self, model: str, service_tier: str) -> frozenset[str]:
+            assert (model, service_tier) == ("gpt-5.3-codex-spark", "priority")
+            return frozenset()
+
+        def plan_types_for_model_service_tier(self, model: str, service_tier: str) -> frozenset[str]:
+            assert (model, service_tier) == ("gpt-5.3-codex-spark", "priority")
+            return frozenset({"pro"})
+
+    async def fake_select_account_with_budget(
+        self,
+        deadline,
+        *,
+        service_tier=None,
+        **kwargs,
+    ):
+        del self, deadline, kwargs
+        normalized_service_tier = (
+            None
+            if service_tier is None or service_tier.strip().lower() in {"auto", "default"}
+            else service_tier.strip().lower()
+        )
+        return AccountSelection(
+            account=account,
+            error_message=None,
+            error_code=None,
+            catalog_omission_quota_admission=CatalogOmissionQuotaAdmission(
+                normalized_model="gpt-5.3-codex-spark",
+                canonical_quota_key="codex_spark",
+                normalized_effective_service_tier=normalized_service_tier,
+            ),
+        )
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    upstreams: list[_FakeBridgeUpstreamWebSocket] = []
+
+    async def fake_connect_responses_websocket(
+        headers,
+        access_token,
+        account_id_header,
+        *,
+        base_url=None,
+        session=None,
+    ):
+        del headers, access_token, account_id_header, base_url, session
+        upstream = _FakeBridgeUpstreamWebSocket()
+        upstreams.append(upstream)
+        return upstream
+
+    async def fail_legacy_stream(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("legacy core_stream_responses path must not be used when HTTP bridge is enabled")
+
+    class Ring:
+        async def list_active(self, *, require_endpoint: bool = False) -> list[str]:
+            assert require_endpoint is True
+            return ["instance-a", "instance-b"]
+
+        async def resolve_endpoint(self, instance_id: str) -> str:
+            return f"http://{instance_id}"
+
+    monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fail_legacy_stream)
+    monkeypatch.setattr(request_id_middleware_module, "uuid4", lambda: "forwarded-request-scope")
+
+    ring = cast(Any, Ring())
+    original_ring = service._ring_membership
+    service._ring_membership = ring
+    canonical_key = proxy_module._HTTPBridgeSessionKey("prompt_cache", "forwarded-prompt-1", None)
+    fork_key = proxy_module._HTTPBridgeSessionKey(
+        "internal_request_parallel",
+        "95427abf10b750a60b5a5d3528343e28c89e8c3a3e428ae51df95534cbf803b3",
+        None,
+    )
+    assert await proxy_module._http_bridge_owner_instance(canonical_key, owner_settings, ring) == "instance-a"
+    assert await proxy_module._http_bridge_owner_instance(canonical_key, origin_settings, ring) == "instance-a"
+    assert await proxy_module._http_bridge_owner_instance(fork_key, owner_settings, ring) == "instance-b"
+
+    scheduled_sessions: list[proxy_module._HTTPBridgeSession] = []
+    schedule_session_closes = service._schedule_http_bridge_session_closes
+
+    def capture_scheduled_sessions(sessions, *, reason):
+        scheduled_sessions.extend(sessions)
+        schedule_session_closes(sessions, reason=reason)
+
+    monkeypatch.setattr(service, "_schedule_http_bridge_session_closes", capture_scheduled_sessions)
+    creator_payload = {
+        "model": "gpt-5.3-codex-spark",
+        "instructions": "Return exactly OK.",
+        "input": "hello",
+        "prompt_cache_key": canonical_key.affinity_key,
+    }
+    priority_payload = proxy_module.ResponsesRequest.model_validate(
+        {**creator_payload, "input": "hello priority", "service_tier": "priority"}
+    )
+    forward_context = HTTPBridgeForwardContext(
+        origin_instance="instance-b",
+        target_instance="instance-a",
+        codex_session_affinity=False,
+        downstream_turn_state=None,
+        original_request_unanchored=False,
+        original_affinity_kind=canonical_key.affinity_kind,
+        original_affinity_key=canonical_key.affinity_key,
+    )
+    forward_headers = build_owner_forward_headers(
+        headers={"x-request-id": "forwarded-priority-request"},
+        payload=priority_payload,
+        context=forward_context,
+    )
+
+    try:
+        creator_response = await async_client.post(
+            "/v1/responses",
+            json=creator_payload,
+            headers={"x-request-id": "creator-request"},
+        )
+        assert creator_response.status_code == 200, creator_response.text
+        creator_session = service._http_bridge_sessions[canonical_key]
+        creator_response_ids = set(creator_session.previous_response_ids)
+
+        priority_response = await async_client.post(
+            "/internal/bridge/responses",
+            json=priority_payload.model_dump_for_forwarding(),
+            headers=forward_headers,
+        )
+
+        assert priority_response.status_code == 200, priority_response.text
+        assert creator_response.json()["output"][0]["content"][0]["text"] == "OK"
+        assert '"type":"response.completed"' in priority_response.text
+        assert '"text":"OK"' in priority_response.text
+        assert len(upstreams) == 2
+        assert creator_session.upstream is upstreams[0]
+        assert service._http_bridge_sessions[fork_key].upstream is upstreams[1]
+        assert creator_session.closed is False
+        assert service._http_bridge_sessions[canonical_key] is creator_session
+        assert creator_session not in scheduled_sessions
+        assert creator_session.request_service_tier is None
+        assert service._http_bridge_sessions[fork_key].request_service_tier == "priority"
+        assert creator_response_ids <= creator_session.previous_response_ids
+    finally:
+        service._ring_membership = original_ring
+
+
+@pytest.mark.asyncio
 async def test_v1_responses_http_bridge_injects_interrupted_custom_tool_output_on_followup(
     async_client,
     monkeypatch,

@@ -87,6 +87,7 @@ from app.modules.proxy._service.http_bridge.helpers import (
     _http_bridge_eviction_priority,
     _http_bridge_has_durable_recovery_anchor,
     _http_bridge_key_strength,
+    _http_bridge_locally_owned_fork_key,
     _http_bridge_models_compatible,
     _http_bridge_owner_check_required,
     _http_bridge_owner_instance,
@@ -483,7 +484,8 @@ class _HTTPBridgeMixin(
             else None
         )
         old_account_id: str | None = None
-        force_durable_takeover_after_detach = own_fork_locally = used_session_header_fallback = False
+        force_durable_takeover_after_detach = used_session_header_fallback = False
+        locally_owned_fork_key: _HTTPBridgeSessionKey | None = None
         model_transition_parent_key: _HTTPBridgeSessionKey | None = None
         while True:
             inflight_future: asyncio.Future[_HTTPBridgeSession] | None = None
@@ -636,7 +638,9 @@ class _HTTPBridgeMixin(
                     key = fork_key
                     durable_lookup = None
                     force_durable_takeover_after_detach = False
-                    own_fork_locally = forwarded_request and forwarded_original_request_unanchored
+                    locally_owned_fork_key = _http_bridge_locally_owned_fork_key(
+                        fork_key, forwarded_request, forwarded_original_request_unanchored
+                    )
                     continue
                 if retained_handoff and not reusable:
                     _raise_http_bridge_incompatible_admission_handoff()
@@ -699,7 +703,7 @@ class _HTTPBridgeMixin(
                     owner_instance = _durable_bridge_lookup_active_owner(durable_lookup)
                     hard_continuity_lookup = owner_check_required or previous_response_id is not None
                     ring_lookup_failed = False
-                    if own_fork_locally:
+                    if key == locally_owned_fork_key:
                         owner_instance = settings.http_responses_session_bridge_instance_id
                     if owner_instance is None:
                         try:
@@ -1323,6 +1327,9 @@ class _HTTPBridgeMixin(
                     model_transition_parent_key, key = key, fork_key
                     durable_lookup = None
                     force_durable_takeover_after_detach = False
+                    locally_owned_fork_key = _http_bridge_locally_owned_fork_key(
+                        fork_key, forwarded_request, forwarded_original_request_unanchored
+                    )
                     continue
                 if (
                     not session.closed

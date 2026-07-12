@@ -772,6 +772,20 @@ def _http_bridge_incompatible_model_fork_key(
     return fork_key
 
 
+def _http_bridge_locally_owned_fork_key(
+    fork_key: "_HTTPBridgeSessionKey",
+    forwarded_request: bool,
+    forwarded_original_request_unanchored: bool,
+) -> "_HTTPBridgeSessionKey | None":
+    if not forwarded_request:
+        return None
+    if fork_key.affinity_kind == "internal_request_parallel":
+        return fork_key
+    if forwarded_original_request_unanchored and fork_key.affinity_kind == "internal_unanchored_parallel":
+        return fork_key
+    return None
+
+
 def _http_bridge_parallel_fork_key(
     *,
     key: "_HTTPBridgeSessionKey",

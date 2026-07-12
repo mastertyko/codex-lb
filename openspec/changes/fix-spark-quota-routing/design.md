@@ -29,6 +29,8 @@ The synchronous bridge request-compatibility predicate is applied before every e
 
 For a genuine general-catalog omission, every reuse check also re-evaluates the registry's current plan or requested service-tier plan eligibility. Provenance records the quota-backed omission decision but does not freeze an account's former plan eligibility. Compatibility failure is local to the current request: an unanchored request receives a collision-resistant request-scope fork, while an anchored request fails closed. Neither outcome detaches, closes, replaces, or rewrites the shared live session.
 
+When a request has already been forwarded to the canonical owner and compatibility creates an `internal_request_parallel` fork, that request-local fork stays on the receiving owner even if its derived key rendezvous-hashes to another replica. The local-ownership marker is bound to that exact derived fork key and is assigned from both the existing-session mismatch and in-flight-waiter mismatch paths, preventing a second hop without changing ownership for canonical keys, ordinary unforwarded forks, or later unrelated key iterations.
+
 Live alias targets are preserved on request incompatibility. Previous-response and turn-state index entries are removed only when their target session is missing, closed, or inactive; a mismatch leaves those indexes, the session registry, close scheduling, and stored request model and service tier unchanged so a later compatible request can still resolve the owner.
 
 ## Risks / Trade-offs

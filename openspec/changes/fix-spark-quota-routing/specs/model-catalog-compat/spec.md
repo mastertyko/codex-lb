@@ -45,6 +45,16 @@ For a model canonically mapped to a separately metered additional quota, account
 - **AND** live previous-response and turn-state aliases remain unchanged so a subsequent compatible request can resolve and reuse the owner
 - **AND** an alias mapping is removed only when its target is missing, closed, or inactive
 
+#### Scenario: Forwarded prompt-cache mismatch forks on the receiving owner
+
+- **GIVEN** two bridge replicas agree that a prompt-cache key belongs to one canonical owner
+- **AND** that owner has an open quota-admitted Spark session whose effective service tier is incompatible with a priority request already forwarded to the owner
+- **AND** the priority request's collision-resistant `internal_request_parallel` fork key rendezvous-hashes to the other replica
+- **WHEN** compatibility rejects either the registered session or a session returned to an in-flight creation waiter
+- **THEN** the receiving canonical owner creates and owns the request-local mismatch fork without forwarding again
+- **AND** both requests can complete on independent transports while the creator session remains open and registered
+- **AND** normal rendezvous ownership remains unchanged for canonical prompt-cache, session, turn-state, previous-response, and unforwarded fork keys
+
 #### Scenario: Catalog-supported account-level service-tier exclusion remains authoritative
 
 - **GIVEN** an authoritative general per-account catalog includes a mapped separately metered model for two plan-compatible accounts
