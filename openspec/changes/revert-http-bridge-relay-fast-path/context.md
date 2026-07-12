@@ -18,7 +18,7 @@ Those upstream implementations supersede the older local sequence/replay and bro
 
 ## Decision Rationale and Alternatives
 
-The chosen release shape is a selective runtime restore, not a causal bug fix. Reverting only the lock would leave untested timeout, parsing, queue, and scheduling deltas. Reverting the whole commit would unnecessarily delete the HTTP benchmark. Holding every performance change would discard work outside the failing path. The selected boundary keeps beta.3 bridge semantics and unrelated optimizations, while the retained benchmark justifies one bounded relay checkpoint: on the release Python runtime, immediately available frames otherwise starve a ready enqueue until the prebuffered burst drains.
+The chosen release shape is a selective runtime restore, not a causal bug fix. Reverting only the lock would leave untested timeout, parsing, queue, and scheduling deltas. Reverting the whole commit would unnecessarily delete the HTTP benchmark. Holding every performance change would discard work outside the failing path. The selected boundary keeps beta.3 HTTP bridge scheduling byte- and semantically unchanged and retains unrelated optimizations. A benchmark observation that a ready enqueue waits behind a finite prebuffered burst is not live-safety proof and does not justify changing the production scheduler; the prior HTTP scheduling optimization remains excluded pending a separate reviewed canary.
 
 Close attribution uses existing request-log columns. A finite reason is supplied by the caller rather than inferred from final session state. The per-request draining flag determines whether an otherwise unattributed failure can be classified as downstream; non-draining closes remain bridge lifecycle failures.
 
@@ -32,7 +32,7 @@ Close attribution uses existing request-log columns. A finite reason is supplied
 
 ## Operational Notes
 
-Before any canary, run the focused HTTP bridge and request-log tests, the deterministic HTTP benchmark, static and OpenSpec checks, and the full test suite. During canary, separate upstream abnormal closes from local bridge closes and group local closes by finite close reason and draining state. Do not interpret a draining local close as a proven client cancellation without the recorded flag, and do not infer causality from aggregate windows whose cohorts differ.
+Before any canary, run the focused HTTP bridge and request-log tests, the deterministic HTTP benchmark, static and OpenSpec checks, and the full test suite. Treat the benchmark as deterministic routing, ownership, archive, order, cancellation, timeout, sentinel, cleanup, and timing evidence—not as live-safety evidence for a scheduler change. During canary, separate upstream abnormal closes from local bridge closes and group local closes by finite close reason and draining state. Do not interpret a draining local close as a proven client cancellation without the recorded flag, and do not infer causality from aggregate windows whose cohorts differ.
 
 ## Related Contracts
 

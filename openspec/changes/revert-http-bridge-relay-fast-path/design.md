@@ -17,6 +17,7 @@ The release candidate therefore keeps beta.3's HTTP runtime unchanged, reapplies
 **Non-Goals:**
 
 - Claim that the optimized relay caused the canary failures.
+- Use benchmark ready-task timing as evidence to change beta.3 HTTP relay scheduling without a separate reviewed canary.
 - Suppress, reclassify away, or retry `stream_incomplete` failures.
 - Change database schemas, public APIs, dependencies, bridge admission, routing, idle TTL, or durable ownership.
 - Weaken or replace beta.3 admission, reconnect-affinity, incomplete-reason, owner-replay, sequence, migration, version, dependency, or unrelated release behavior.
@@ -26,7 +27,7 @@ The release candidate therefore keeps beta.3's HTTP runtime unchanged, reapplies
 
 ### Retain the beta.3 HTTP bridge runtime bundle atomically
 
-Beta.3 already uses the default AnyIO pending lock, `asyncio.wait_for` receive and event-queue waits, eager event parsing and previous response/error derivation, and awaited queue puts. Keep those semantics and its production `rewrite_parallel_tool_call_text` caller unchanged. The retained deterministic benchmark showed that, on the release Python runtime, immediately available frames can still drain a prebuffered burst before a ready enqueue runs. Add only a bounded 32-frame fairness checkpoint, initialized to yield after the first processed text frame, without restoring the rejected lock, parsing, timeout, or non-awaiting queue fast paths. The local rollback otherwise contributes its deterministic HTTP benchmark and corrected cleanup/attribution contracts, not a historical bridge-file replacement.
+Beta.3 already uses the default AnyIO pending lock, `asyncio.wait_for` receive and event-queue waits, eager event parsing and previous response/error derivation, awaited queue puts, and no explicit frame-count scheduler checkpoint. Keep that implementation and its production `rewrite_parallel_tool_call_text` caller unchanged. The retained deterministic benchmark measures production routing, ownership, archive attribution, order, cancellation, contention, receive timeout, terminal sentinels, cleanup, and throughput; it MUST NOT require a ready enqueue to run before a finite prebuffered burst drains or treat such timing as live-safety proof. The prior HTTP scheduling optimization remains excluded pending a separate reviewed canary. The local rollback contributes its deterministic HTTP benchmark and corrected cleanup/attribution contracts, not a historical bridge-file replacement or a new scheduling bundle.
 
 Alternative: replay `d1d02044` or restore files from the pre-beta branch. Rejected because that would overwrite upstream admission-waiter, lane-isolation, replay, and affinity work even though the runtime rollback is already satisfied.
 
@@ -50,7 +51,7 @@ Alternative: filter draining requests out of the cleanup list. Rejected because 
 
 ### Retain the benchmark and rebaseline only legitimate payload changes
 
-Keep the real HTTP relay benchmark on the restored default lock and retain routing, archive attribution, order, cancellation, contention, receive timeout, terminal sentinel, cleanup, and ready-enqueue fairness checks. Keep its locked correctness digest unchanged; update timing references only when a measured restored-runtime baseline justifies it.
+Keep the real HTTP relay benchmark on beta.3 production scheduling and retain finite prebuffered-burst routing and ownership, archive attribution, order, cancellation, contention, receive timeout, terminal sentinel, cleanup, fast-consumer, and backlogged-consumer checks. Remove the ready-enqueue scheduling assertion and update the locked digest only because its correctness payload no longer includes that assertion; update timing references only when a measured beta.3-runtime baseline justifies it.
 
 ## Risks / Trade-offs
 

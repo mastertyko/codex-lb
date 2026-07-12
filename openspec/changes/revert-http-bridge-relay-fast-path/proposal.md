@@ -8,9 +8,9 @@ The integration base is the upstream `v1.21.0-beta.3` release commit `a225f0db0c
 
 ## What Changes
 
-- Retain beta.3's default pending lock, `asyncio.wait_for` receive and queue waits, eager HTTP event parsing, response/error derivation, awaited queue puts, and relay behavior; do not restore pre-beta source over the upstream bridge implementation.
+- Preserve beta.3's default pending lock, `asyncio.wait_for` receive and queue waits, eager HTTP event parsing, response/error derivation, awaited queue puts, and relay scheduling unchanged; keep the prior HTTP scheduling optimization excluded pending a separate reviewed canary.
 - Keep the eager HTTP `rewrite_parallel_tool_call_text` contract and remove no beta.3 API that still has a production caller.
-- Retain and rebaseline the deterministic HTTP-bridge benchmark against the restored runtime without weakening routing, archive attribution, order, cancellation, contention, timeout, sentinel, or cleanup contracts.
+- Retain and rebaseline the deterministic HTTP-bridge benchmark against beta.3 production semantics without weakening routing, ownership, archive attribution, order, cancellation, contention, timeout, sentinel, or cleanup contracts and without requiring a scheduler yield during a finite prebuffered burst.
 - Record a finite local bridge-close reason and whether each failed request was already draining in the existing `failure_phase` and `failure_detail` fields, without suppressing `stream_incomplete` or changing persisted schemas.
 - Preserve the current live stale-diagnostic behavior and add regression coverage for draining idle-prune and non-draining close attribution.
 - Preserve shared HTTP/direct-WebSocket reservation settlement before account health, exclude draining or initially-unsettled cleanup from health penalties, batch partial-release retries, retain post-take ownership across foreground cancellation, and make shutdown cancellation await exactly-once finalizers and all repository-using cleanup.

@@ -31,7 +31,7 @@ _REQUEST_COUNT = 8
 _DELTA_COUNT = 64
 _EVENTS_PER_REQUEST = _DELTA_COUNT + 3
 _TOTAL_EVENT_COUNT = _REQUEST_COUNT * _EVENTS_PER_REQUEST
-_EXPECTED_CORRECTNESS_DIGEST = "97b1314a65c626f83e76337f9489ee9a373dd5c3b411122b61335ae8b71ffa5b"
+_EXPECTED_CORRECTNESS_DIGEST = "9d334ecc15ad699bfe811fc641c9eb7c3282a913eb80b200fb65dff5b8ff4955"
 _REFERENCE_NS_PER_EVENT: dict[str, float] = {
     "relay_fast": 65_301.694,
     "relay_backlogged": 58_881.375,
@@ -119,17 +119,6 @@ class _QueuedUpstream(_FakeUpstream):
 
     def push(self, message: UpstreamWebSocketMessage) -> None:
         self._queue.put_nowait(message)
-
-
-class _SignalingUpstream(_FakeUpstream):
-    def __init__(self, messages: Sequence[UpstreamWebSocketMessage]) -> None:
-        super().__init__(messages)
-        self.first_receive_started = asyncio.Event()
-
-    async def receive(self) -> UpstreamWebSocketMessage:
-        if self._index == 0:
-            self.first_receive_started.set()
-        return await super().receive()
 
 
 class _BlockingUpstream(_FakeUpstream):
@@ -750,49 +739,6 @@ async def _verify_contended_pending_lock_contract() -> dict[str, object]:
     }
 
 
-async def _verify_ready_enqueue_fairness() -> dict[str, int]:
-    fixture = _make_fixture()
-    upstream = _SignalingUpstream(_FRAME_MESSAGES)
-    fixture.upstream = upstream
-    fixture.session.upstream = cast(UpstreamResponsesWebSocket, upstream)
-    marker_state = proxy_service._WebSocketRequestState(
-        request_id="req-http-ready-enqueue-marker",
-        model="gpt-5.6-sol",
-        service_tier=None,
-        reasoning_effort=None,
-        api_key_reservation=None,
-        started_at=time.monotonic(),
-    )
-    event_count_when_enqueued: int | None = None
-
-    async def enqueue_marker() -> None:
-        nonlocal event_count_when_enqueued
-        await upstream.first_receive_started.wait()
-        async with fixture.session.pending_lock:
-            event_count_when_enqueued = sum(
-                cast(asyncio.Queue[str | None], state.event_queue).qsize() for state in fixture.request_states
-            )
-            fixture.session.pending_requests.append(marker_state)
-            fixture.session.pending_requests.remove(marker_state)
-
-    marker_task = asyncio.create_task(enqueue_marker(), name="benchmark-ready-http-enqueue")
-    try:
-        summary = await _run_pipeline(fixture, backlog_before_consume=True)
-        async with asyncio.timeout(1.0):
-            await marker_task
-    finally:
-        if not marker_task.done():
-            marker_task.cancel()
-        await asyncio.gather(marker_task, return_exceptions=True)
-
-    if event_count_when_enqueued is None or event_count_when_enqueued >= _TOTAL_EVENT_COUNT:
-        raise RuntimeError("HTTP bridge relay starved a ready enqueue until its prebuffered burst drained")
-    return {
-        "event_count_when_enqueued": event_count_when_enqueued,
-        "relay_event_count": summary.event_count,
-    }
-
-
 async def _verify_correctness() -> str:
     fast_outputs, fast_depth = await _collect_pipeline(_make_fixture(), backlog_before_consume=False)
     backlogged_outputs, backlog_depth = await _collect_pipeline(_make_fixture(), backlog_before_consume=True)
@@ -812,7 +758,6 @@ async def _verify_correctness() -> str:
         "cancellation": cancellation,
         "timeout": timeout,
         "contended_pending_lock": await _verify_contended_pending_lock_contract(),
-        "ready_enqueue_fairness": await _verify_ready_enqueue_fairness(),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     if digest != _EXPECTED_CORRECTNESS_DIGEST:

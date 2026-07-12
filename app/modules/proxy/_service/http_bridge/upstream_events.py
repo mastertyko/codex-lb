@@ -156,7 +156,6 @@ from app.modules.proxy.tool_call_dedupe import (
 logger = logging.getLogger("app.modules.proxy.service")
 T = TypeVar("T")
 _TEXT_DELTA_EVENT_TYPES = frozenset({"response.output_text.delta", "response.refusal.delta"})
-_HTTP_BRIDGE_RELAY_CHECKPOINT_INTERVAL = 32
 _REQUEST_TRANSPORT_HTTP = "http"
 _UPSTREAM_CLOSE_CODES_SKIP_SAME_ACCOUNT_RETRY = frozenset({1011})
 _WEBSOCKET_AUTH_INVALIDATED_FAILURE_CODE = "account_auth_invalidated"
@@ -255,7 +254,6 @@ class _HTTPBridgeUpstreamEventsMixin:
     ) -> None:
         runtime_settings = _service_get_settings()
         relay_upstream = session.upstream
-        processed_text_since_checkpoint = _HTTP_BRIDGE_RELAY_CHECKPOINT_INTERVAL - 1
         try:
             while True:
                 receive_timeout = await self._next_websocket_receive_timeout(
@@ -293,10 +291,6 @@ class _HTTPBridgeUpstreamEventsMixin:
                     await self._process_http_bridge_upstream_text(session, message.text)
                     if await self._retire_http_bridge_after_drain_if_ready(session):
                         break
-                    processed_text_since_checkpoint += 1
-                    if processed_text_since_checkpoint >= _HTTP_BRIDGE_RELAY_CHECKPOINT_INTERVAL:
-                        processed_text_since_checkpoint = 0
-                        await asyncio.sleep(0)
                     continue
 
                 async with session.pending_lock:

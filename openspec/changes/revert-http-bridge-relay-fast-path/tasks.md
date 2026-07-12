@@ -1,6 +1,6 @@
 ## 1. Restore HTTP Bridge Runtime
 
-- [x] 1.1 Restore the default pending lock, `asyncio.wait_for` receive and queue waits, eager event parsing and response/error derivation, and awaited queue puts; retain only the measured bounded fairness checkpoint required to prevent a ready enqueue from starving behind an immediately available frame burst.
+- [x] 1.1 Restore the default pending lock, `asyncio.wait_for` receive and queue waits, eager event parsing and response/error derivation, awaited queue puts, and the beta.3 HTTP relay scheduling path with no explicit frame-count checkpoint.
 - [x] 1.2 Remove the now-unused `parse_event=False` tool-call rewrite API and its optimization-only test while preserving unrelated relay behavior.
 
 ## 2. Add Failure-Only Close Attribution
@@ -12,7 +12,7 @@
 ## 3. Align Deterministic Measurement and Existing Tests
 
 - [x] 3.1 Update existing HTTP bridge tests to the restored lock and scheduling contracts while retaining attribution, order, cancellation, contention, timeout, sentinel, and cleanup coverage.
-- [x] 3.2 Keep the HTTP bridge benchmark on the restored production semantics and update its locked digest or timing references only when measured payload or baseline changes justify it.
+- [x] 3.2 Keep the HTTP bridge benchmark on beta.3 production scheduling, retain its routing, ownership, archive, order, cancellation, contention, timeout, sentinel, cleanup, and timing coverage, and remove any requirement for a ready enqueue to run before a finite prebuffered burst drains.
 
 ## 4. Verify the Release Candidate
 
