@@ -2099,7 +2099,7 @@ class _HTTPBridgeMixin(
             upstream=upstream,
             upstream_control=_WebSocketUpstreamControl(),
             pending_requests=deque(),
-            pending_lock=anyio.Lock(),
+            pending_lock=anyio.Lock(fast_acquire=True),
             response_create_gate=asyncio.Semaphore(1),
             queued_request_count=0,
             lifecycle_lock=anyio.Lock(),

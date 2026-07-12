@@ -27,7 +27,6 @@ from app.core.clients.proxy import codex_control_request as core_codex_control_r
 from app.core.clients.proxy import compact_responses as core_compact_responses  # noqa: F401
 from app.core.clients.proxy import transcribe_audio as core_transcribe_audio  # noqa: F401
 from app.core.clients.proxy_websocket import UpstreamWebSocketMessage
-from app.core.openai.parsing import parse_sse_event
 from app.core.utils.request_id import reset_request_id, set_request_id
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.modules.proxy._service.api_key_usage import (
@@ -169,6 +168,7 @@ _SECURITY_WORK_NO_AUTHORIZED_ACCOUNTS_MESSAGE = (
 )
 _HTTP_BRIDGE_BACKGROUND_CLOSE_TIMEOUT_SECONDS = 5.0
 _HTTP_BRIDGE_BACKGROUND_CLEANUP_WARN_THRESHOLD = 100
+_HTTP_BRIDGE_RELAY_CHECKPOINT_INTERVAL = 32
 
 
 def _archive_http_bridge_upstream_text(
@@ -251,6 +251,7 @@ class _HTTPBridgeUpstreamEventsMixin:
     ) -> None:
         runtime_settings = _service_get_settings()
         relay_upstream = session.upstream
+        processed_text_since_checkpoint = _HTTP_BRIDGE_RELAY_CHECKPOINT_INTERVAL - 1
         try:
             while True:
                 receive_timeout = await self._next_websocket_receive_timeout(
@@ -265,10 +266,8 @@ class _HTTPBridgeUpstreamEventsMixin:
                     elif receive_timeout.timeout_seconds <= 0:
                         raise asyncio.TimeoutError()
                     else:
-                        message = await asyncio.wait_for(
-                            session.upstream.receive(),
-                            timeout=receive_timeout.timeout_seconds,
-                        )
+                        async with asyncio.timeout(receive_timeout.timeout_seconds):
+                            message = await session.upstream.receive()
                 except asyncio.TimeoutError:
                     if receive_timeout is None:
                         raise
@@ -288,6 +287,10 @@ class _HTTPBridgeUpstreamEventsMixin:
                     await self._process_http_bridge_upstream_text(session, message.text)
                     if await self._retire_http_bridge_after_drain_if_ready(session):
                         break
+                    processed_text_since_checkpoint += 1
+                    if processed_text_since_checkpoint >= _HTTP_BRIDGE_RELAY_CHECKPOINT_INTERVAL:
+                        processed_text_since_checkpoint = 0
+                        await asyncio.sleep(0)
                     continue
 
                 async with session.pending_lock:
@@ -331,36 +334,43 @@ class _HTTPBridgeUpstreamEventsMixin:
         original_text = text
         event_block = f"data: {text}\n\n"
         payload = parse_sse_data_json(event_block)
-        event = parse_sse_event(event_block)
-        event_type = _event_type_from_payload(event, payload)
-        response_id = _websocket_response_id(event, payload)
-        error_message = _websocket_event_error_message(event_type, payload)
+        event_type = _event_type_from_payload(None, payload)
+        parse_event = event_type in {"response.completed", "response.failed", "response.incomplete", "error"}
+        response_id = _websocket_response_id(None, payload)
         is_typeless_error_event = (
-            isinstance(payload, dict)
+            event_type == "error"
+            and isinstance(payload, dict)
             and not isinstance(payload.get("type"), str)
             and isinstance(payload.get("error"), dict)
         )
-        is_previous_response_not_found_event = _is_previous_response_not_found_error(
-            code=_normalize_error_code(
+        if event_type in {"error", "response.failed"}:
+            error_message = _websocket_event_error_message(event_type, payload)
+            error_code = _normalize_error_code(
                 _websocket_event_error_code(event_type, payload),
                 _websocket_event_error_type(event_type, payload),
-            ),
-            param=_websocket_event_error_param(event_type, payload),
-            message=error_message,
-        )
-        is_missing_tool_output_event = _is_missing_tool_output_error(
-            code=_normalize_error_code(
-                _websocket_event_error_code(event_type, payload),
-                _websocket_event_error_type(event_type, payload),
-            ),
-            param=_websocket_event_error_param(event_type, payload),
-            message=error_message,
-        )
-        previous_response_id_hint = _previous_response_id_from_not_found_message(error_message)
+            )
+            error_param = _websocket_event_error_param(event_type, payload)
+            is_previous_response_not_found_event = _is_previous_response_not_found_error(
+                code=error_code,
+                param=error_param,
+                message=error_message,
+            )
+            is_missing_tool_output_event = _is_missing_tool_output_error(
+                code=error_code,
+                param=error_param,
+                message=error_message,
+            )
+            previous_response_id_hint = _previous_response_id_from_not_found_message(error_message)
+        else:
+            error_message = None
+            is_previous_response_not_found_event = False
+            is_missing_tool_output_event = False
+            previous_response_id_hint = None
         text, payload, event, event_type, event_block = rewrite_parallel_tool_call_text(
             text,
             payload,
             event_block=event_block,
+            parse_event=parse_event,
         )
 
         async with session.pending_lock:
@@ -874,20 +884,21 @@ class _HTTPBridgeUpstreamEventsMixin:
                     if retried:
                         return
 
+        # Request event queues are unbounded, so non-blocking puts preserve queue semantics without coroutine overhead.
         if (
             matched_request_state is not None
             and matched_request_state.event_queue is not None
             and not suppress_downstream_event
         ):
-            await matched_request_state.event_queue.put(event_block)
+            matched_request_state.event_queue.put_nowait(event_block)
 
         if terminal_request_state is None:
             return
 
         if terminal_request_state is not matched_request_state and terminal_request_state.event_queue is not None:
-            await terminal_request_state.event_queue.put(event_block)
+            terminal_request_state.event_queue.put_nowait(event_block)
         if terminal_request_state.event_queue is not None:
-            await terminal_request_state.event_queue.put(None)
+            terminal_request_state.event_queue.put_nowait(None)
 
         if settlement_event_type in {"response.failed", "response.incomplete", "error"}:
             error_code = None

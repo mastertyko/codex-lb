@@ -1941,6 +1941,31 @@ def test_rewrite_parallel_tool_call_text_preserves_sse_event_name():
     assert rewritten_payload is not None
 
 
+def test_rewrite_parallel_tool_call_text_can_skip_event_model_parsing() -> None:
+    payload: dict[str, JsonValue] = {
+        "type": "response.output_text.delta",
+        "response_id": "resp_lazy_parse",
+        "delta": "hello",
+    }
+    text = json.dumps(payload, separators=(",", ":"))
+    event_block = format_sse_event(payload)
+
+    rewritten_text, rewritten_payload, event, event_type, rewritten_event_block = (
+        tool_call_dedupe.rewrite_parallel_tool_call_text(
+            text,
+            payload,
+            event_block=event_block,
+            parse_event=False,
+        )
+    )
+
+    assert rewritten_text == text
+    assert rewritten_payload is payload
+    assert event is None
+    assert event_type == "response.output_text.delta"
+    assert rewritten_event_block == event_block
+
+
 def test_rewrite_parallel_tool_call_text_preserves_raw_error_type():
     payload: dict[str, JsonValue] = {
         "error": {

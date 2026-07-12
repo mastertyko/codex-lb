@@ -32,6 +32,7 @@ from app.modules.proxy import service as proxy_service
 from app.modules.proxy._service.http_bridge import helpers as http_bridge_helpers_module
 from app.modules.proxy._service.http_bridge import mixin as http_bridge_mixin_module
 from app.modules.proxy._service.http_bridge import streaming as http_bridge_streaming_module
+from app.modules.proxy._service.http_bridge import upstream_events as http_bridge_upstream_events_module
 from app.modules.proxy.account_cache import clear_account_routing_unavailable, mark_account_routing_unavailable
 from app.modules.proxy.http_bridge_forwarding import OwnerForwardRelayFailure
 
@@ -72,7 +73,7 @@ def _make_bridge_session(
         upstream=cast(UpstreamResponsesWebSocket, SimpleNamespace(close=AsyncMock())),
         upstream_control=proxy_service._WebSocketUpstreamControl(),
         pending_requests=pending_requests or deque(),
-        pending_lock=anyio.Lock(),
+        pending_lock=anyio.Lock(fast_acquire=True),
         response_create_gate=asyncio.Semaphore(1),
         queued_request_count=queued_request_count,
         last_used_at=1.0,
@@ -1353,6 +1354,62 @@ async def test_http_bridge_upstream_non_text_archives_with_request_archive_id(
 
     assert archived == [("archive-bridge-close", "close", 1000)]
     assert session.last_upstream_close_code == 1000
+
+
+@pytest.mark.asyncio
+async def test_http_bridge_relay_checkpoints_after_processed_text_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    session = _make_bridge_session(key_value="bridge-relay-fairness")
+    first_receive_started = asyncio.Event()
+    messages = deque(
+        [UpstreamWebSocketMessage(kind="text", text="{}") for _ in range(40)]
+        + [UpstreamWebSocketMessage(kind="close", close_code=1000)]
+    )
+    processed_frame_count = 0
+    checkpoint_frame_counts: list[int] = []
+    original_sleep = asyncio.sleep
+
+    async def receive() -> UpstreamWebSocketMessage:
+        first_receive_started.set()
+        return messages.popleft()
+
+    async def process_text(_session: object, _text: str) -> None:
+        nonlocal processed_frame_count
+        processed_frame_count += 1
+
+    async def record_checkpoint(delay: float) -> None:
+        assert delay == 0
+        checkpoint_frame_counts.append(processed_frame_count)
+        await original_sleep(delay)
+
+    session.upstream = cast(
+        UpstreamResponsesWebSocket,
+        SimpleNamespace(receive=receive, close=AsyncMock()),
+    )
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: _make_app_settings())
+    monkeypatch.setattr(http_bridge_upstream_events_module.asyncio, "sleep", record_checkpoint)
+    monkeypatch.setattr(service, "_next_websocket_receive_timeout", AsyncMock(return_value=None))
+    monkeypatch.setattr(service, "_process_http_bridge_upstream_text", process_text)
+    monkeypatch.setattr(service, "_retire_http_bridge_after_drain_if_ready", AsyncMock(return_value=False))
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", AsyncMock(return_value=False))
+    monkeypatch.setattr(service, "_fail_http_bridge_reader_and_maybe_retire", AsyncMock(return_value=True))
+    frame_count_when_enqueued: int | None = None
+
+    async def enqueue_ready_request() -> None:
+        nonlocal frame_count_when_enqueued
+        await first_receive_started.wait()
+        async with session.pending_lock:
+            frame_count_when_enqueued = processed_frame_count
+
+    enqueue_task = asyncio.create_task(enqueue_ready_request())
+    await service._relay_http_bridge_upstream_messages(session)
+    await enqueue_task
+
+    assert processed_frame_count == 40
+    assert frame_count_when_enqueued == 1
+    assert checkpoint_frame_counts == [1, 33]
 
 
 def test_pop_terminal_websocket_request_state_precreated_completed_does_not_guess_with_ambiguous_pending() -> None:
@@ -3379,6 +3436,19 @@ async def test_create_http_bridge_session_filters_http_headers_for_upstream_webs
 
     if session.upstream_reader is not None:
         await session.upstream_reader
+    ready_task_ran = False
+
+    async def mark_ready_task() -> None:
+        nonlocal ready_task_ran
+        ready_task_ran = True
+
+    ready_task = asyncio.create_task(mark_ready_task())
+    await session.pending_lock.acquire()
+    try:
+        assert not ready_task_ran
+    finally:
+        session.pending_lock.release()
+    await ready_task
     assert captured_headers
     forwarded = {key.lower(): value for key, value in captured_headers[0].items()}
     assert forwarded["session_id"] == "sid-filtered"
