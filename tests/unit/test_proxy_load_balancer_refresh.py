@@ -2640,6 +2640,90 @@ async def test_select_account_preserves_service_tier_plan_filter_when_quota_over
 
 
 @pytest.mark.asyncio
+async def test_select_account_preserves_authoritative_service_tier_accounts_when_quota_overrides_catalog(
+    monkeypatch,
+) -> None:
+    tier_rejected = _make_account("acc-gated-tier-rejected", "gated-tier-rejected@example.com")
+    tier_rejected.plan_type = "pro"
+    tier_allowed = _make_account("acc-gated-tier-allowed", "gated-tier-allowed@example.com")
+    tier_allowed.plan_type = "pro"
+    now = utcnow()
+    now_epoch = int(now.replace(tzinfo=timezone.utc).timestamp())
+    usage_repo = StubUsageRepository(
+        primary={
+            tier_rejected.id: UsageHistory(
+                id=1,
+                account_id=tier_rejected.id,
+                recorded_at=now,
+                window="primary",
+                used_percent=10.0,
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+            ),
+            tier_allowed.id: UsageHistory(
+                id=2,
+                account_id=tier_allowed.id,
+                recorded_at=now,
+                window="primary",
+                used_percent=10.0,
+                reset_at=now_epoch + 300,
+                window_minutes=5,
+            ),
+        },
+        secondary={},
+    )
+    additional_usage_repo = StubAdditionalUsageRepository(
+        primary={
+            tier_rejected.id: _additional_entry(
+                3,
+                account_id=tier_rejected.id,
+                window="primary",
+                used_percent=10.0,
+                recorded_at=now,
+            ),
+            tier_allowed.id: _additional_entry(
+                4,
+                account_id=tier_allowed.id,
+                window="primary",
+                used_percent=10.0,
+                recorded_at=now,
+            ),
+        }
+    )
+
+    monkeypatch.setattr(
+        "app.modules.proxy.load_balancer.get_model_registry",
+        lambda: SimpleNamespace(
+            get_snapshot=lambda: SimpleNamespace(account_plans={tier_rejected.id: "pro", tier_allowed.id: "pro"}),
+            account_ids_for_model=lambda _model: frozenset({tier_rejected.id, tier_allowed.id}),
+            plan_types_for_model=lambda _model: frozenset({"pro"}),
+            account_ids_for_model_service_tier=lambda _model, tier: (
+                frozenset({tier_allowed.id}) if tier == "priority" else None
+            ),
+            plan_types_for_model_service_tier=lambda _model, _tier: frozenset({"pro"}),
+        ),
+    )
+
+    balancer = LoadBalancer(
+        lambda: _repo_factory(
+            StubAccountsRepository([tier_rejected, tier_allowed]),
+            usage_repo,
+            StubStickySessionsRepository(),
+            additional_usage_repo,
+        )
+    )
+    selection = await balancer.select_account(model="gpt-5.3-codex-spark", service_tier="priority")
+    selection_inputs = await balancer._load_selection_inputs(
+        model="gpt-5.3-codex-spark",
+        service_tier="priority",
+    )
+
+    assert selection.account is not None
+    assert selection.account.id == tier_allowed.id
+    assert [account.id for account in selection_inputs.accounts] == [tier_allowed.id]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("additional_limit_name", "entry_limit_name", "entry_quota_key"),
     [

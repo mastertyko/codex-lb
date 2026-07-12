@@ -16,14 +16,14 @@ The model registry aggregates general per-plan and per-account Codex catalogs. S
 
 ## Decisions
 
-For a model mapped by the additional-quota registry, account candidate filtering skips only the registry's exact per-account model index. It still evaluates the registry's allowed plan or service-tier plans. The existing additional-quota filter then requires fresh account-specific telemetry and rejects missing, stale, or exhausted quota data before routing.
+For a model mapped by the additional-quota registry, account candidate filtering resolves the authoritative general per-account model index independently from requested service-tier filtering. Accounts present in that general model index stay in the normal pool only when they also pass the authoritative per-account service-tier index. Only accounts genuinely absent from the general model index may use the omission fallback, which applies the registry's allowed plan or service-tier plans before requiring fresh model-specific quota telemetry.
 
-This keeps the exception narrow and evidence-backed. Treating the bootstrap catalog as globally authoritative would resurrect models without current account evidence; bypassing every model filter would admit plans that do not support the model. Deferring only exact account support to fresh additional-quota telemetry avoids both failures.
+This keeps the exception narrow and evidence-backed. A catalog-supported account rejected by the requested account-level service tier cannot be reclassified as model-catalog-omitted or restored by quota evidence. Treating bootstrap metadata as globally authoritative would reject genuinely omitted-but-usable models, while bypassing every model or tier filter would admit unsupported accounts.
 
 Explicit caller-supplied additional-limit filters do not activate this exception. Only a canonical model-to-quota mapping can override the general account catalog, preventing an unrelated quota key from bypassing model support.
 
 ## Risks / Trade-offs
 
 - A malformed additional-quota registry could map a model incorrectly. Existing canonical registry loading, plan applicability, and fresh-data requirements constrain that risk.
-- Service-tier account affinity is less precise for a mapped additional-quota model omitted from the account catalog; plan-level service-tier filtering remains enforced and the subsequent quota/health gates remain authoritative.
+- Service-tier account affinity is less precise only for an account genuinely omitted from the general model catalog, because no model-specific account-tier entry exists to trust for that account. Plan-level service-tier filtering remains authoritative for that fallback; catalog-supported accounts continue to require the exact per-account service-tier index.
 - Fresh quota telemetry may temporarily disappear during refresh failures. Selection remains fail-closed with the existing additional-quota data-unavailable error.

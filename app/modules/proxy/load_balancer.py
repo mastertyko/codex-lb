@@ -156,6 +156,12 @@ class AccountConcurrencyCaps:
 
 
 @dataclass(frozen=True, slots=True)
+class _ModelAccountFilterResult:
+    accounts: list[Account]
+    general_model_account_ids: frozenset[str] | None
+
+
+@dataclass(frozen=True, slots=True)
 class _AdditionalLimitFilterResult:
     accounts: list[Account]
     latest_primary: dict[str, AdditionalUsageHistory]
@@ -885,24 +891,21 @@ class LoadBalancer:
             pre_model_filter_accounts = accounts
             model_catalog_omitted_account_ids: frozenset[str] = frozenset()
             if model and _mapped_model_has_registry_entry(model):
-                catalog_accounts = _filter_accounts_for_model(
+                canonical_quota_can_override_account_catalog = (
+                    additional_limit_name is None and mapped_limit_name is not None
+                )
+                model_filter = _filter_accounts_for_model_with_catalog_evidence(
                     pre_model_filter_accounts,
                     model,
                     service_tier=service_tier,
+                    additional_quota_can_override_account_catalog=canonical_quota_can_override_account_catalog,
                 )
-                if additional_limit_name is None and mapped_limit_name is not None:
-                    accounts = _filter_accounts_for_model(
-                        pre_model_filter_accounts,
-                        model,
-                        service_tier=service_tier,
-                        additional_quota_can_override_account_catalog=True,
-                    )
-                    catalog_account_ids = {account.id for account in catalog_accounts}
+                accounts = model_filter.accounts
+                general_model_account_ids = model_filter.general_model_account_ids
+                if canonical_quota_can_override_account_catalog and general_model_account_ids is not None:
                     model_catalog_omitted_account_ids = frozenset(
-                        account.id for account in accounts if account.id not in catalog_account_ids
+                        account.id for account in accounts if account.id not in general_model_account_ids
                     )
-                else:
-                    accounts = catalog_accounts
             if model and not accounts:
                 if not all_accounts:
                     selection_inputs = _SelectionInputs(
@@ -2471,47 +2474,79 @@ def _usage_refresh_interval_seconds() -> int:
     return int(getattr(settings, "usage_refresh_interval_seconds", _DEFAULT_USAGE_REFRESH_INTERVAL_SECONDS))
 
 
-def _filter_accounts_for_model(
+def _filter_accounts_for_model_with_catalog_evidence(
     accounts: list[Account],
     model: str,
     *,
     service_tier: str | None = None,
     additional_quota_can_override_account_catalog: bool = False,
-) -> list[Account]:
+) -> _ModelAccountFilterResult:
     registry = get_model_registry()
     account_indexes_cover_selection = True
     get_snapshot = getattr(registry, "get_snapshot", None)
     if callable(get_snapshot):
         snapshot = get_snapshot()
-        account_indexes_cover_selection = snapshot is not None and {account.id for account in accounts}.issubset(
-            snapshot.account_plans
+        account_indexes_cover_selection = snapshot is not None and all(
+            account.id in snapshot.account_plans for account in accounts
         )
-    # Separately metered models can disappear from the general per-account
-    # catalog while fresh additional-quota telemetry still proves account
-    # access. The caller tracks candidates admitted only by this bypass so the
-    # quota filter can require fresh evidence for those accounts.
-    use_account_catalog = account_indexes_cover_selection and not additional_quota_can_override_account_catalog
     account_ids_for_model = getattr(registry, "account_ids_for_model", None)
-    model_account_ids = (
-        account_ids_for_model(model) if callable(account_ids_for_model) and use_account_catalog else None
+    general_model_account_ids = (
+        account_ids_for_model(model) if callable(account_ids_for_model) and account_indexes_cover_selection else None
     )
-    model_accounts = (
-        accounts if model_account_ids is None else [account for account in accounts if account.id in model_account_ids]
-    )
+    if general_model_account_ids is None or additional_quota_can_override_account_catalog:
+        model_accounts = accounts
+    else:
+        model_accounts = [account for account in accounts if account.id in general_model_account_ids]
+
     normalized_service_tier = service_tier.strip().lower() if service_tier is not None else None
     effective_service_tier = None if normalized_service_tier in {"auto", "default"} else service_tier
     if effective_service_tier is not None:
         allowed_account_ids = (
-            registry.account_ids_for_model_service_tier(model, effective_service_tier) if use_account_catalog else None
+            registry.account_ids_for_model_service_tier(model, effective_service_tier)
+            if account_indexes_cover_selection
+            else None
         )
         if allowed_account_ids is not None:
-            return [account for account in model_accounts if account.id in allowed_account_ids]
+            if additional_quota_can_override_account_catalog and general_model_account_ids is not None:
+                allowed_plans = registry.plan_types_for_model_service_tier(model, effective_service_tier)
+                tier_filtered_accounts: list[Account] = []
+                for account in accounts:
+                    if account.id in general_model_account_ids:
+                        if account.id in allowed_account_ids:
+                            tier_filtered_accounts.append(account)
+                    elif allowed_plans is None or account_plan_matches_allowed(account.plan_type, allowed_plans):
+                        tier_filtered_accounts.append(account)
+                model_accounts = tier_filtered_accounts
+            else:
+                model_accounts = [account for account in model_accounts if account.id in allowed_account_ids]
+            return _ModelAccountFilterResult(
+                accounts=model_accounts,
+                general_model_account_ids=general_model_account_ids,
+            )
         allowed_plans = registry.plan_types_for_model_service_tier(model, effective_service_tier)
     else:
         allowed_plans = registry.plan_types_for_model(model)
-    if allowed_plans is None:
-        return model_accounts
-    return [a for a in model_accounts if account_plan_matches_allowed(a.plan_type, allowed_plans)]
+    if allowed_plans is not None:
+        model_accounts = [
+            account for account in model_accounts if account_plan_matches_allowed(account.plan_type, allowed_plans)
+        ]
+    return _ModelAccountFilterResult(
+        accounts=model_accounts,
+        general_model_account_ids=general_model_account_ids,
+    )
+
+
+def _filter_accounts_for_model(
+    accounts: list[Account],
+    model: str,
+    *,
+    service_tier: str | None = None,
+) -> list[Account]:
+    return _filter_accounts_for_model_with_catalog_evidence(
+        accounts,
+        model,
+        service_tier=service_tier,
+    ).accounts
 
 
 def _selectable_accounts(accounts: list[Account]) -> list[Account]:

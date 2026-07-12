@@ -12,6 +12,15 @@ For a model canonically mapped to a separately metered additional quota, account
 - **THEN** the general account-catalog omission does not remove that account from consideration
 - **AND** the account proceeds through the remaining additional-quota and routing gates
 
+#### Scenario: Catalog-supported account-level service-tier exclusion remains authoritative
+
+- **GIVEN** an authoritative general per-account catalog includes a mapped separately metered model for two plan-compatible accounts
+- **AND** the authoritative requested service-tier account index includes only one of those accounts
+- **AND** both accounts have fresh, non-exhausted additional-quota telemetry for the model
+- **WHEN** account selection requests that model and service tier
+- **THEN** the account absent from the requested service-tier account index is not selected
+- **AND** quota evidence does not reclassify that catalog-supported account as model-catalog-omitted
+
 #### Scenario: Plan incompatibility remains authoritative
 
 - **GIVEN** a requested separately metered model is mapped to an additional quota
