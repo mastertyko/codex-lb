@@ -833,7 +833,8 @@ class LoadBalancer:
         additional_limit_name: str | None = None,
         account_ids: Collection[str] | None = None,
     ) -> _SelectionInputs:
-        effective_limit_name = additional_limit_name or _gated_limit_name_for_model(model)
+        mapped_limit_name = _gated_limit_name_for_model(model)
+        effective_limit_name = additional_limit_name or mapped_limit_name
         additional_quota_routing_policies: dict[str, str] = {}
         if effective_limit_name is not None:
             additional_quota_routing_policies = await _load_dashboard_additional_quota_routing_overrides()
@@ -882,8 +883,26 @@ class LoadBalancer:
                 allowed_account_ids = set(account_ids)
                 accounts = [account for account in accounts if account.id in allowed_account_ids]
             pre_model_filter_accounts = accounts
+            model_catalog_omitted_account_ids: frozenset[str] = frozenset()
             if model and _mapped_model_has_registry_entry(model):
-                accounts = _filter_accounts_for_model(pre_model_filter_accounts, model, service_tier=service_tier)
+                catalog_accounts = _filter_accounts_for_model(
+                    pre_model_filter_accounts,
+                    model,
+                    service_tier=service_tier,
+                )
+                if additional_limit_name is None and mapped_limit_name is not None:
+                    accounts = _filter_accounts_for_model(
+                        pre_model_filter_accounts,
+                        model,
+                        service_tier=service_tier,
+                        additional_quota_can_override_account_catalog=True,
+                    )
+                    catalog_account_ids = {account.id for account in catalog_accounts}
+                    model_catalog_omitted_account_ids = frozenset(
+                        account.id for account in accounts if account.id not in catalog_account_ids
+                    )
+                else:
+                    accounts = catalog_accounts
             if model and not accounts:
                 if not all_accounts:
                     selection_inputs = _SelectionInputs(
@@ -933,6 +952,7 @@ class LoadBalancer:
                     limit_name=effective_limit_name,
                     explicit_limit=additional_limit_name is not None,
                     repos=repos,
+                    require_fresh_evidence_account_ids=model_catalog_omitted_account_ids,
                 )
                 accounts = additional_filter.accounts
                 if not accounts:
@@ -1115,6 +1135,7 @@ class LoadBalancer:
         limit_name: str,
         explicit_limit: bool = False,
         repos: ProxyRepositories,
+        require_fresh_evidence_account_ids: frozenset[str] = frozenset(),
     ) -> _AdditionalLimitFilterResult:
         if not accounts:
             return _AdditionalLimitFilterResult(accounts=[], latest_primary={}, latest_secondary={})
@@ -1159,6 +1180,7 @@ class LoadBalancer:
                 account_plan_type=account.plan_type,
                 quota_key=limit_name,
                 explicit_limit=explicit_limit,
+                require_fresh_evidence=account.id in require_fresh_evidence_account_ids,
                 latest_primary=latest_primary,
                 latest_secondary=latest_secondary,
                 fresh_primary=fresh_primary,
@@ -2454,6 +2476,7 @@ def _filter_accounts_for_model(
     model: str,
     *,
     service_tier: str | None = None,
+    additional_quota_can_override_account_catalog: bool = False,
 ) -> list[Account]:
     registry = get_model_registry()
     account_indexes_cover_selection = True
@@ -2463,9 +2486,14 @@ def _filter_accounts_for_model(
         account_indexes_cover_selection = snapshot is not None and {account.id for account in accounts}.issubset(
             snapshot.account_plans
         )
+    # Separately metered models can disappear from the general per-account
+    # catalog while fresh additional-quota telemetry still proves account
+    # access. The caller tracks candidates admitted only by this bypass so the
+    # quota filter can require fresh evidence for those accounts.
+    use_account_catalog = account_indexes_cover_selection and not additional_quota_can_override_account_catalog
     account_ids_for_model = getattr(registry, "account_ids_for_model", None)
     model_account_ids = (
-        account_ids_for_model(model) if callable(account_ids_for_model) and account_indexes_cover_selection else None
+        account_ids_for_model(model) if callable(account_ids_for_model) and use_account_catalog else None
     )
     model_accounts = (
         accounts if model_account_ids is None else [account for account in accounts if account.id in model_account_ids]
@@ -2474,9 +2502,7 @@ def _filter_accounts_for_model(
     effective_service_tier = None if normalized_service_tier in {"auto", "default"} else service_tier
     if effective_service_tier is not None:
         allowed_account_ids = (
-            registry.account_ids_for_model_service_tier(model, effective_service_tier)
-            if account_indexes_cover_selection
-            else None
+            registry.account_ids_for_model_service_tier(model, effective_service_tier) if use_account_catalog else None
         )
         if allowed_account_ids is not None:
             return [account for account in model_accounts if account.id in allowed_account_ids]
@@ -2607,6 +2633,7 @@ def _additional_quota_eligibility(
     account_plan_type: str | None,
     quota_key: str | None,
     explicit_limit: bool = False,
+    require_fresh_evidence: bool = False,
     latest_primary: dict[str, AdditionalUsageHistory],
     latest_secondary: dict[str, AdditionalUsageHistory],
     fresh_primary: dict[str, AdditionalUsageHistory],
@@ -2617,7 +2644,11 @@ def _additional_quota_eligibility(
     primary_entry = fresh_primary.get(account_id)
     secondary_entry = fresh_secondary.get(account_id)
 
-    if not explicit_limit and not _additional_quota_applies_to_plan(quota_key=quota_key, plan_type=account_plan_type):
+    if (
+        not require_fresh_evidence
+        and not explicit_limit
+        and not _additional_quota_applies_to_plan(quota_key=quota_key, plan_type=account_plan_type)
+    ):
         return "eligible"
 
     if latest_primary_entry is None and latest_secondary_entry is None:

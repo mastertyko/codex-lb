@@ -3459,6 +3459,7 @@ async def test_load_selection_inputs_sets_burn_first_override_for_additional_quo
         limit_name: str,
         explicit_limit: bool,
         repos,
+        require_fresh_evidence_account_ids: frozenset[str],
     ) -> _AdditionalLimitFilterResult:
         return _AdditionalLimitFilterResult(
             accounts=accounts,
@@ -3523,6 +3524,7 @@ async def test_security_work_filter_preserves_additional_quota_metadata():
         limit_name: str,
         explicit_limit: bool,
         repos,
+        require_fresh_evidence_account_ids: frozenset[str],
     ) -> _AdditionalLimitFilterResult:
         return _AdditionalLimitFilterResult(
             accounts=accounts,
@@ -3572,6 +3574,7 @@ async def test_load_selection_inputs_uses_canonicalized_additional_quota_alias_k
         limit_name: str,
         explicit_limit: bool,
         repos,
+        require_fresh_evidence_account_ids: frozenset[str],
     ) -> _AdditionalLimitFilterResult:
         return _AdditionalLimitFilterResult(
             accounts=accounts,
@@ -3636,6 +3639,7 @@ async def test_load_selection_inputs_uses_registry_additional_quota_routing_poli
         limit_name: str,
         explicit_limit: bool,
         repos,
+        require_fresh_evidence_account_ids: frozenset[str],
     ) -> _AdditionalLimitFilterResult:
         return _AdditionalLimitFilterResult(
             accounts=accounts,
@@ -3694,6 +3698,7 @@ async def test_load_selection_inputs_inherits_account_policy_for_additional_quot
         limit_name: str,
         explicit_limit: bool,
         repos,
+        require_fresh_evidence_account_ids: frozenset[str],
     ) -> _AdditionalLimitFilterResult:
         return _AdditionalLimitFilterResult(
             accounts=accounts,
