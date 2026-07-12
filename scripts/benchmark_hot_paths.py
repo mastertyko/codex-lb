@@ -504,9 +504,7 @@ async def _run_benchmarks() -> list[Measurement]:
         SyncCase("sse_parse", _sse_parse_once, 12, len(_SSE_PARSE_BLOCKS), "event"),
         SyncCase("usage_latest", _usage_latest_once, 2, len(_USAGE_ACCOUNT_IDS), "account"),
     )
-    async_cases = (
-        AsyncCase("sse_stream", _sse_stream_once, 6, len(_STREAM_BLOCKS), "event"),
-    )
+    async_cases = (AsyncCase("sse_stream", _sse_stream_once, 6, len(_STREAM_BLOCKS), "event"),)
 
     measurements = [_measure_sync(case) for case in sync_cases]
     measurements.extend([await _measure_async(case) for case in async_cases])
@@ -515,8 +513,7 @@ async def _run_benchmarks() -> list[Measurement]:
 
 def _hot_path_score(measurements: Sequence[Measurement]) -> float:
     ratios = [
-        measurement.ns_per_operation / _REFERENCE_NS_PER_OPERATION[measurement.name]
-        for measurement in measurements
+        measurement.ns_per_operation / _REFERENCE_NS_PER_OPERATION[measurement.name] for measurement in measurements
     ]
     return math.exp(sum(math.log(ratio) for ratio in ratios) / len(ratios)) * 1_000.0
 
@@ -535,13 +532,9 @@ async def main() -> None:
     print(f"ASI sample_count={_SAMPLE_COUNT}")
     print(f"METRIC hot_path_score={hot_path_score:.6f}")
     for measurement in measurements:
+        print(f"METRIC {measurement.name}_ns_per_{measurement.metric_suffix}={measurement.ns_per_operation:.3f}")
         print(
-            f"METRIC {measurement.name}_ns_per_{measurement.metric_suffix}="
-            f"{measurement.ns_per_operation:.3f}"
-        )
-        print(
-            f"METRIC {measurement.name}_p95_ns_per_{measurement.metric_suffix}="
-            f"{measurement.p95_ns_per_operation:.3f}"
+            f"METRIC {measurement.name}_p95_ns_per_{measurement.metric_suffix}={measurement.p95_ns_per_operation:.3f}"
         )
 
 

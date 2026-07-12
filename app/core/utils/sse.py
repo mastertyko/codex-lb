@@ -127,5 +127,3 @@ def _extract_sse_data_lines(event_block: str) -> list[str] | None:
     if not data_lines:
         return None
     return data_lines
-
-

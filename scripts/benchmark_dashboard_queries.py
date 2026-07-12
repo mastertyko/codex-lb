@@ -110,8 +110,7 @@ async def _measure_async(case: AsyncCase) -> Measurement:
 
 def _dashboard_db_score(measurements: Sequence[Measurement]) -> float:
     ratios = [
-        _REFERENCE_NS_PER_OPERATION[measurement.name] / measurement.ns_per_operation
-        for measurement in measurements
+        _REFERENCE_NS_PER_OPERATION[measurement.name] / measurement.ns_per_operation for measurement in measurements
     ]
     return math.exp(sum(math.log(ratio) for ratio in ratios) / len(ratios)) * 1_000.0
 
@@ -476,13 +475,9 @@ async def main() -> None:
     print(f"METRIC dashboard_aggregate_statements={counts.dashboard_aggregate}")
     print(f"METRIC request_page_statements={counts.request_page}")
     for measurement in measurements:
+        print(f"METRIC {measurement.name}_ns_per_{measurement.metric_suffix}={measurement.ns_per_operation:.3f}")
         print(
-            f"METRIC {measurement.name}_ns_per_{measurement.metric_suffix}="
-            f"{measurement.ns_per_operation:.3f}"
-        )
-        print(
-            f"METRIC {measurement.name}_p95_ns_per_{measurement.metric_suffix}="
-            f"{measurement.p95_ns_per_operation:.3f}"
+            f"METRIC {measurement.name}_p95_ns_per_{measurement.metric_suffix}={measurement.p95_ns_per_operation:.3f}"
         )
 
 

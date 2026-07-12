@@ -1212,11 +1212,7 @@ class AdditionalUsageRepository:
             .correlate(account_subquery)
             .scalar_subquery()
         )
-        latest_ids = (
-            select(latest_id.label("usage_id"))
-            .select_from(account_subquery)
-            .subquery("latest_additional_ids")
-        )
+        latest_ids = select(latest_id.label("usage_id")).select_from(account_subquery).subquery("latest_additional_ids")
         stmt = select(AdditionalUsageHistory).join(
             latest_ids,
             AdditionalUsageHistory.id == latest_ids.c.usage_id,
