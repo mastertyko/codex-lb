@@ -16,9 +16,9 @@
 
 ## 4. Verify the Release Candidate
 
-- [ ] 4.1 Run all touched focused suites and all four deterministic benchmarks on the exact final SHA, confirming every locked correctness digest and reporting metrics.
-- [ ] 4.2 Run one finite-timeout full pytest on the exact final SHA, Ruff format-check/lint, ty, changed-file LSP diagnostics, strict change and main-spec validation, migration upgrade/check, and `git diff --check`.
-- [ ] 4.3 Verify exact-final-SHA implementation completeness, correctness, design coherence, upstream-release preservation, and residual risks; keep the change active and local for independent audit.
+- [x] 4.1 Run all touched focused suites and all four deterministic benchmarks on the exact final SHA, confirming every locked correctness digest and reporting metrics.
+- [x] 4.2 Run one finite-timeout full pytest on the exact final SHA, Ruff format-check/lint, ty, changed-file LSP diagnostics, strict change and main-spec validation, migration upgrade/check, and `git diff --check`.
+- [x] 4.3 Verify exact-final-SHA implementation completeness, correctness, design coherence, upstream-release preservation, and residual risks; keep the change active and local for future external audit.
 
 ## 5. Correct Reservation and Account-Health Ordering
 

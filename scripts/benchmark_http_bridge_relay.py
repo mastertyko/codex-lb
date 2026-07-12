@@ -285,7 +285,7 @@ def _make_fixture(
         upstream=cast(UpstreamResponsesWebSocket, upstream),
         upstream_control=proxy_service._WebSocketUpstreamControl(),
         pending_requests=deque(request_states),
-        pending_lock=anyio.Lock(fast_acquire=True),
+        pending_lock=anyio.Lock(),
         response_create_gate=asyncio.Semaphore(1),
         queued_request_count=request_count,
         last_used_at=1.0,
