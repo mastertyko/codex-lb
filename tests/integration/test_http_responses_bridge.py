@@ -2218,6 +2218,7 @@ async def test_v1_responses_http_bridge_stale_previous_response_alias_same_model
 
 @pytest.mark.asyncio
 async def test_v1_responses_http_bridge_previous_response_alias_rejects_service_tier_provenance_mismatch(
+    async_client,
     app_instance,
     monkeypatch,
 ):
@@ -2228,16 +2229,22 @@ async def test_v1_responses_http_bridge_previous_response_alias_rejects_service_
     service._http_bridge_turn_state_index.clear()
     service._http_bridge_previous_response_index.clear()
 
-    account_id = "acc-previous-response-tier-owner"
+    account_id = await _import_account(
+        async_client,
+        "acc_previous_response_tier_owner",
+        "previous-response-tier-owner@example.com",
+        plan_type="pro",
+    )
+    account = await _get_account(account_id)
     previous_response_id = "resp_previous_response_tier_owner"
     owner_key = proxy_module._HTTPBridgeSessionKey("prompt_cache", "bridge-old-prompt", None)
     owner_session = cast(proxy_module._HTTPBridgeSession, _make_dummy_bridge_session(owner_key))
     owner_session.request_model = "gpt-5.3-codex-spark"
     owner_session.request_service_tier = None
-    owner_session.account = cast(
-        Account,
-        SimpleNamespace(id=account_id, status=AccountStatus.ACTIVE, plan_type="pro"),
-    )
+    owner_session.account = account
+    owner_session.unanchored_reservation_id = None
+    owner_upstream = _FakeBridgeUpstreamWebSocket()
+    owner_session.upstream = cast(proxy_module.UpstreamResponsesWebSocket, owner_upstream)
     owner_session.catalog_omission_quota_admission = CatalogOmissionQuotaAdmission(
         normalized_model="gpt-5.3-codex-spark",
         canonical_quota_key="codex_spark",
@@ -2274,6 +2281,113 @@ async def test_v1_responses_http_bridge_previous_response_alias_rejects_service_
             return SimpleNamespace(account_plans={account_id: "pro"})
 
     monkeypatch.setattr(proxy_support, "get_model_registry", lambda: Registry())
+
+    fallback_session_id = "priority-compatible-session"
+    fallback_key = proxy_module._HTTPBridgeSessionKey("session_header", fallback_session_id, None)
+    fallback_upstream = _FakeBridgeUpstreamWebSocket()
+    fallback_session = proxy_module._HTTPBridgeSession(
+        key=fallback_key,
+        headers={"x-codex-session-id": fallback_session_id},
+        affinity=proxy_module._AffinityPolicy(
+            key=fallback_session_id,
+            kind=proxy_module.StickySessionKind.CODEX_SESSION,
+        ),
+        request_model="gpt-5.3-codex-spark",
+        account=account,
+        upstream=cast(proxy_module.UpstreamResponsesWebSocket, fallback_upstream),
+        upstream_control=proxy_module._WebSocketUpstreamControl(),
+        pending_requests=deque(),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=0,
+        last_used_at=time.monotonic(),
+        idle_ttl_seconds=120.0,
+        request_service_tier="priority",
+        catalog_omission_quota_admission=CatalogOmissionQuotaAdmission(
+            normalized_model="gpt-5.3-codex-spark",
+            canonical_quota_key="codex_spark",
+            normalized_effective_service_tier="priority",
+        ),
+    )
+    fallback_session.upstream_reader = asyncio.create_task(
+        service._relay_http_bridge_upstream_messages(fallback_session)
+    )
+    service._http_bridge_sessions[fallback_key] = fallback_session
+    create_http_bridge_session = AsyncMock(
+        side_effect=AssertionError("anchored mismatch must fail before bridge creation")
+    )
+    monkeypatch.setattr(service, "_create_http_bridge_session", create_http_bridge_session)
+    scheduled_sessions: list[proxy_module._HTTPBridgeSession] = []
+    schedule_session_closes = service._schedule_http_bridge_session_closes
+
+    def capture_scheduled_sessions(sessions, *, reason):
+        scheduled_sessions.extend(sessions)
+        schedule_session_closes(sessions, reason=reason)
+
+    monkeypatch.setattr(service, "_schedule_http_bridge_session_closes", capture_scheduled_sessions)
+    owner_state_before = (
+        owner_session.request_model,
+        owner_session.request_service_tier,
+        owner_session.catalog_omission_quota_admission,
+        owner_session.upstream,
+        set(owner_session.previous_response_ids),
+    )
+    fallback_state_before = (
+        fallback_session.request_model,
+        fallback_session.request_service_tier,
+        fallback_session.catalog_omission_quota_admission,
+        fallback_session.upstream,
+        set(fallback_session.previous_response_ids),
+    )
+    owner_request_count = len(owner_upstream.sent_text)
+    fallback_request_count = len(fallback_upstream.sent_text)
+
+    rejected = await async_client.post(
+        "/v1/responses",
+        headers={
+            "x-codex-turn-state": "http_turn_previous_response_tier_fallback",
+            "x-codex-session-id": fallback_session_id,
+        },
+        json={
+            "model": "gpt-5.3-codex-spark",
+            "instructions": "Return exactly OK.",
+            "input": "must fail before session fallback",
+            "previous_response_id": previous_response_id,
+            "service_tier": "priority",
+        },
+    )
+
+    assert len(fallback_upstream.sent_text) == fallback_request_count
+    assert rejected.status_code == 502, rejected.text
+    assert rejected.json()["error"] == {
+        "message": "Upstream websocket closed before response.completed",
+        "type": "server_error",
+        "code": "stream_incomplete",
+    }
+    create_http_bridge_session.assert_not_awaited()
+    assert len(owner_upstream.sent_text) == owner_request_count
+    assert owner_session.closed is False
+    assert fallback_session.closed is False
+    assert service._http_bridge_sessions[owner_key] is owner_session
+    assert service._http_bridge_sessions[fallback_key] is fallback_session
+    assert owner_session not in scheduled_sessions
+    assert fallback_session not in scheduled_sessions
+    assert service._http_bridge_previous_response_index == previous_response_index_before
+    assert service._http_bridge_turn_state_index == turn_state_index_before
+    assert (
+        owner_session.request_model,
+        owner_session.request_service_tier,
+        owner_session.catalog_omission_quota_admission,
+        owner_session.upstream,
+        set(owner_session.previous_response_ids),
+    ) == owner_state_before
+    assert (
+        fallback_session.request_model,
+        fallback_session.request_service_tier,
+        fallback_session.catalog_omission_quota_admission,
+        fallback_session.upstream,
+        set(fallback_session.previous_response_ids),
+    ) == fallback_state_before
 
     with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
         await service._get_or_create_http_bridge_session(

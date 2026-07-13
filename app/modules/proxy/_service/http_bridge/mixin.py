@@ -590,7 +590,9 @@ class _HTTPBridgeMixin(
                                 previous_session.request_model, request_model
                             ):
                                 model_transition_rebind = True
-                            elif previous_key is not None and _http_bridge_alias_target_is_stale(previous_session):
+                            elif not _http_bridge_alias_target_is_stale(previous_session):
+                                raise ProxyResponseError(502, _http_bridge_continuity_lost_error_envelope())
+                            elif previous_key is not None:
                                 self._http_bridge_previous_response_index.pop(previous_alias_key, None)
                         if model_transition_rebind:
                             key = _HTTPBridgeSessionKey("turn_state_header", incoming_turn_state, api_key_id)
