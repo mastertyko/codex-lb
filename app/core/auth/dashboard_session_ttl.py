@@ -37,7 +37,7 @@ def _allows_long_local_dashboard_session(request: HTTPConnection) -> bool:
         return True
     if not settings.dashboard_trust_loopback_host_header_for_long_sessions:
         return False
-    if any(request.headers.get(header) for header in _FORWARDED_CLIENT_IP_HEADERS):
+    if any(value for header in _FORWARDED_CLIENT_IP_HEADERS for value in request.headers.getlist(header)):
         return False
     return _uses_loopback_dashboard_url(request)
 
