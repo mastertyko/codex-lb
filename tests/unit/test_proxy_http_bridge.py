@@ -10039,7 +10039,7 @@ async def test_get_or_create_http_bridge_session_preserves_session_header_fallba
     service._http_bridge_sessions[parent_key] = parent
     captured: dict[str, object] = {}
     model_fork_keys: list[proxy_service._HTTPBridgeSessionKey] = []
-    incompatible_model_fork_key = http_bridge_mixin_module._http_bridge_incompatible_model_fork_key
+    incompatible_model_fork_key = http_bridge_helpers_module._http_bridge_incompatible_model_fork_key
 
     def track_incompatible_model_fork_key(**kwargs: Any) -> proxy_service._HTTPBridgeSessionKey | None:
         fork_key = incompatible_model_fork_key(**kwargs)
@@ -10057,7 +10057,7 @@ async def test_get_or_create_http_bridge_session_preserves_session_header_fallba
         return child
 
     monkeypatch.setattr(
-        http_bridge_mixin_module,
+        http_bridge_helpers_module,
         "_http_bridge_incompatible_model_fork_key",
         track_incompatible_model_fork_key,
     )
