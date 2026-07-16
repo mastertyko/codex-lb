@@ -319,7 +319,7 @@ async def test_login_password_caps_non_loopback_dashboard_session_ttl():
 
 
 @pytest.mark.asyncio
-async def test_login_password_caps_later_duplicate_forwarded_identity():
+async def test_login_password_caps_later_duplicate_forwarded_identity_from_loopback_socket():
     limiter = SimpleNamespace(
         check_and_increment=AsyncMock(),
         clear_for_key=AsyncMock(),
@@ -365,7 +365,7 @@ async def test_login_password_caps_later_duplicate_forwarded_identity():
         response = await login_password(
             _build_login_request(
                 "/api/dashboard-auth/password/login",
-                client_host="172.17.0.1",
+                client_host="127.0.0.1",
                 host="127.0.0.1:2455",
                 headers=[
                     (b"x-forwarded-for", b""),

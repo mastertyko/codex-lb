@@ -122,14 +122,14 @@ def test_long_dashboard_session_ttl_accepts_only_empty_repeated_forwarded_fields
     assert ttl_seconds == DEFAULT_DASHBOARD_SESSION_TTL_SECONDS
 
 
-def test_long_dashboard_session_ttl_clamps_for_later_duplicate_forwarded_identity(
+def test_long_dashboard_session_ttl_clamps_for_later_duplicate_forwarded_identity_from_loopback_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_settings(monkeypatch, _settings(trust_loopback_host_header=True))
 
     ttl_seconds = resolve_dashboard_session_ttl_seconds(
         _request(
-            client_host="172.17.0.1",
+            client_host="127.0.0.1",
             host="127.0.0.1:2455",
             headers=[(b"x-forwarded-for", b""), (b"x-forwarded-for", b"203.0.113.24")],
         ),
