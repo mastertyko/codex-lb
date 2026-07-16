@@ -138,6 +138,8 @@ def test_forwarded_chain_traverses_only_complete_trusted_proxy_path() -> None:
         'for=203.0.113.24;proto=abc"def"',
         'for=203.0.113.24;proto="bad\x01value"',
         'for="[fe80::1%eth0]"',
+        "for =127.0.0.1",
+        "for= 127.0.0.1",
         "for=203.0.113.24; proto",
     ],
 )

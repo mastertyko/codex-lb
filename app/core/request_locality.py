@@ -267,9 +267,11 @@ def _parse_forwarded_node(value: str, *, is_quoted: bool) -> str:
 
 def _parse_forwarded_pair(parameter: str) -> tuple[str, str, bool]:
     name, separator, raw_value = parameter.partition("=")
-    normalized_name = name.strip().lower()
-    value = raw_value.strip()
-    if not separator or not _is_http_token(normalized_name) or not value:
+    if not separator or name != name.strip() or raw_value != raw_value.strip():
+        raise ValueError("Malformed Forwarded parameter")
+    normalized_name = name.lower()
+    value = raw_value
+    if not _is_http_token(normalized_name) or not value:
         raise ValueError("Malformed Forwarded parameter")
     if value.startswith('"'):
         return normalized_name, _unquote_forwarded_value(value), True
