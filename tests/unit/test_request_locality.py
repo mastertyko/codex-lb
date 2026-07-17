@@ -241,6 +241,7 @@ def test_connection_resolver_rejects_repeated_singleton_before_valid_xff() -> No
 
     assert resolved is None
 
+
 @pytest.mark.parametrize("trusted_cidrs", [[], ["10.0.0.0/8"]], ids=["empty", "nonmatching"])
 def test_trusted_proxy_mode_rejects_forwarded_hint_from_untrusted_loopback_peer(
     monkeypatch: pytest.MonkeyPatch,
