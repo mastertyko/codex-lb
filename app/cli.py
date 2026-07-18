@@ -126,9 +126,12 @@ def _build_log_config() -> "LogConfig":
 
 def _parse_server_port(raw_port: str) -> int:
     try:
-        return int(raw_port)
+        port = int(raw_port)
     except ValueError as exc:
-        raise SystemExit(f"--port/PORT must be an integer, got {raw_port!r}.") from exc
+        raise SystemExit(f"--port/PORT must be an integer between 0 and 65535 inclusive, got {raw_port!r}.") from exc
+    if not 0 <= port <= 65535:
+        raise SystemExit(f"--port/PORT must be between 0 and 65535 inclusive, got {raw_port!r}.")
+    return port
 
 
 def _parse_server_timeout_keep_alive(raw_timeout: str) -> int:
