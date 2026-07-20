@@ -1,7 +1,7 @@
 ## 1. Baseline and characterization
 
-- [ ] 1.1 Create a replacement implementation branch from current `main`, port PR #1416's focused `service.py` / `_service/support.py` diff, and record in the eventual PR that it supersedes #1416; leave closure of the older PR to a maintainer.
-  - The PR #1416 code move is ported exactly. Branch creation and eventual PR supersession text remain deferred until explicit user approval for those git actions.
+- [x] 1.1 Create a replacement implementation branch from current `main`, port PR #1416's focused `service.py` / `_service/support.py` diff, and record in the eventual PR that it supersedes #1416; leave closure of the older PR to a maintainer.
+  - Draft PR #1430 uses the replacement branch, ports PR #1416's code move exactly, records the supersession relationship, and leaves closure of #1416 to a maintainer.
 - [x] 1.2 Add or identify public-boundary `LoadBalancer.select_account()` characterization cases for non-sticky and sticky success, required-owner conflict, ambiguous ownership, hard-affinity saturation, account-cap exhaustion, stale persistence retry, and cancellation/exception lease cleanup; additionally assert cache-generation reselection on the non-sticky path and exactly-once lease release wherever either path has acquired a lease.
 - [x] 1.3 Run the focused characterization set before code movement and record the passing baseline and current architecture-check failures.
   - Before movement, the focused contract/concurrency baseline passed 57/57; the checker reported `service.py` 2,604/2,600, `load_balancer.py` 3,260/3,021, and `select_account()` 699/527.
