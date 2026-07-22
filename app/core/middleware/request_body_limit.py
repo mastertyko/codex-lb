@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from fastapi import FastAPI
+from starlette._utils import get_route_path
 from starlette.datastructures import Headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -57,7 +58,7 @@ def request_ingress_error_response(
     code: str,
     message: str,
 ) -> JSONResponse:
-    uses_openai_errors = _uses_openai_ingress_errors(request.url.path)
+    uses_openai_errors = _uses_openai_ingress_errors(get_route_path(request.scope))
     response_code = "invalid_request_error" if uses_openai_errors and code == "invalid_request" else code
     log_error_response(
         logger,
@@ -118,7 +119,7 @@ class RequestBodyLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        path = scope.get("path", "")
+        path = get_route_path(scope)
         limit = request_body_limit_for_path(path)
         declared_length = _declared_content_length(headers)
         if declared_length is not None and declared_length > limit:

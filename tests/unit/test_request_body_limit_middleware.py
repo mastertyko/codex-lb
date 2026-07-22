@@ -27,7 +27,12 @@ def _configure_limits(monkeypatch: pytest.MonkeyPatch, *, general: int, response
     get_settings.cache_clear()
 
 
-def _http_scope(path: str = "/echo", *, headers: list[tuple[bytes, bytes]] | None = None) -> Scope:
+def _http_scope(
+    path: str = "/echo",
+    *,
+    root_path: str = "",
+    headers: list[tuple[bytes, bytes]] | None = None,
+) -> Scope:
     return {
         "type": "http",
         "asgi": {"version": "3.0"},
@@ -37,7 +42,7 @@ def _http_scope(path: str = "/echo", *, headers: list[tuple[bytes, bytes]] | Non
         "path": path,
         "raw_path": path.encode("ascii"),
         "query_string": b"",
-        "root_path": "",
+        "root_path": root_path,
         "headers": headers or [],
         "client": ("testclient", 50000),
         "server": ("testserver", 80),
@@ -256,6 +261,35 @@ async def test_responses_paths_use_larger_budget_including_trailing_slash(monkey
         )
         assert inner.chunks == [b"12345678"]
         assert sent[0]["status"] == 204
+
+
+@pytest.mark.asyncio
+async def test_root_path_responses_uses_route_budget_and_openai_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure_limits(monkeypatch, general=5, responses=8)
+    mounted_scope = _http_scope("/api/v1/responses", root_path="/api")
+
+    admitted_inner = _BodyConsumer()
+    admitted = await _run_direct(
+        RequestBodyLimitMiddleware(admitted_inner),
+        mounted_scope,
+        _request_messages(b"12345678"),
+    )
+
+    assert admitted_inner.chunks == [b"12345678"]
+    assert admitted[0]["status"] == 204
+
+    rejected = await _run_direct(
+        RequestBodyLimitMiddleware(_BodyConsumer()),
+        {**mounted_scope, "headers": [(b"content-length", b"9")]},
+        _request_messages(b"123456789"),
+    )
+
+    assert rejected[0]["status"] == 413
+    assert _json_response_body(rejected)["error"] == {
+        "message": "Request body exceeds the maximum allowed size",
+        "type": "invalid_request_error",
+        "code": "payload_too_large",
+    }
 
 
 @pytest.mark.asyncio

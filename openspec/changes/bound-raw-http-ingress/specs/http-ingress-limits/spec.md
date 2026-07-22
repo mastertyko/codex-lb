@@ -29,6 +29,8 @@ The service MUST enforce the applicable request-body budget against actual raw b
 
 The service MUST use `max_decompressed_body_bytes` as the general raw and decompressed HTTP request-body budget. When an owning route capability defines a larger budget from an existing route-specific setting, the ingress guard MUST use that route budget. The HTTP ingress guard MUST NOT add another setting or change existing defaults.
 
+Route-specific budget and error-envelope selection MUST use the application-relative route path after removing any matching ASGI `root_path` prefix.
+
 Requests declaring `multipart/form-data` without `Content-Encoding` MUST remain outside this generic whole-body guard. Multipart requests carrying `Content-Encoding` MUST remain guarded. The service MUST NOT treat the client-declared multipart media type as a trusted security boundary.
 
 #### Scenario: Another HTTP path uses the general budget
@@ -45,6 +47,13 @@ Requests declaring `multipart/form-data` without `Content-Encoding` MUST remain 
 
 - **WHEN** a `multipart/form-data` request carries a `Content-Encoding` header
 - **THEN** the service applies both the raw and decompressed budget checks
+
+#### Scenario: Mounted Responses route keeps its route-specific policy
+
+- **GIVEN** the service is mounted under a non-empty ASGI `root_path`
+- **WHEN** the request scope path includes that prefix and targets `/v1/responses` relative to the application
+- **THEN** the service applies the Responses-specific ingress budget
+- **AND** any ingress failure uses the OpenAI-compatible error envelope
 
 ### Requirement: Encoded HTTP bodies are bounded before and after decompression
 
