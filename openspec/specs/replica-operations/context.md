@@ -89,8 +89,10 @@ retry once on conflict because their mutations are idempotent absolute writes.
 
 - **Websocket turns are not drained on shutdown** — drain rejects new HTTP work but neither
   rejects new websocket scopes nor waits for in-flight websocket turns. HTTP and bridge teardown
-  does drain tracked proxy-persistence tasks, including request logs enqueued while bridge
-  sessions close, before the database closes. Follow-up: `graceful-drain-lifecycle`.
+  waits up to the configured drain timeout for tracked proxy-persistence tasks, including request
+  logs enqueued while bridge sessions close. If that bounded wait times out or raises, shutdown
+  continues to database close, so the last request logs or settlements can still be lost.
+  Follow-up: `graceful-drain-lifecycle`.
 - **`file_id` → account pins are process-local best-effort** — file finalize/input_file requests
   landing on another replica can route to an account that does not own the file. Follow-up:
   `persist-file-account-pins`.
