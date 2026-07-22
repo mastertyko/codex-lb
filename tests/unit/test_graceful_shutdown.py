@@ -63,6 +63,43 @@ async def test_wait_for_tasks_to_drain_returns_pending_at_deadline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_wait_for_tasks_to_drain_resnapshots_registry_at_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_gate = asyncio.Event()
+    late_gate = asyncio.Event()
+
+    async def wait_for_gate(gate: asyncio.Event) -> None:
+        await gate.wait()
+
+    initial_task = asyncio.create_task(wait_for_gate(initial_gate), name="initial-task")
+    tasks = {initial_task}
+    late_task: asyncio.Task[None] | None = None
+
+    async def add_late_task_then_timeout(
+        pending: set[asyncio.Task[None]],
+        *,
+        timeout: float,
+    ) -> tuple[set[asyncio.Task[None]], set[asyncio.Task[None]]]:
+        nonlocal late_task
+        assert timeout > 0
+        late_task = asyncio.create_task(wait_for_gate(late_gate), name="late-task")
+        tasks.add(late_task)
+        return set(), pending
+
+    monkeypatch.setattr(shutdown_state.asyncio, "wait", add_late_task_then_timeout)
+
+    overdue = await wait_for_tasks_to_drain(tasks, timeout_seconds=1)
+
+    assert late_task is not None
+    assert overdue == {initial_task, late_task}
+
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_control_plane_drains_are_failure_isolated(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,

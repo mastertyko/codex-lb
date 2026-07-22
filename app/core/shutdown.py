@@ -81,4 +81,4 @@ async def wait_for_tasks_to_drain(
 
         _, still_pending = await asyncio.wait(pending, timeout=remaining)
         if still_pending:
-            return still_pending
+            return {task for task in tasks if not task.done()}
