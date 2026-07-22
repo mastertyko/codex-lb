@@ -29,9 +29,12 @@ A supported multi-replica deployment looks like:
   replica and a reachable replica-specific advertise URL so hard-continuity requests landing on
   the wrong replica can be forwarded to the owner (see `sticky-session-operations` and
   `responses-api-compat` for the forwarding mechanics). Live membership and advertise endpoints
-  are registered and discovered through the shared database. `..._INSTANCE_RING` is an optional
-  static override for testing or debugging, not a production prerequisite; it is incompatible
-  with autoscaling.
+  are registered and discovered through the shared database. In the normal runtime that live,
+  endpoint-bearing database set determines routing; `..._INSTANCE_RING` does not override or
+  restrict it. The static list remains a legacy fallback for internal/test paths constructed
+  without a membership reader and a configuration hint for multi-replica validation. Empty live
+  discovery uses only the current instance, and lookup failures fail closed rather than falling
+  back to the static list.
 - **Shared encryption key** — the same `encryption.key` file mounted on every replica. Verified
   at startup against the `runtime_sentinels` fingerprint (below).
 
