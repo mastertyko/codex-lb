@@ -124,6 +124,38 @@ async def test_control_plane_drains_are_failure_isolated(
 
 
 @pytest.mark.asyncio
+async def test_control_plane_drain_requires_stable_clean_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    audit_calls = 0
+    fleet_calls = 0
+    late_fleet_seen = False
+
+    async def drain_audit(_: float) -> bool:
+        nonlocal audit_calls
+        audit_calls += 1
+        return True
+
+    async def drain_fleet(_: float) -> bool:
+        nonlocal fleet_calls, late_fleet_seen
+        fleet_calls += 1
+        if fleet_calls == 1:
+            await asyncio.sleep(0)
+            return True
+        late_fleet_seen = True
+        return True
+
+    monkeypatch.setattr(app_main, "drain_audit_log_tasks", drain_audit)
+    monkeypatch.setattr(app_main.fleet_api, "drain_background_refresh_tasks", drain_fleet)
+
+    await _drain_detached_control_plane_tasks(1)
+
+    assert audit_calls == 2
+    assert fleet_calls == 2
+    assert late_fleet_seen is True
+
+
+@pytest.mark.asyncio
 async def test_release_leader_lease_within_returns_when_release_wedged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

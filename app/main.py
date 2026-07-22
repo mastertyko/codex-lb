@@ -136,18 +136,40 @@ async def _release_leader_lease_within(timeout: float) -> None:
 
 
 async def _drain_detached_control_plane_tasks(timeout_seconds: float) -> None:
-    results = await asyncio.gather(
-        drain_audit_log_tasks(timeout_seconds),
-        fleet_api.drain_background_refresh_tasks(timeout_seconds),
-        return_exceptions=True,
-    )
-    for task_kind, result in zip(("audit log", "fleet refresh"), results, strict=True):
-        if isinstance(result, BaseException):
-            logger.warning(
-                "Failed to drain %s tasks during shutdown",
-                task_kind,
-                exc_info=(type(result), result, result.__traceback__),
-            )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_seconds
+    clean_passes = 0
+
+    while clean_passes < 2:
+        remaining = max(0.0, deadline - loop.time())
+        results = await asyncio.gather(
+            drain_audit_log_tasks(remaining),
+            fleet_api.drain_background_refresh_tasks(remaining),
+            return_exceptions=True,
+        )
+
+        clean_pass = True
+        for task_kind, result in zip(("audit log", "fleet refresh"), results, strict=True):
+            if isinstance(result, BaseException):
+                clean_pass = False
+                logger.warning(
+                    "Failed to drain %s tasks during shutdown",
+                    task_kind,
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+            elif result is False:
+                clean_pass = False
+
+        if not clean_pass:
+            return
+
+        clean_passes += 1
+
+        # A done callback may enqueue sibling audit/fleet work after both
+        # registries looked empty. One extra stable pass catches that before
+        # HTTP clients and DB engines are torn down.
+        if clean_passes < 2:
+            await asyncio.sleep(0)
 
 
 class _MetricsServer(Protocol):
