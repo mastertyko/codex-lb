@@ -7,7 +7,7 @@ import pytest
 from fastapi import FastAPI, Request
 from httpx import ASGITransport, AsyncClient
 
-from app.core.auth.dashboard_mode import DashboardAuthMode
+from app.core.auth.dashboard_mode import DashboardAuthMode, get_dashboard_request_auth
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
@@ -99,6 +99,17 @@ def _set_proxy_unauthenticated_client_cidrs_env(
 ) -> None:
     monkeypatch.setenv("CODEX_LB_PROXY_UNAUTHENTICATED_CLIENT_CIDRS", cidrs)
     get_settings.cache_clear()
+
+
+def _add_dashboard_proxy_header_echo_route(app: FastAPI) -> None:
+    @app.get("/test/dashboard-proxy-header")
+    async def echo_dashboard_proxy_header(request: Request) -> dict[str, str | None]:
+        return {
+            "remote_user": request.headers.get("Remote-User"),
+            "client_host": request.client.host if request.client is not None else None,
+        }
+
+    app.router.routes.insert(0, app.router.routes.pop())
 
 
 async def _enable_guest_access(client: AsyncClient) -> dict[str, object]:
@@ -743,6 +754,85 @@ async def test_trusted_header_mode_requires_proxy_header_for_open_dashboard(asyn
 
 
 @pytest.mark.asyncio
+async def test_trusted_header_mode_rejects_spoofed_proxy_identity_from_untrusted_raw_peer(
+    app_instance,
+    monkeypatch,
+):
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+    _set_dashboard_auth_env(
+        monkeypatch,
+        mode=DashboardAuthMode.TRUSTED_HEADER,
+        trust_proxy_headers=True,
+        trusted_proxy_cidrs="10.0.0.0/8",
+    )
+
+    _add_dashboard_proxy_header_echo_route(app_instance)
+
+    async with app_instance.router.lifespan_context(app_instance):
+        transport = ASGITransport(app=app_instance, client=("203.0.113.24", 50000))
+        async with AsyncClient(transport=transport, base_url="http://lb.example") as direct_client:
+            header_response = await direct_client.get(
+                "/test/dashboard-proxy-header",
+                headers={
+                    "X-Forwarded-For": "10.0.0.2",
+                    "Remote-User": "attacker@example.com",
+                },
+            )
+            response = await direct_client.get(
+                "/api/settings",
+                headers={
+                    "X-Forwarded-For": "10.0.0.2",
+                    "Remote-User": "attacker@example.com",
+                },
+            )
+
+    assert (
+        header_response.status_code,
+        header_response.json(),
+        response.status_code,
+    ) == (200, {"remote_user": None, "client_host": "10.0.0.2"}, 401)
+    assert response.json()["error"]["code"] == "proxy_auth_required"
+
+
+@pytest.mark.asyncio
+async def test_trusted_header_mode_accepts_identity_from_trusted_raw_proxy(
+    app_instance,
+    monkeypatch,
+):
+    monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+    _set_dashboard_auth_env(
+        monkeypatch,
+        mode=DashboardAuthMode.TRUSTED_HEADER,
+        trust_proxy_headers=True,
+        trusted_proxy_cidrs="10.0.0.0/8",
+    )
+    _add_dashboard_proxy_header_echo_route(app_instance)
+
+    async with app_instance.router.lifespan_context(app_instance):
+        transport = ASGITransport(app=app_instance, client=("10.0.0.2", 50000))
+        async with AsyncClient(transport=transport, base_url="http://lb.example") as proxy_client:
+            headers = {
+                "X-Forwarded-For": "203.0.113.24",
+                "Remote-User": "admin@example.com",
+            }
+            header_response = await proxy_client.get(
+                "/test/dashboard-proxy-header",
+                headers=headers,
+            )
+            response = await proxy_client.get("/api/settings", headers=headers)
+
+    assert (
+        header_response.status_code,
+        header_response.json(),
+        response.status_code,
+    ) == (
+        200,
+        {"remote_user": "admin@example.com", "client_host": "203.0.113.24"},
+        200,
+    )
+
+
+@pytest.mark.asyncio
 async def test_trusted_header_mode_rejects_guest_login_without_proxy_header(async_client, monkeypatch):
     _set_dashboard_auth_env(
         monkeypatch,
@@ -1012,7 +1102,7 @@ async def test_trusted_header_proxy_auth_with_fallback_password_reports_no_activ
 
 
 @pytest.mark.asyncio
-async def test_trusted_header_mode_scrubs_untrusted_proxy_header(monkeypatch):
+async def test_trusted_header_mode_scrubs_proxy_header_and_denies_auth_without_raw_peer_capture(monkeypatch):
     _set_dashboard_auth_env(
         monkeypatch,
         mode=DashboardAuthMode.TRUSTED_HEADER,
@@ -1024,9 +1114,13 @@ async def test_trusted_header_mode_scrubs_untrusted_proxy_header(monkeypatch):
 
     @app.get("/dashboard-proxy-header")
     async def echo_dashboard_proxy_header(request: Request) -> dict[str, str | None]:
-        return {"remote_user": request.headers.get("Remote-User")}
+        auth = get_dashboard_request_auth(request)
+        return {
+            "remote_user": request.headers.get("Remote-User"),
+            "actor": auth.actor if auth is not None else None,
+        }
 
-    transport = ASGITransport(app=app)
+    transport = ASGITransport(app=app, client=("10.0.0.2", 50000))
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         response = await client.get(
             "/dashboard-proxy-header",
@@ -1034,7 +1128,7 @@ async def test_trusted_header_mode_scrubs_untrusted_proxy_header(monkeypatch):
         )
 
     assert response.status_code == 200
-    assert response.json() == {"remote_user": None}
+    assert response.json() == {"remote_user": None, "actor": None}
 
 
 @pytest.mark.asyncio
