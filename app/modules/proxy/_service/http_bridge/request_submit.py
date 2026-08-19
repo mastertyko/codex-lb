@@ -122,6 +122,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _upstream_response_create_max_bytes,
     _websocket_auth_failure_permanent_code,
     _websocket_auth_failure_requires_reauth,
+    _websocket_request_text_is_account_neutral_fresh_replay,
 )
 from app.modules.proxy._service.observability import (
     _hash_identifier as _hash_identifier,
@@ -3126,10 +3127,16 @@ class _HTTPBridgeRequestSubmitMixin:
                 # Account-scoped uploaded files cannot be replayed on a
                 # different owner. Keep the preferred account mandatory for
                 # both silent recovery and clean-close recovery.
+                candidate_text = (
+                    request_state.fresh_upstream_request_text
+                    if request_state.fresh_upstream_request_is_retry_safe and request_state.fresh_upstream_request_text
+                    else request_state.request_text
+                )
+                candidate_portable = _websocket_request_text_is_account_neutral_fresh_replay(candidate_text)
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
-                if request_text is None:
+                if request_text is None or request_text != candidate_text:
                     return False
-                account_bound_replay = _prepare_websocket_request_state_for_account_switch(request_state) is None
+                account_bound_replay = not candidate_portable
                 require_preferred_reconnect = (
                     account_neutral_recovery or account_bound_replay or request_state.file_required_preferred_account
                 )

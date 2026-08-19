@@ -383,6 +383,7 @@ from app.modules.proxy._service.warmup import (
 from app.modules.proxy._service.websocket.helpers import (
     _app_error_to_websocket_event,
     _assign_websocket_response_id,
+    _bind_websocket_request_dispatch_owner,
     _find_websocket_request_state_by_response_id,
     _forget_websocket_stale_previous_response,
     _is_websocket_response_create,
@@ -672,19 +673,15 @@ def _websocket_archive_request_state_for_payload(
     if response_id is not None:
         return _find_websocket_request_state_by_response_id(pending_requests, response_id)
     error_message = _websocket_event_error_message(event_type, payload)
+    raw_error_code = _websocket_event_error_code(event_type, payload)
+    raw_error_type = _websocket_event_error_type(event_type, payload)
     is_previous_response_not_found_event = _facade()._is_previous_response_not_found_error(
-        code=_normalize_error_code(
-            _websocket_event_error_code(event_type, payload),
-            _websocket_event_error_type(event_type, payload),
-        ),
+        code=raw_error_code or raw_error_type,
         param=_websocket_event_error_param(event_type, payload),
         message=error_message,
     )
     is_missing_tool_output_event = _facade()._is_missing_tool_output_error(
-        code=_normalize_error_code(
-            _websocket_event_error_code(event_type, payload),
-            _websocket_event_error_type(event_type, payload),
-        ),
+        code=_normalize_error_code(raw_error_code, raw_error_type),
         param=_websocket_event_error_param(event_type, payload),
         message=error_message,
     )
@@ -2575,6 +2572,19 @@ class _WebSocketMixin:
                     if text_data is not None:
                         archive_request_id = None if request_state is None else request_state.archive_request_id
                         if request_state is not None and payload is not None and _is_websocket_response_create(payload):
+                            if account is None or not _bind_websocket_request_dispatch_owner(
+                                request_state,
+                                account_id=account.id,
+                                exact_request_text=text_data,
+                            ):
+                                raise ProxyResponseError(
+                                    502,
+                                    openai_error(
+                                        "previous_response_owner_unavailable",
+                                        "Request payload owner account is unavailable; retry later.",
+                                        error_type="server_error",
+                                    ),
+                                )
                             request_state.response_create_sent_at = time.monotonic()
                         with _websocket_archive_request_context(archive_request_id):
                             await upstream.send_text(text_data)
@@ -3441,7 +3451,11 @@ class _WebSocketMixin:
         for attempt in range(max_attempts):
             is_retry = attempt > 0
             forced_refresh_account_id = request_state.force_refresh_account_id
-            preferred_account_id = forced_refresh_account_id or request_state.preferred_account_id
+            preferred_account_id = (
+                request_state.replay_required_account_id
+                or forced_refresh_account_id
+                or request_state.preferred_account_id
+            )
             turn_state_owner_required = (
                 request_state.affinity_policy.codex_session_source == "turn_state"
                 and request_state.preferred_account_id is not None
@@ -5090,19 +5104,15 @@ class _WebSocketMixin:
             and not isinstance(payload.get("type"), str)
             and isinstance(payload.get("error"), dict)
         )
+        raw_error_code = _websocket_event_error_code(event_type, payload)
+        raw_error_type = _websocket_event_error_type(event_type, payload)
         is_previous_response_not_found_event = _facade()._is_previous_response_not_found_error(
-            code=_normalize_error_code(
-                _websocket_event_error_code(event_type, payload),
-                _websocket_event_error_type(event_type, payload),
-            ),
+            code=raw_error_code or raw_error_type,
             param=_websocket_event_error_param(event_type, payload),
             message=error_message,
         )
         is_missing_tool_output_event = _facade()._is_missing_tool_output_error(
-            code=_normalize_error_code(
-                _websocket_event_error_code(event_type, payload),
-                _websocket_event_error_type(event_type, payload),
-            ),
+            code=_normalize_error_code(raw_error_code, raw_error_type),
             param=_websocket_event_error_param(event_type, payload),
             message=error_message,
         )

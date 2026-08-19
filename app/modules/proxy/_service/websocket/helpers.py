@@ -469,8 +469,27 @@ def _websocket_request_text_is_account_neutral_fresh_replay(request_text: str | 
         return False
     if not isinstance(payload, dict):
         return False
+    event_type = payload.get("type")
+    if event_type is not None and event_type != "response.create":
+        return False
     payload.pop("type", None)
     return responses_payload_is_account_neutral_fresh_replay(cast(dict[str, JsonValue], payload))
+
+
+def _bind_websocket_request_dispatch_owner(
+    request_state: "_WebSocketRequestState",
+    *,
+    account_id: str,
+    exact_request_text: str,
+) -> bool:
+    required_account_id = request_state.replay_required_account_id
+    if _websocket_request_text_is_account_neutral_fresh_replay(exact_request_text):
+        return required_account_id is None or required_account_id == account_id
+    if required_account_id is not None and required_account_id != account_id:
+        return False
+    request_state.preferred_account_id = account_id
+    request_state.replay_required_account_id = account_id
+    return True
 
 
 def _prepare_websocket_request_state_for_account_switch(
@@ -786,14 +805,13 @@ def _websocket_precreated_retry_error_code(
     if event_type not in {"error", "response.failed"}:
         return None
 
-    error_code = _normalize_error_code(
-        _websocket_event_error_code(event_type, payload),
-        _websocket_event_error_type(event_type, payload),
-    )
+    raw_error_code = _websocket_event_error_code(event_type, payload)
+    raw_error_type = _websocket_event_error_type(event_type, payload)
+    error_code = _normalize_error_code(raw_error_code, raw_error_type)
     error_param = _websocket_event_error_param(event_type, payload)
     error_message = _websocket_event_error_message(event_type, payload)
     if _facade()._is_previous_response_not_found_error(
-        code=error_code,
+        code=raw_error_code or raw_error_type,
         param=error_param,
         message=error_message,
     ):
@@ -1141,14 +1159,13 @@ def _maybe_rewrite_websocket_previous_response_not_found_event(
     upstream_control: _WebSocketUpstreamControl,
     original_text: str,
 ) -> tuple[OpenAIEvent | None, dict[str, JsonValue] | None, str | None, str]:
-    error_code = _normalize_error_code(
-        _websocket_event_error_code(event_type, payload),
-        _websocket_event_error_type(event_type, payload),
-    )
+    raw_error_code = _websocket_event_error_code(event_type, payload)
+    raw_error_type = _websocket_event_error_type(event_type, payload)
+    error_code = _normalize_error_code(raw_error_code, raw_error_type)
     error_param = _websocket_event_error_param(event_type, payload)
     error_message = _websocket_event_error_message(event_type, payload)
     should_rewrite = _facade()._is_previous_response_not_found_error(
-        code=error_code,
+        code=raw_error_code or raw_error_type,
         param=error_param,
         message=error_message,
     )

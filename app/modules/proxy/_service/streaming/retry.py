@@ -400,6 +400,7 @@ class _StreamingRetryMixin:
         deferred_capacity_account: Account | None = None
         deferred_capacity_lease: AccountLease | None = None
         preferred_account_id: str | None = None
+        payload_replay_required_account_id: str | None = None
         file_preferred_account_id: str | None = rewritten_file_account_id
         require_preferred_account = False
         last_retryable_stream_error: _RetryableStreamError | None = None
@@ -581,19 +582,42 @@ class _StreamingRetryMixin:
             )
             settled = await _settle_stream_usage_before_pending_penalty(settlement)
 
+        def _authorize_payload_dispatch(account: Account) -> None:
+            nonlocal payload_replay_required_account_id
+            required_account_id = payload_replay_required_account_id
+            if required_account_id is not None and required_account_id != account.id:
+                raise ProxyResponseError(
+                    502,
+                    openai_error(
+                        "previous_response_owner_unavailable",
+                        "Request payload owner account is unavailable; retry later.",
+                        error_type="server_error",
+                    ),
+                )
+            if required_account_id is None and not responses_payload_is_account_neutral_fresh_replay(
+                payload.to_replay_safety_payload()
+            ):
+                payload_replay_required_account_id = account.id
+
         def _move_verified_fresh_replay_from_owner(*, account_id: str, outcome: str) -> bool:
             # Only a proxy-injected owner anchor with locally verified full
             # input may move; the failed owner stays excluded so sticky
             # selection cannot immediately loop back to it.
-            nonlocal affinity, payload, preferred_account_id, require_preferred_account, verified_fresh_replay_payload
+            nonlocal affinity, payload, payload_replay_required_account_id
+            nonlocal preferred_account_id, require_preferred_account, verified_fresh_replay_payload
             if not (
                 require_preferred_account
                 and preferred_account_id == account_id
                 and verified_fresh_replay_payload is not None
             ):
                 return False
+            if not responses_payload_is_account_neutral_fresh_replay(
+                verified_fresh_replay_payload.to_replay_safety_payload()
+            ):
+                return False
             payload = verified_fresh_replay_payload
             verified_fresh_replay_payload = None
+            payload_replay_required_account_id = None
             excluded_account_ids.add(account_id)
             preferred_account_id = None
             require_preferred_account = False
@@ -617,6 +641,7 @@ class _StreamingRetryMixin:
             transient_retries = 0
 
             async def _iter_stream_once() -> AsyncGenerator[str, None]:
+                _authorize_payload_dispatch(account)
                 inner_stream = proxy._stream_once(
                     account,
                     payload,
@@ -1041,6 +1066,13 @@ class _StreamingRetryMixin:
                     yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                     return
                 while True:
+                    effective_preferred_account_id = resolve_required_account_id(
+                        ("continuation", preferred_account_id),
+                        ("dispatched payload", payload_replay_required_account_id),
+                    )
+                    effective_require_preferred_account = (
+                        require_preferred_account or payload_replay_required_account_id is not None
+                    )
                     try:
                         selection = await proxy._select_account_with_budget_compatible(
                             deadline,
@@ -1054,7 +1086,7 @@ class _StreamingRetryMixin:
                             model=payload.model,
                             service_tier=payload.service_tier,
                             exclude_account_ids=excluded_account_ids,
-                            preferred_account_id=preferred_account_id,
+                            preferred_account_id=effective_preferred_account_id,
                             require_security_work_authorized=require_security_work_authorized,
                             lease_kind="stream",
                             estimated_lease_tokens=estimated_lease_tokens,
@@ -1062,7 +1094,7 @@ class _StreamingRetryMixin:
                             # verified-fresh replay branch below removes its
                             # anchor before it permits cross-account movement.
                             fallback_on_preferred_account_unavailable=not (
-                                require_preferred_account or file_required_preferred_account
+                                effective_require_preferred_account or file_required_preferred_account
                             ),
                         )
                     except ProxyResponseError as exc:
@@ -1850,6 +1882,7 @@ class _StreamingRetryMixin:
                         )
                         try:
                             settlement = _StreamSettlement()
+                            _authorize_payload_dispatch(account)
                             inner_stream = proxy._stream_once(
                                 account,
                                 payload,

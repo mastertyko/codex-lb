@@ -409,6 +409,55 @@ def test_websocket_account_switch_keeps_fresh_request_body():
     )
 
 
+@pytest.mark.parametrize("event_type", ["response.cancel", "future.request"])
+def test_websocket_account_switch_rejects_unknown_request_type(event_type):
+    request_text = json.dumps(
+        {"type": event_type, "model": "gpt-5.6-sol"},
+        separators=(",", ":"),
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req_ws_unknown_switch",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        request_text=request_text,
+    )
+
+    assert websocket_mixin._prepare_websocket_request_state_for_account_switch(request_state) is None
+    assert request_state.request_text == request_text
+
+
+def test_websocket_dispatch_owner_rejects_account_bound_socket_reuse():
+    request_text = (
+        '{"type":"response.create","model":"gpt-5.6-sol","input":['
+        '{"type":"reasoning","id":"rs_owner","encrypted_content":"owner-bound"}]}'
+    )
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req_ws_dispatch_owner",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=time.monotonic(),
+        request_text=request_text,
+    )
+
+    assert websocket_mixin._bind_websocket_request_dispatch_owner(
+        request_state,
+        account_id="acc_owner",
+        exact_request_text=request_text,
+    )
+    assert not websocket_mixin._bind_websocket_request_dispatch_owner(
+        request_state,
+        account_id="acc_other",
+        exact_request_text=request_text,
+    )
+    assert request_state.preferred_account_id == "acc_owner"
+    assert request_state.replay_required_account_id == "acc_owner"
+
+
 def test_websocket_account_switch_rejects_client_owned_previous_response_chain():
     request_state = proxy_service._WebSocketRequestState(
         request_id="req_ws_client_chain",
@@ -17293,6 +17342,80 @@ async def test_stream_responses_retries_security_work_warning_on_authorized_acco
     assert request_logs.calls[1]["status"] == "success"
     assert regular_lease in released_leases
     assert authorized_lease in released_leases
+
+
+@pytest.mark.asyncio
+async def test_stream_responses_refuses_account_bound_security_work_retry(monkeypatch):
+    settings = _make_proxy_settings()
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    regular_account = _make_account("acc_regular_security_account_bound")
+    authorized_account = _make_account("acc_authorized_security_account_bound")
+    authorized_account.security_work_authorized = True
+    select_account = AsyncMock(
+        side_effect=[
+            AccountSelection(account=regular_account, error_message=None),
+            AccountSelection(account=authorized_account, error_message=None),
+        ]
+    )
+    cyber_message = (
+        "This chat was flagged for possible cybersecurity risk. "
+        "If this seems wrong, try rephrasing your request. "
+        "To get authorized for security work, join the Trusted Access for Cyber program. "
+        "https://chatgpt.com/cyber"
+    )
+    dispatched_account_ids: list[str] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        dispatched_account_ids.append(account_id)
+        if account_id == regular_account.chatgpt_account_id:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "response.failed",
+                        "response": {
+                            "id": "resp_cyber_account_bound",
+                            "error": {
+                                "code": "invalid_request_error",
+                                "type": "invalid_request_error",
+                                "message": cyber_message,
+                            },
+                        },
+                    }
+                )
+                + "\n\n"
+            )
+            return
+        yield 'data: {"type":"response.completed","response":{"id":"resp_cross_account"}}\n\n'
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(service._load_balancer, "select_account", select_account)
+    monkeypatch.setattr(service._load_balancer, "record_error", AsyncMock())
+    monkeypatch.setattr(service._load_balancer, "record_success", AsyncMock())
+    monkeypatch.setattr(service, "_ensure_fresh", AsyncMock(side_effect=lambda account, **kwargs: account))
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_stream)
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "check api",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_owner",
+                    "encrypted_content": "owner-bound",
+                }
+            ],
+            "stream": True,
+        }
+    )
+
+    chunks = [chunk async for chunk in service.stream_responses(payload, {"session_id": "sid-stream"})]
+
+    assert dispatched_account_ids == [regular_account.chatgpt_account_id]
+    assert all("resp_cross_account" not in chunk for chunk in chunks)
 
 
 @pytest.mark.asyncio
@@ -45008,6 +45131,10 @@ async def test_retry_http_bridge_precreated_request_migrates_only_safe_initial_t
 async def test_retry_http_bridge_precreated_request_keeps_account_bound_body_on_owner(monkeypatch):
     service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
     account = _make_account("acc_bridge_account_bound")
+    request_text = (
+        '{"type":"response.create","model":"gpt-5.6-sol","input":['
+        '{"type":"reasoning","id":"rs_owner","encrypted_content":"owner-bound"}]}'
+    )
     request_state = proxy_service._WebSocketRequestState(
         request_id="req_bridge_account_bound",
         model="gpt-5.6-sol",
@@ -45017,10 +45144,7 @@ async def test_retry_http_bridge_precreated_request_keeps_account_bound_body_on_
         started_at=0.0,
         awaiting_response_created=True,
         transport="http",
-        request_text=(
-            '{"type":"response.create","model":"gpt-5.6-sol","input":['
-            '{"type":"reasoning","id":"rs_owner","encrypted_content":"owner-bound"}]}'
-        ),
+        request_text=request_text,
         preferred_account_id=account.id,
     )
     upstream = AsyncMock()
@@ -45042,7 +45166,27 @@ async def test_retry_http_bridge_precreated_request_keeps_account_bound_body_on_
         downstream_turn_state="turn_state_owner",
     )
     reconnect = AsyncMock(return_value=None)
+    portability_snapshots: list[tuple[int, str | None, str | None]] = []
+    original_portability_check = (
+        proxy_http_bridge_request_submit._websocket_request_text_is_account_neutral_fresh_replay
+    )
+
+    def check_portability(candidate_text):
+        portability_snapshots.append(
+            (
+                request_state.replay_count,
+                request_state.response_id,
+                request_state.request_text,
+            )
+        )
+        return original_portability_check(candidate_text)
+
     monkeypatch.setattr(service, "_reconnect_http_bridge_session", reconnect)
+    monkeypatch.setattr(
+        proxy_http_bridge_request_submit,
+        "_websocket_request_text_is_account_neutral_fresh_replay",
+        check_portability,
+    )
 
     assert await service._retry_http_bridge_precreated_request(session) is True
 
@@ -45055,6 +45199,7 @@ async def test_retry_http_bridge_precreated_request_keeps_account_bound_body_on_
     assert request_state.preferred_account_id == account.id
     assert request_state.excluded_account_ids == set()
     assert session.upstream_turn_state == "turn_state_owner"
+    assert portability_snapshots == [(0, None, request_text)]
     upstream.send_text.assert_awaited_once_with(request_state.request_text)
 
 
