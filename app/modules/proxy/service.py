@@ -2283,7 +2283,7 @@ def _partial_output_proxy_error_event_block(
     rewritten_error = _rewrite_previous_response_stream_error(
         previous_response_id=effective_previous_response_id,
         preferred_account_id=preferred_account_id,
-        error_code=error_code,
+        error_code=(error.code or error.type) if error is not None else None,
         error_type=error.type if error else None,
         error_message=error_message,
         error_param=error.param if error else None,

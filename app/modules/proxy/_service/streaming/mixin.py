@@ -279,6 +279,7 @@ from app.modules.proxy._service.streaming.helpers import (
     _mark_upstream_stream_incomplete,
     _raw_stream_error_code_or_upstream,
     _rewrite_malformed_stream_error_event,
+    _stream_error_fields,
 )
 from app.modules.proxy._service.streaming.helpers import (
     _raw_stream_error_fields as _raw_error_fields,
@@ -656,25 +657,19 @@ class _StreamingMixin(_StreamingRetryMixin):
                     if event.type == "response.failed" and event.response and event.response.id
                     else request_id
                 )
+                raw_error_type, raw_error_message, raw_error_param, code, classifier_code = _stream_error_fields(
+                    error,
+                    event_type,
+                    first_payload,
+                    preserve_raw=preserve_raw_sse_line,
+                )
                 if preserve_raw_sse_line and error is None:
-                    raw_error_type, raw_error_message, raw_error_param, code = _raw_error_fields(
-                        event_type,
-                        first_payload,
-                    )
                     settlement.error = cast(UpstreamError, {"message": raw_error_message or "Upstream error"})
-                else:
-                    raw_error_type = error.type if error else None
-                    raw_error_message = error.message if error else None
-                    raw_error_param = error.param if error else None
-                    code = _normalize_error_code(
-                        error.code if error else None,
-                        raw_error_type,
-                    )
                 code = _raw_stream_error_code_or_upstream(event_type, first_payload, code)
                 rewritten_error = _facade()._rewrite_previous_response_stream_error(
                     previous_response_id=payload.previous_response_id,
                     preferred_account_id=preferred_account_id,
-                    error_code=code,
+                    error_code=classifier_code,
                     error_type=raw_error_type,
                     error_message=raw_error_message,
                     error_param=raw_error_param,
@@ -827,15 +822,21 @@ class _StreamingMixin(_StreamingRetryMixin):
                                 settlement.response_id = response_id
                         else:
                             error = event.error
+                        (
+                            raw_error_type,
+                            raw_error_message,
+                            raw_error_param,
+                            raw_error_code,
+                            classifier_code,
+                        ) = _stream_error_fields(
+                            error,
+                            event_type,
+                            event_payload,
+                            preserve_raw=preserve_raw_sse_line,
+                        )
                         if preserve_raw_sse_line and error is None:
-                            _, raw_error_message, _, raw_error_code = _raw_error_fields(event_type, event_payload)
                             upstream_error = cast(UpstreamError, {"message": raw_error_message or "Upstream error"})
                         else:
-                            raw_error_code = _normalize_error_code(
-                                error.code if error else None,
-                                error.type if error else None,
-                            )
-                            raw_error_message = error.message if error else None
                             upstream_error = _upstream_error_from_openai(error)
                         raw_error_code = _raw_stream_error_code_or_upstream(
                             event_type,
@@ -845,10 +846,10 @@ class _StreamingMixin(_StreamingRetryMixin):
                         rewritten_error = _facade()._rewrite_previous_response_stream_error(
                             previous_response_id=payload.previous_response_id,
                             preferred_account_id=preferred_account_id,
-                            error_code=raw_error_code,
-                            error_type=error.type if error else None,
-                            error_message=error.message if error else None,
-                            error_param=error.param if error else None,
+                            error_code=classifier_code,
+                            error_type=raw_error_type,
+                            error_message=raw_error_message,
+                            error_param=raw_error_param,
                         )
                         if rewritten_error is not None:
                             response_id = (
@@ -958,10 +959,7 @@ class _StreamingMixin(_StreamingRetryMixin):
             rewritten_error = _facade()._rewrite_previous_response_stream_error(
                 previous_response_id=payload.previous_response_id,
                 preferred_account_id=preferred_account_id,
-                error_code=_normalize_error_code(
-                    error.code if error else None,
-                    error.type if error else None,
-                ),
+                error_code=(error.code or error.type) if error is not None else None,
                 error_type=error.type if error else None,
                 error_message=error.message if error else None,
                 error_param=error.param if error else None,

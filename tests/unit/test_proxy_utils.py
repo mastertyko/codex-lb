@@ -49,7 +49,7 @@ from app.core.clients.proxy_websocket import (
 )
 from app.core.config.settings import Settings
 from app.core.crypto import TokenEncryptor
-from app.core.errors import openai_error
+from app.core.errors import OpenAIErrorEnvelope, openai_error
 from app.core.exceptions import ProxyReasoningEffortNotAllowed
 from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
 from app.core.openai.parsing import parse_sse_event
@@ -35980,7 +35980,12 @@ async def test_stream_incomplete_records_success_without_account_error(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_stream_previous_response_not_found_proxy_error_is_masked_to_stream_incomplete(monkeypatch, caplog):
+@pytest.mark.parametrize("bare_error", [False, True], ids=["structured", "bare-without-optional-fields"])
+async def test_stream_previous_response_not_found_proxy_error_is_masked_to_stream_incomplete(
+    monkeypatch,
+    caplog,
+    bare_error,
+):
     settings = _make_proxy_settings()
     request_logs = _RequestLogsRecorder()
     service = proxy_service.ProxyService(_repo_factory(request_logs))
@@ -36006,12 +36011,16 @@ async def test_stream_previous_response_not_found_proxy_error_is_masked_to_strea
 
     async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False, **kwargs):
         del payload, headers, access_token, account_id, base_url, raise_for_status, kwargs
-        error_payload = openai_error(
-            "previous_response_not_found",
-            "Previous response with id 'resp_prev_anchor' not found.",
-            error_type="invalid_request_error",
-        )
-        error_payload["error"]["param"] = "previous_response_id"
+        error_payload: OpenAIErrorEnvelope
+        if bare_error:
+            error_payload = {"error": {"message": "Invalid `previous_response_id`."}}
+        else:
+            error_payload = openai_error(
+                "previous_response_not_found",
+                "Previous response with id 'resp_prev_anchor' not found.",
+                error_type="invalid_request_error",
+            )
+            error_payload["error"]["param"] = "previous_response_id"
         raise proxy_module.ProxyResponseError(400, error_payload)
         if False:
             yield ""
@@ -47446,6 +47455,70 @@ async def test_stream_with_retry_rewrites_malformed_error_when_it_is_the_first_f
     assert await service.drain_persistence_tasks(timeout_seconds=1)
     assert request_logs.calls[0]["status"] != "success"
     assert request_logs.calls[0]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_stream_with_retry_rewrites_bare_previous_response_error_first(monkeypatch):
+    settings = _make_proxy_settings()
+    request_logs = _RequestLogsRecorder()
+    service = proxy_service.ProxyService(_repo_factory(request_logs))
+    account = _make_account("acc_bare_previous_response_first")
+    request_logs.response_owner_by_id[("resp_prev_anchor", None, "sid-bare-prev")] = account.id
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        service,
+        "_select_account_with_budget_compatible",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
+
+    async def fake_core_stream_responses(*_args: object, **_kwargs: object):
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "error": {
+                        "message": "Invalid `previous_response_id`.",
+                    },
+                }
+            )
+            + "\n\n"
+        )
+
+    monkeypatch.setattr(proxy_service, "core_stream_responses", fake_core_stream_responses)
+
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.1",
+            "instructions": "hi",
+            "input": [],
+            "stream": True,
+            "previous_response_id": "resp_prev_anchor",
+        }
+    )
+    chunks = [
+        chunk
+        async for chunk in service._stream_with_retry(
+            payload,
+            {"session_id": "sid-bare-prev"},
+            codex_session_affinity=False,
+            propagate_http_errors=False,
+            openai_cache_affinity=False,
+            api_key=None,
+            api_key_reservation=None,
+            suppress_text_done_events=False,
+            request_transport="http",
+            upstream_stream_transport_override="http",
+        )
+    ]
+
+    terminal = json.loads(chunks[-1].split("data: ", 1)[1])
+    assert terminal["type"] == "response.failed"
+    assert terminal["response"]["error"]["code"] == "stream_incomplete"
+    assert "previous_response_not_found" not in chunks[-1]
 
 
 @pytest.mark.asyncio

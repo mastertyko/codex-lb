@@ -46,7 +46,7 @@ from app.core.errors import (
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     response_failed_event,
 )
-from app.core.openai.models import OpenAIEvent
+from app.core.openai.models import OpenAIError, OpenAIEvent
 from app.core.openai.parsing import parse_sse_event
 from app.core.resilience.network_recovery import (
     PROCESS_NETWORK_UNAVAILABLE_CODE,
@@ -581,6 +581,45 @@ def _raw_stream_error_fields(
         raw_error_message,
         raw_error_param,
         _normalize_error_code(_websocket_event_error_code(event_type, event_payload), raw_error_type),
+    )
+
+
+def _raw_stream_classifier_code(
+    event_type: str | None,
+    event_payload: dict[str, JsonValue] | None,
+) -> str | None:
+    return _websocket_event_error_code(event_type, event_payload) or _websocket_event_error_type(
+        event_type,
+        event_payload,
+    )
+
+
+def _stream_error_fields(
+    error: OpenAIError | None,
+    event_type: str | None,
+    event_payload: dict[str, JsonValue] | None,
+    *,
+    preserve_raw: bool,
+) -> tuple[str | None, str | None, str | None, str, str | None]:
+    if preserve_raw and error is None:
+        error_type, error_message, error_param, normalized_code = _raw_stream_error_fields(
+            event_type,
+            event_payload,
+        )
+        return (
+            error_type,
+            error_message,
+            error_param,
+            normalized_code,
+            _raw_stream_classifier_code(event_type, event_payload),
+        )
+    error_type = error.type if error else None
+    return (
+        error_type,
+        error.message if error else None,
+        error.param if error else None,
+        _normalize_error_code(error.code if error else None, error_type),
+        (error.code or error.type) if error else None,
     )
 
 
