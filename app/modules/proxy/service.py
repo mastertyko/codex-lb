@@ -2183,7 +2183,7 @@ def _compact_previous_response_not_found_error(exc: ProxyResponseError) -> Proxy
         return None
     code = _normalize_error_code(error.code, error.type)
     if not _is_previous_response_not_found_error(
-        code=code,
+        code=error.code or error.type,
         param=error.param,
         message=error.message,
     ):

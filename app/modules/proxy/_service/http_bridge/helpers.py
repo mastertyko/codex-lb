@@ -2790,7 +2790,9 @@ def _http_bridge_should_attempt_local_previous_response_recovery(exc: ProxyRespo
     param = param_value.strip() if isinstance(param_value, str) and param_value.strip() else None
     message_value = error.get("message")
     message = message_value.strip() if isinstance(message_value, str) and message_value.strip() else None
-    return _is_previous_response_not_found_error(code=code, param=param, message=message)
+    error_type = error.get("type")
+    classifier_code = code if isinstance(code, str) else error_type if isinstance(error_type, str) else None
+    return _is_previous_response_not_found_error(code=classifier_code, param=param, message=message)
 
 
 def _http_bridge_is_previous_response_owner_unavailable(exc: ProxyResponseError) -> bool:

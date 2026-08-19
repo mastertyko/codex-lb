@@ -1762,19 +1762,15 @@ class _HTTPBridgeUpstreamEventsMixin:
             and not isinstance(payload.get("type"), str)
             and isinstance(payload.get("error"), dict)
         )
+        raw_error_code = _websocket_event_error_code(event_type, payload)
+        raw_error_type = _websocket_event_error_type(event_type, payload)
         is_previous_response_not_found_event = _is_previous_response_not_found_error(
-            code=_normalize_error_code(
-                _websocket_event_error_code(event_type, payload),
-                _websocket_event_error_type(event_type, payload),
-            ),
+            code=raw_error_code or raw_error_type,
             param=_websocket_event_error_param(event_type, payload),
             message=error_message,
         )
         is_missing_tool_output_event = _is_missing_tool_output_error(
-            code=_normalize_error_code(
-                _websocket_event_error_code(event_type, payload),
-                _websocket_event_error_type(event_type, payload),
-            ),
+            code=_normalize_error_code(raw_error_code, raw_error_type),
             param=_websocket_event_error_param(event_type, payload),
             message=error_message,
         )

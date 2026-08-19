@@ -1435,7 +1435,7 @@ def _sanitize_websocket_previous_response_error(
     normalized_message = parsed_error.message if parsed_error and parsed_error.message else error_message
     reason = "previous_response_not_found"
     should_rewrite = _facade()._is_previous_response_not_found_error(
-        code=normalized_code,
+        code=(parsed_error.code or parsed_error.type) if parsed_error is not None else error_code,
         param=parsed_error.param if parsed_error else None,
         message=normalized_message,
     )
@@ -1489,7 +1489,7 @@ def _sanitize_websocket_terminal_error_fields(
 ) -> tuple[str, str, str, str | None]:
     normalized_code = _normalize_error_code(error_code, error_type)
     if not _facade()._is_previous_response_not_found_error(
-        code=normalized_code,
+        code=error_code or error_type,
         param=error_param,
         message=error_message,
     ):
@@ -1923,14 +1923,11 @@ def _wrapped_websocket_error_event(
     expose_stale_previous_response_classifier: bool = False,
 ) -> dict[str, JsonValue]:
     error = payload["error"]
-    error_code = _normalize_error_code(
-        error.get("code"),
-        error.get("type"),
-    )
+    raw_error_code = error.get("code") or error.get("type")
     error_param = error.get("param")
     error_message = error.get("message")
     if _facade()._is_previous_response_not_found_error(
-        code=error_code,
+        code=raw_error_code,
         param=error_param,
         message=error_message,
     ):

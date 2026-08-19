@@ -727,6 +727,26 @@ class _PreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
         )
 
 
+class _BarePreviousResponseNotFoundUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
+    async def send_text(self, text: str) -> None:
+        self.sent_text.append(text)
+        await self._messages.put(
+            _FakeUpstreamMessage(
+                "text",
+                text=json.dumps(
+                    {
+                        "type": "error",
+                        "status": 400,
+                        "error": {
+                            "message": "Invalid `previous_response_id`.",
+                        },
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+        )
+
+
 class _AnonymousPreviousResponseNotFoundWithInflightUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
     def __init__(self) -> None:
         super().__init__()
@@ -13721,10 +13741,16 @@ async def test_v1_responses_http_bridge_precreated_disconnect_returns_upstream_u
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stale_upstream_type",
+    [_PreviousResponseNotFoundUpstreamWebSocket, _BarePreviousResponseNotFoundUpstreamWebSocket],
+    ids=["structured", "bare-without-optional-fields"],
+)
 async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response_not_found(
     async_client,
     app_instance,
     monkeypatch,
+    stale_upstream_type,
 ):
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
@@ -13817,7 +13843,7 @@ async def test_v1_responses_http_bridge_rebinds_after_upstream_previous_response
         await _replace_http_bridge_upstream_reader(
             service,
             session,
-            cast(proxy_module.UpstreamWebSocket, _PreviousResponseNotFoundUpstreamWebSocket()),
+            cast(proxy_module.UpstreamWebSocket, stale_upstream_type()),
         )
 
     second = await async_client.post(

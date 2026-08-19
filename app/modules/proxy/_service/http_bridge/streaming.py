@@ -227,9 +227,6 @@ from app.modules.proxy.continuity import (
 from app.modules.proxy.durable_bridge_coordinator import DurableBridgeLookup
 from app.modules.proxy.durable_bridge_repository import durable_bridge_hash
 from app.modules.proxy.durable_bridge_runtime import http_bridge_owner_process_epoch
-from app.modules.proxy.helpers import (
-    _normalize_error_code,
-)
 from app.modules.proxy.replay_safety import (
     project_responses_input_for_account_neutral_fresh_replay,
     responses_input_suffix_matches_pending_tool_calls,
@@ -4445,11 +4442,10 @@ class _HTTPBridgeStreamingMixin:
                         request_state.latency_first_token_ms = max(
                             0, int((ttft_visible_at - request_state.started_at) * 1000)
                         )
+                raw_error_code = _websocket_event_error_code(block_event_type, block_payload)
+                raw_error_type = _websocket_event_error_type(block_event_type, block_payload)
                 if not propagate_http_errors and _is_previous_response_not_found_error(
-                    code=_normalize_error_code(
-                        _websocket_event_error_code(block_event_type, block_payload),
-                        _websocket_event_error_type(block_event_type, block_payload),
-                    ),
+                    code=raw_error_code or raw_error_type,
                     param=_websocket_event_error_param(block_event_type, block_payload),
                     message=_websocket_event_error_message(block_event_type, block_payload),
                 ):

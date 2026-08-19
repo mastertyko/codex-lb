@@ -9002,7 +9002,7 @@ def _is_previous_response_not_found_public_error(error_value: OpenAIError | None
     if error_value is None:
         return False
     return is_previous_response_not_found_error(
-        code=error_value.code,
+        code=error_value.code or error_value.type,
         param=error_value.param,
         message=error_value.message,
     )

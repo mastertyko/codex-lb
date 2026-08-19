@@ -522,7 +522,7 @@ def _rewrite_previous_response_stream_error(
     if previous_response_id is None:
         return None
     if _facade()._is_previous_response_not_found_error(
-        code=error_code,
+        code=error_code or error_type,
         param=error_param,
         message=error_message,
     ):
