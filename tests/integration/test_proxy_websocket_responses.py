@@ -5969,8 +5969,25 @@ def test_v1_responses_websocket_marks_fresh_turn_as_retry_safe_at_prep_time(
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/responses", "/backend-api/codex/responses"])
+@pytest.mark.parametrize(
+    "upstream_error",
+    [
+        {
+            "type": "invalid_request_error",
+            "code": "previous_response_not_found",
+            "message": "Previous response with id 'resp_ws_prev_anchor' not found.",
+            "param": "previous_response_id",
+        },
+        {
+            "type": "invalid_request_error",
+            "message": "Invalid `previous_response_id`.",
+        },
+    ],
+    ids=["structured-not-found", "bare-invalid-id"],
+)
 def test_responses_websocket_replays_client_full_resend_previous_response_miss_without_anchor(
     endpoint,
+    upstream_error,
     app_instance,
     monkeypatch,
 ):
@@ -6006,12 +6023,7 @@ def test_responses_websocket_replays_client_full_resend_previous_response_miss_w
                         {
                             "type": "error",
                             "status": 400,
-                            "error": {
-                                "type": "invalid_request_error",
-                                "code": "previous_response_not_found",
-                                "message": "Previous response with id 'resp_ws_prev_anchor' not found.",
-                                "param": "previous_response_id",
-                            },
+                            "error": upstream_error,
                         },
                         separators=(",", ":"),
                     ),
@@ -6825,9 +6837,7 @@ def test_backend_responses_websocket_masks_top_level_previous_response_not_found
                             "type": "error",
                             "status_code": 400,
                             "error_type": "invalid_request_error",
-                            "code": "previous_response_not_found",
-                            "message": "Previous response with id 'resp_chatgpt_prev_anchor' not found.",
-                            "param": "previous_response_id",
+                            "message": "Invalid `previous_response_id`.",
                         },
                         separators=(",", ":"),
                     ),

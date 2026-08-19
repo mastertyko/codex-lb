@@ -79,6 +79,7 @@ from app.modules.proxy.helpers import (
     is_upstream_model_capacity_error,
 )
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
+from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -176,7 +177,10 @@ def _verified_cross_transport_fresh_replay(
         stored_fingerprint=continuity_state.last_completed_input_prefix_fingerprint,
     ):
         return None
-    return payload.model_copy(update={"previous_response_id": None})
+    fresh_payload = payload.model_copy(update={"previous_response_id": None})
+    if not responses_payload_is_account_neutral_fresh_replay(fresh_payload.to_replay_safety_payload()):
+        return None
+    return fresh_payload
 
 
 def _effective_http_downstream_transport_policy(

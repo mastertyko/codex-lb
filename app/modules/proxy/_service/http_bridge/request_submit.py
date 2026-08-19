@@ -3094,6 +3094,7 @@ class _HTTPBridgeRequestSubmitMixin:
             )
             if request_state.replay_count >= 1 and not additional_clean_close_retry:
                 return False
+            account_bound_replay = False
             if request_state.previous_response_id is not None:
                 require_preferred_reconnect = False
                 if account_neutral_recovery:
@@ -3125,11 +3126,14 @@ class _HTTPBridgeRequestSubmitMixin:
                 # Account-scoped uploaded files cannot be replayed on a
                 # different owner. Keep the preferred account mandatory for
                 # both silent recovery and clean-close recovery.
-                require_preferred_reconnect = account_neutral_recovery or request_state.file_required_preferred_account
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
                 if request_text is None:
                     return False
-                if account_neutral_recovery:
+                account_bound_replay = _prepare_websocket_request_state_for_account_switch(request_state) is None
+                require_preferred_reconnect = (
+                    account_neutral_recovery or account_bound_replay or request_state.file_required_preferred_account
+                )
+                if account_neutral_recovery or account_bound_replay:
                     request_state.preferred_account_id = session.account.id
                 elif not request_state.file_required_preferred_account:
                     if hard_owner_bound and not model_fallback_replay and not fresh_hard_request_account_switch_allowed:
@@ -3210,7 +3214,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 await self._reconnect_http_bridge_session(
                     session,
                     request_state=request_state,
-                    require_same_account=account_neutral_recovery,
+                    require_same_account=account_neutral_recovery or account_bound_replay,
                     require_preferred_account=True,
                     **reconnect_reader_kwargs,
                 )
@@ -3413,12 +3417,12 @@ class _HTTPBridgeRequestSubmitMixin:
             key=session.key.affinity_key,
         ):
             return False
-        retry_text = request_state.request_text
-        if not retry_text:
-            return False
         if request_state.file_required_preferred_account:
             return False
         if not _websocket_request_can_replay_before_visible_output(request_state):
+            return False
+        retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
+        if retry_text is None:
             return False
 
         owner_account_id = session.account.id
@@ -3436,11 +3440,6 @@ class _HTTPBridgeRequestSubmitMixin:
             session.turn_state_alias_registration_generations
         )
         previous_session_headers = session.headers
-        if request_state.previous_response_id is not None:
-            retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
-        if retry_text is None:
-            return False
-
         request_state.preferred_account_id = None
         request_state.excluded_account_ids.add(owner_account_id)
         request_state.affinity_policy = replace(

@@ -102,7 +102,12 @@ def is_previous_response_not_found_error(
 ) -> bool:
     if code == PREVIOUS_RESPONSE_NOT_FOUND_CODE:
         return True
-    if code != "invalid_request_error" or param != "previous_response_id":
+    if code != "invalid_request_error":
+        return False
+    normalized_message = " ".join(message.lower().replace("`", "").split()) if message else ""
+    if param is None and normalized_message.rstrip(".") == "invalid previous_response_id":
+        return True
+    if param != "previous_response_id":
         return False
     return is_previous_response_not_found_message(message)
 

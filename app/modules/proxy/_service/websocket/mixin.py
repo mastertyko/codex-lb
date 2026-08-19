@@ -3448,6 +3448,7 @@ class _WebSocketMixin:
             )
             require_preferred_account = (
                 (request_state.previous_response_id is not None and request_state.preferred_account_id is not None)
+                or request_state.replay_required_account_id is not None
                 or request_state.file_required_preferred_account
                 or turn_state_owner_required
             )
@@ -3761,6 +3762,14 @@ class _WebSocketMixin:
                 break
 
         account = selection.account
+        if (
+            account is not None
+            and request_state.replay_required_account_id is None
+            and request_state.request_text is not None
+            and not _facade()._websocket_request_text_is_account_neutral_fresh_replay(request_state.request_text)
+        ):
+            request_state.preferred_account_id = account.id
+            request_state.replay_required_account_id = account.id
         if (
             account is not None
             and require_preferred_account

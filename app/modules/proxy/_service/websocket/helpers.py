@@ -339,6 +339,7 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
+from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 
 
 def _facade() -> Any:
@@ -459,17 +460,34 @@ def _websocket_owner_switch_has_other_pending_requests(
     return any(pending is not request_state for pending in pending_requests)
 
 
+def _websocket_request_text_is_account_neutral_fresh_replay(request_text: str | None) -> bool:
+    if not isinstance(request_text, str):
+        return False
+    try:
+        payload = json.loads(request_text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    payload.pop("type", None)
+    return responses_payload_is_account_neutral_fresh_replay(cast(dict[str, JsonValue], payload))
+
+
 def _prepare_websocket_request_state_for_account_switch(
     request_state: "_WebSocketRequestState",
 ) -> str | None:
     """Return an unsent request body only when moving accounts is proven safe."""
     if request_state.previous_response_id is None:
+        if not _websocket_request_text_is_account_neutral_fresh_replay(request_state.request_text):
+            return None
         return request_state.request_text
     if not (
         request_state.proxy_injected_previous_response_id
         and request_state.fresh_upstream_request_is_retry_safe
         and request_state.fresh_upstream_request_text
     ):
+        return None
+    if not _websocket_request_text_is_account_neutral_fresh_replay(request_state.fresh_upstream_request_text):
         return None
     try:
         fresh_payload = json.loads(request_state.fresh_upstream_request_text)
@@ -485,6 +503,7 @@ def _prepare_websocket_request_state_for_account_switch(
     request_state.request_text = request_state.fresh_upstream_request_text
     request_state.previous_response_id = None
     request_state.preferred_account_id = None
+    request_state.replay_required_account_id = None
     request_state.proxy_injected_previous_response_id = False
     request_state.fresh_upstream_request_is_retry_safe = False
     request_state.responses_lite_model = request_state.fresh_upstream_request_responses_lite_model
@@ -900,14 +919,18 @@ def _websocket_auth_request_can_switch_account(request_state: _WebSocketRequestS
     if request_state.file_required_preferred_account:
         return False
     if request_state.previous_response_id is None:
-        return True
+        return request_state.request_text is None or _websocket_request_text_is_account_neutral_fresh_replay(
+            request_state.request_text
+        )
     if not (
         request_state.proxy_injected_previous_response_id
         and request_state.fresh_upstream_request_is_retry_safe
         and request_state.fresh_upstream_request_text
     ):
         return False
-    return not _websocket_fresh_request_blocks_account_switch(request_state)
+    return _websocket_request_text_is_account_neutral_fresh_replay(
+        request_state.fresh_upstream_request_text
+    ) and not _websocket_fresh_request_blocks_account_switch(request_state)
 
 
 def _prepare_websocket_request_state_for_auth_replay(
@@ -1118,7 +1141,10 @@ def _maybe_rewrite_websocket_previous_response_not_found_event(
     upstream_control: _WebSocketUpstreamControl,
     original_text: str,
 ) -> tuple[OpenAIEvent | None, dict[str, JsonValue] | None, str | None, str]:
-    error_code = _websocket_event_error_code(event_type, payload)
+    error_code = _normalize_error_code(
+        _websocket_event_error_code(event_type, payload),
+        _websocket_event_error_type(event_type, payload),
+    )
     error_param = _websocket_event_error_param(event_type, payload)
     error_message = _websocket_event_error_message(event_type, payload)
     should_rewrite = _facade()._is_previous_response_not_found_error(
