@@ -276,11 +276,23 @@ class UsageUpdater:
         latest_usage: Mapping[str, UsageHistory],
         *,
         own_singleflight_sessions: bool = False,
+        join_existing: bool | None = None,
     ) -> bool:
-        """Refresh usage for all accounts. Returns True if usage rows were written."""
+        """Refresh usage for all accounts. Returns True if usage rows were written.
+
+        ``own_singleflight_sessions`` makes each detached singleflight refresh
+        acquire and release its own DB session instead of using this updater's
+        caller-bound repositories. ``join_existing`` controls whether a caller
+        joins an in-flight refresh for the same key (deduplication) or waits
+        and forces a fresh one; it defaults to the historical coupling
+        ``not own_singleflight_sessions`` so existing callers keep their
+        semantics.
+        """
         settings = get_settings()
         if not settings.usage_refresh_enabled:
             return False
+        if join_existing is None:
+            join_existing = not own_singleflight_sessions
 
         refreshed = False
         now = utcnow()
@@ -349,9 +361,9 @@ class UsageUpdater:
                         own_singleflight_session=own_singleflight_sessions,
                     ),
                     refresh_factory,
-                    join_existing=not own_singleflight_sessions,
+                    join_existing=join_existing,
                 )
-                if not own_singleflight_sessions:
+                if join_existing:
                     await self._sync_account_from_repo(account)
                 refreshed = refreshed or result.usage_written
                 # Only cache when the upstream fetch actually succeeded.
@@ -911,7 +923,9 @@ class UsageUpdater:
     async def _sync_account_from_repo(self, account: Account) -> None:
         if not self._accounts_repo:
             return
-        stored = await self._accounts_repo.get_by_id(account.id)
+        # Joined owned-session refreshes run in a different session.  A plain
+        # get_by_id() can return the caller session's stale identity-map row.
+        stored = await self._accounts_repo.get_by_id_fresh(account.id)
         if stored is None:
             return
         account.chatgpt_account_id = stored.chatgpt_account_id
