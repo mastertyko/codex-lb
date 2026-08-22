@@ -509,14 +509,14 @@ select the PostgreSQL datasource in Grafana.
 
 ### Requirement: Dashboard request logs show generation speed
 
-The dashboard request-log table MUST show time to first token and output-token generation speed when the required latency and output-token fields are available. Generation speed MUST use output tokens divided by elapsed generation time after time to first token, not total input plus output tokens and not total request latency including TTFT.
+The dashboard request-log table MUST show time to first token and output-token generation speed when the required latency and output-token fields are available. Generation speed MUST use non-reasoning output tokens divided by elapsed generation time after time to first token, not total input plus output tokens and not total request latency including TTFT. The displayed metric MUST remain named `TPS`.
 
-#### Scenario: TPS excludes TTFT and input tokens
+#### Scenario: TPS excludes TTFT, input tokens, and reasoning tokens
 
-- **GIVEN** a successful request log has 1,000 input tokens, 200 output tokens, 1,000 ms total latency, and 200 ms TTFT
+- **GIVEN** a successful request log has 1,000 input tokens, 200 output tokens, including 40 reasoning tokens, 1,000 ms total latency, and 200 ms TTFT
 - **WHEN** the dashboard renders request logs
 - **THEN** it shows TTFT as 200ms
-- **AND** it shows TPS as 250.0
+- **AND** it shows TPS as `(200 - 40) / 0.8 = 200.0`
 
 #### Scenario: missing speed inputs stay blank
 
@@ -526,7 +526,7 @@ The dashboard request-log table MUST show time to first token and output-token g
 
 ### Requirement: Reports show daily median generation speed trends
 
-The Reports dashboard MUST expose daily median TTFT, daily median TPS, and daily median queue-wait trends when request-log latency fields are available. Empty days and rows with no valid timing/speed inputs MUST render as zero in those trend charts. Daily TPS MUST median per-request output-token TPS after TTFT rather than use input tokens or include TTFT wait time. Daily queue wait MUST median per-request `latency_queue_ms` over rows where it is non-null.
+The Reports dashboard MUST expose daily median TTFT, daily median TPS, and daily median queue-wait trends when request-log latency fields are available. Empty days and rows with no valid timing/speed inputs MUST render as zero in those trend charts. Daily TPS MUST median per-request non-reasoning output-token TPS after TTFT rather than use input tokens or include TTFT wait time. Daily queue wait MUST median per-request `latency_queue_ms` over rows where it is non-null.
 
 #### Scenario: Daily speed charts use median valid request values
 
@@ -550,15 +550,30 @@ The Reports dashboard MUST expose daily median TTFT, daily median TPS, and daily
 
 ### Requirement: Websocket responses capture request-log latency timings
 
-The websocket responses proxy path MUST record first-upstream-event, response-created, and first-token latency into the same request-log latency fields the HTTP bridge populates, so websocket request logs expose TTFT and generation speed. Recording MUST NOT change routing, failover, or the bytes returned to the client.
+The websocket responses proxy path MUST record first-upstream-event, response-created, and first-token latency into the same request-log latency fields the HTTP bridge populates, so websocket request logs expose TTFT and generation speed. First-token latency MUST use the first token-bearing output delta, including text, refusal, reasoning-summary, function-call argument, and tool-call output deltas, or a custom/apply-patch tool-call `response.output_item.added` event when the tool protocol does not stream argument deltas. Recording MUST NOT change routing, failover, or the bytes returned to the client.
 
-#### Scenario: Websocket request log records latency timings
+#### Scenario: Websocket text response records latency timings
 
 - **GIVEN** a websocket responses request whose upstream emits a `response.created` event, then a text delta, then completion
 - **WHEN** the proxy persists the request log
 - **THEN** the log has non-null first-upstream-event, response-created, and first-token latency values
 - **AND** first-upstream-event latency is less than or equal to response-created latency, which is less than or equal to first-token latency
 
+#### Scenario: Websocket tool call records first-token latency
+
+- **GIVEN** a websocket responses request whose first token-bearing output is a function-call argument delta, tool-call output delta, or custom/apply-patch tool-call `response.output_item.added` event
+- **WHEN** the proxy persists the request log
+- **THEN** the log has a non-null first-token latency value
+- **AND** the proxy forwards the upstream event unchanged
+
+#### Scenario: Control events do not record first-token latency
+
+- **GIVEN** a responses request whose upstream has emitted only control events such as `response.created`
+- **WHEN** the proxy inspects the request timing
+- **THEN** first-token latency remains null until a token-bearing output delta arrives
+- **AND** a message, reasoning, or function-call `response.output_item.added` lifecycle event does not record first-token latency
+- **AND** reasoning-summary placeholder deltas that are stripped before delivery do not record first-token latency
+- **AND** metadata-only or empty tool-call delta events do not record first-token latency
 ### Requirement: Startup probe timeouts do not emit shielded-future diagnostics
 
 The system SHALL, when the streaming proxy's startup probe times out waiting for
@@ -627,11 +642,15 @@ measured from the same anchor: the start of the attempt that produced the row.
 Time spent before that attempt — account selection, admission waits, and failed
 failover attempts — MUST NOT inflate `latency_first_token_ms`; the HTTP
 streaming path MUST record it instead in a nullable `latency_queue_ms`
-request-log column. First-token detection MUST treat the first output delta of
-any kind — visible text, refusal, or reasoning deltas — as the first token, so
-TTFT means time to first model output and the generation window
-(`latency_ms - latency_first_token_ms`) covers reasoning generation, matching
-the reasoning-inclusive `output_tokens` numerator used for TPS.
+request-log column. First-token detection MUST treat the first token-bearing
+output event — visible text, refusal, reasoning deltas, function-call argument,
+tool-call output, or a custom/apply-patch tool-call `response.output_item.added`
+event — as the first token. Lifecycle/control events, reasoning-summary
+placeholder deltas stripped before delivery, and metadata-only or empty
+tool-call deltas MUST NOT record first-token latency. TTFT means time to first
+model output and the generation window (`latency_ms -
+latency_first_token_ms`) covers reasoning generation, while TPS uses the
+non-reasoning output-token numerator.
 
 #### Scenario: Failover no longer inflates TTFT
 
@@ -710,9 +729,10 @@ MUST also be rejected rather than failing or interrupting the proxied request.
 #### Scenario: Dashboard retains generation-only throughput semantics
 
 - **GIVEN** a source response reports `time_to_first_token_ms: 108.83`,
-  `generation_time_ms: 162.98`, and `9` output tokens
-- **WHEN** the existing dashboard computes tokens per second as output tokens
-  divided by `latency_ms - latency_first_token_ms`
+  `generation_time_ms: 162.98`, and `9` output tokens, including zero reasoning
+  tokens
+- **WHEN** the existing dashboard computes tokens per second as non-reasoning
+  output tokens divided by `latency_ms - latency_first_token_ms`
 - **THEN** it reports approximately `55.2` generation tokens per second
 - **AND** it does not substitute an upstream `tokens_per_second` value that may
   include TTFT
