@@ -10,6 +10,7 @@ import pytest
 from app.core.shutdown import wait_for_tasks_to_drain
 from app.main import (
     InFlightMiddleware,
+    _close_http_client_within,
     _drain_detached_control_plane_tasks,
     _drain_proxy_persistence_tasks,
     _release_leader_lease_within,
@@ -249,6 +250,75 @@ async def test_release_leader_lease_within_swallows_release_error(
 
     # Must not raise: a failed release must never fail shutdown.
     await _release_leader_lease_within(5)
+
+
+@pytest.mark.asyncio
+async def test_close_http_client_within_returns_when_close_wedged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Regression: close_http_client() force-closes every managed client and
+    # then waits on their closed events with no deadline. A stalled TLS or TCP
+    # teardown leaves one event unset, which stranded shutdown before
+    # mark_process_dead() and close_db() in the surrounding finally chain.
+    gate = asyncio.Event()
+    started = asyncio.Event()
+    cancelled = False
+
+    async def wedged_close() -> None:
+        nonlocal cancelled
+        started.set()
+        try:
+            await gate.wait()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    monkeypatch.setattr(app_main, "close_http_client", wedged_close)
+
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    await _close_http_client_within(0.2)
+    elapsed = loop.time() - start
+
+    assert 0.2 <= elapsed < 1.0
+    assert started.is_set()
+    # Abandoned rather than cancelled: each client owns its own close task, so
+    # cancelling the wait would only unwind the waiter.
+    assert cancelled is False
+
+    # Let the abandoned close finish so no task dangles past the test.
+    gate.set()
+    await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_close_http_client_within_awaits_quick_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed = False
+
+    async def quick_close() -> None:
+        nonlocal closed
+        closed = True
+
+    monkeypatch.setattr(app_main, "close_http_client", quick_close)
+
+    await _close_http_client_within(5)
+
+    assert closed is True
+
+
+@pytest.mark.asyncio
+async def test_close_http_client_within_swallows_close_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def broken_close() -> None:
+        raise RuntimeError("transport gone")
+
+    monkeypatch.setattr(app_main, "close_http_client", broken_close)
+
+    # Must not raise: a failed client close must never fail shutdown.
+    await _close_http_client_within(5)
 
 
 @pytest.fixture(autouse=True)

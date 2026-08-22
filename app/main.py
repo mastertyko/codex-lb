@@ -200,6 +200,39 @@ async def _release_leader_lease_within(timeout: float) -> None:
         logger.warning("Failed to release scheduler leader lease during shutdown", exc_info=exc)
 
 
+def _log_abandoned_http_client_close(task: asyncio.Task[None]) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Abandoned managed HTTP client close finished with error", exc_info=exc)
+
+
+async def _close_http_client_within(timeout: float) -> None:
+    """Close the managed HTTP clients without ever pinning shutdown.
+
+    ``close_http_client()`` force-closes every managed client and then waits on
+    their ``closed`` events with no deadline. A stalled TLS or TCP teardown
+    leaves one of those events unset, which would strand shutdown before
+    ``mark_process_dead()`` and ``close_db()`` in the surrounding finally
+    chain. Each client owns its own close task, so a wait that overruns
+    ``timeout`` is abandoned rather than cancelled: teardown keeps unwinding in
+    the background while shutdown proceeds within its deadline.
+    """
+    close_task: asyncio.Task[None] = asyncio.ensure_future(close_http_client())
+    done, _ = await asyncio.wait({close_task}, timeout=timeout)
+    if close_task not in done:
+        logger.warning(
+            "Managed HTTP client close did not finish within %.1fs; abandoning the wait so shutdown can proceed",
+            timeout,
+        )
+        close_task.add_done_callback(_log_abandoned_http_client_close)
+        return
+    exc = close_task.exception()
+    if exc is not None:
+        logger.warning("Failed to close managed HTTP clients during shutdown", exc_info=exc)
+
+
 async def _drain_proxy_persistence_tasks(
     proxy_service: Any,
     timeout_seconds: float,
@@ -757,7 +790,7 @@ async def lifespan(app: FastAPI):
         # potentially wedged cancellation, so shutdown always proceeds.
         await _release_leader_lease_within(10)
         try:
-            await close_http_client()
+            await _close_http_client_within(10)
         finally:
             try:
                 if metrics_server_task is not None:
