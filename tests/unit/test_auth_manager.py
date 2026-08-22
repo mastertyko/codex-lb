@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import gc
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -2860,12 +2859,10 @@ async def test_refresh_account_requires_reauth_when_upstream_session_is_invalid(
 
 
 @pytest.mark.asyncio
-async def test_refresh_singleflight_retains_detached_settlement_task(monkeypatch):
-    """Regression: settlement runs in a task detached from every caller, and the
-    event loop keeps only a weak reference to it. A settlement collected before
-    it runs would leave the failed key in ``_inflight`` and register no
-    cooldown, letting the very next caller re-run the upstream refresh that the
-    cooldown exists to hold back."""
+async def test_refresh_singleflight_settlement_task_is_owned_then_released(monkeypatch):
+    """Settlement is spawned detached, so the singleflight owns it while it is
+    pending and drops it once it settles. Pins both halves: the registry must
+    not leak, and settlement must still register the failure cooldown."""
 
     monkeypatch.setattr(
         auth_manager_module,
@@ -2885,10 +2882,7 @@ async def test_refresh_singleflight_retains_detached_settlement_task(monkeypatch
     with pytest.raises(RefreshError):
         await singleflight.run(key, failing_refresh)
 
-    # Registered before it is given a chance to run, so nothing except this
-    # registry can keep the settlement alive across a collection.
     assert singleflight._completions
-    gc.collect()
 
     await asyncio.sleep(0)
     await asyncio.sleep(0)

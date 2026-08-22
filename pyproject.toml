@@ -115,9 +115,9 @@ target-version = "py313"
 extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
-# RUF006 guards a defect this codebase has shipped: a detached task the loop
-# only weakly references can be collected mid-flight, dropping the cleanup or
-# state settlement it carried.
+# RUF006 keeps a detached task owned by its spawner. asyncio holds only a weak
+# reference to a running task, so the alternative is depending on whatever the
+# task happens to await to keep it reachable.
 select = ["E", "F", "I", "RUF006"]
 
 [tool.ty.src]

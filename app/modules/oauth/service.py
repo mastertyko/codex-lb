@@ -150,11 +150,11 @@ class OAuthStateStore:
         return self._lock
 
     def retain_idle_stop_task(self, task: asyncio.Task[None]) -> None:
-        """Hold the idle-stop task until it settles.
+        """Own the detached idle-stop task until it settles.
 
-        The idle check awaits this store's lock before it reaches the stop
-        task it registers, so a collected task there would leave the local
-        callback server listening with nothing left to close it.
+        asyncio holds only a weak reference to a running task, so the spawner
+        keeps one here rather than depending on whatever the task happens to
+        await for its reachability.
         """
         self._idle_stop_tasks.add(task)
         task.add_done_callback(self._idle_stop_tasks.discard)

@@ -172,10 +172,9 @@ class _RefreshSingleflight:
     def __init__(self) -> None:
         self._inflight: dict[_RefreshSingleflightKey, asyncio.Task[Account]] = {}
         self._recent_failures: dict[_RefreshSingleflightKey, tuple[float, tuple[str, str, bool]]] = {}
-        # The loop keeps only weak references to running tasks. Settlement
-        # runs detached from every caller, so without a strong reference a
-        # collected completion would drop the failure cooldown and let the
-        # next caller re-run the refresh the cooldown exists to hold back.
+        # Settlement runs detached from every caller, and asyncio holds only a
+        # weak reference to a running task. Own it here rather than rely on
+        # whatever the task happens to await to keep it reachable.
         self._completions: set[asyncio.Task[None]] = set()
         self._lock = asyncio.Lock()
 

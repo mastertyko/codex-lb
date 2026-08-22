@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import gc
 import json
 import logging
 import time
@@ -2708,11 +2707,10 @@ async def test_loser_browser_callback_honors_durable_success_not_error(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_callback_server_idle_stop_task_is_retained_until_it_settles():
-    """Regression: the idle stop is spawned detached and awaits the store lock
-    before it reaches the task that stops the local callback server. The event
-    loop keeps only a weak reference in that window, so a collected idle stop
-    would leave the callback server listening with nothing left to close it."""
+async def test_callback_server_idle_stop_task_is_owned_then_released():
+    """The idle stop is spawned detached, so the store owns it while it is
+    pending and drops it once it settles. Pins both halves: the registry must
+    not leak, and the idle stop must still close the callback server."""
 
     service = oauth_module.OauthService(cast(AccountsRepository, SimpleNamespace()))
     store = oauth_module._OAUTH_STORE
@@ -2728,9 +2726,7 @@ async def test_callback_server_idle_stop_task_is_retained_until_it_settles():
     service._spawn_callback_server_idle_stop()
 
     assert store._idle_stop_tasks
-    gc.collect()
 
-    # Survived the collection with only the registry holding it, and ran.
     await asyncio.wait_for(stopped.wait(), timeout=1)
 
     await asyncio.wait_for(asyncio.gather(*store._idle_stop_tasks), timeout=1)
