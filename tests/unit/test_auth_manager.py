@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -2856,3 +2857,47 @@ async def test_refresh_account_requires_reauth_when_upstream_session_is_invalid(
     reason = repo.status_payload["deactivation_reason"]
     assert isinstance(reason, str)
     assert "re-login" in reason.lower() or "expired" in reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_refresh_singleflight_retains_detached_settlement_task(monkeypatch):
+    """Regression: settlement runs in a task detached from every caller, and the
+    event loop keeps only a weak reference to it. A settlement collected before
+    it runs would leave the failed key in ``_inflight`` and register no
+    cooldown, letting the very next caller re-run the upstream refresh that the
+    cooldown exists to hold back."""
+
+    monkeypatch.setattr(
+        auth_manager_module,
+        "get_settings",
+        lambda: SimpleNamespace(proxy_refresh_failure_cooldown_seconds=30.0),
+    )
+
+    singleflight = auth_manager_module._RefreshSingleflight()
+    key = ("acc_settlement_gc", "fingerprint")
+    attempts = 0
+
+    async def failing_refresh() -> Account:
+        nonlocal attempts
+        attempts += 1
+        raise RefreshError("invalid_grant", "refresh failed", True)
+
+    with pytest.raises(RefreshError):
+        await singleflight.run(key, failing_refresh)
+
+    # Registered before it is given a chance to run, so nothing except this
+    # registry can keep the settlement alive across a collection.
+    assert singleflight._completions
+    gc.collect()
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert singleflight._completions == set()
+    assert singleflight._inflight == {}
+
+    with pytest.raises(RefreshError) as cached:
+        await singleflight.run(key, failing_refresh)
+
+    assert cached.value.code == "invalid_grant"
+    assert attempts == 1

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import gc
 import json
 import logging
 import time
@@ -2704,3 +2705,36 @@ async def test_loser_browser_callback_honors_durable_success_not_error(monkeypat
     async with SessionLocal() as session:
         record = await OAuthFlowRepository(session, TokenEncryptor()).get_by_flow_id(start.flow_id)
     assert record is not None and record.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_callback_server_idle_stop_task_is_retained_until_it_settles():
+    """Regression: the idle stop is spawned detached and awaits the store lock
+    before it reaches the task that stops the local callback server. The event
+    loop keeps only a weak reference in that window, so a collected idle stop
+    would leave the callback server listening with nothing left to close it."""
+
+    service = oauth_module.OauthService(cast(AccountsRepository, SimpleNamespace()))
+    store = oauth_module._OAUTH_STORE
+    stopped = asyncio.Event()
+
+    class _RecordingCallbackServer:
+        async def stop(self) -> None:
+            stopped.set()
+
+    async with store.lock:
+        store._callback_server = cast(Any, _RecordingCallbackServer())
+
+    service._spawn_callback_server_idle_stop()
+
+    assert store._idle_stop_tasks
+    gc.collect()
+
+    # Survived the collection with only the registry holding it, and ran.
+    await asyncio.wait_for(stopped.wait(), timeout=1)
+
+    await asyncio.wait_for(asyncio.gather(*store._idle_stop_tasks), timeout=1)
+    await asyncio.sleep(0)
+
+    assert store._idle_stop_tasks == set()
+    assert store._callback_server is None

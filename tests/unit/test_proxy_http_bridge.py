@@ -15537,6 +15537,7 @@ async def test_stream_via_http_bridge_reacquires_api_key_reservation_after_owner
     )
 
     submitted_reservations: list[proxy_service.ApiKeyUsageReservationData | None] = []
+    producer_tasks: list[asyncio.Task[None]] = []
 
     async def fake_forward_http_bridge_request_to_owner(**kwargs: object):
         del kwargs
@@ -15560,7 +15561,7 @@ async def test_stream_via_http_bridge_reacquires_api_key_reservation_after_owner
             await event_queue.put('data: {"type":"response.completed"}\n\n')
             await event_queue.put(None)
 
-        asyncio.create_task(produce_after_reattach_delay())
+        producer_tasks.append(asyncio.create_task(produce_after_reattach_delay()))
 
     reserve_retry = AsyncMock(return_value=retried_reservation)
     capacity_unavailable = ProxyResponseError(

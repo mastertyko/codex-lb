@@ -115,7 +115,10 @@ target-version = "py313"
 extend-exclude = ["*.md"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I"]
+# RUF006 guards a defect this codebase has shipped: a detached task the loop
+# only weakly references can be collected mid-flight, dropping the cleanup or
+# state settlement it carried.
+select = ["E", "F", "I", "RUF006"]
 
 [tool.ty.src]
 exclude = [".agents/hooks/"]

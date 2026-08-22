@@ -59,12 +59,13 @@ async def test_admission_succeeds_when_slot_frees_during_wait() -> None:
         await asyncio.sleep(0.2)
         lease.release()
 
-    asyncio.create_task(release_after_delay())
+    releaser = asyncio.create_task(release_after_delay())
 
     start = time.monotonic()
     second_lease = await controller.acquire_token_refresh()
     elapsed = time.monotonic() - start
 
+    await releaser
     second_lease.release()
     # Should have acquired within ~0.2-0.5s, NOT timed out at 2s
     assert elapsed < 1.0, f"Took too long: {elapsed:.3f}s — slot freed at 0.2s"
@@ -131,12 +132,13 @@ async def test_response_create_admission_waits() -> None:
         await asyncio.sleep(0.15)
         lease.release()
 
-    asyncio.create_task(release_after_delay())
+    releaser = asyncio.create_task(release_after_delay())
 
     start = time.monotonic()
     second = await controller.acquire_response_create()
     elapsed = time.monotonic() - start
 
+    await releaser
     second.release()
     assert elapsed < 0.4, f"Took too long: {elapsed:.3f}s"
 
