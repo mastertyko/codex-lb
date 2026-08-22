@@ -20,10 +20,10 @@ The unauthenticated `/internal/drain/start`, `/internal/drain/stop`, and `/inter
 - **THEN** the drain-stop endpoint responds 403
 - **AND** the drain-status endpoint responds 403
 
-#### Scenario: Loopback preStop caller stays authorized behind projection
+#### Scenario: Loopback caller stays authorized when a forwarded address is present
 
 - **WHEN** forwarding projection trusts every peer
-- **AND** the loopback preStop helper requests drain status with a remote forwarded client address
+- **AND** a loopback caller requests drain status with a remote forwarded client address
 - **THEN** the request is authorized
 - **AND** the response reports current drain state
 

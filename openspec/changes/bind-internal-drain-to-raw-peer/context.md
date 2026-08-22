@@ -14,10 +14,13 @@ value becomes attacker-controlled, and these endpoints have no second gate:
 the API firewall covers only `/v1` and `/backend-api/codex`, the SPA catch-all
 does not shadow `/internal/`, and the health router carries no dependencies.
 
-The same projection also breaks the legitimate caller. With
-`FORWARDED_ALLOW_IPS=*`, the in-pod preStop helper connects over loopback but
-is projected to whatever client the forwarded chain names, so its own drain is
-refused. Binding to the raw peer fixes the bypass and that denial together.
+The shipped preStop helper is not affected. `LocalDrainClient.start_drain`
+sends only the drain-deadline header and `get_status` sends none, so there is
+no forwarded address for the projection to adopt and its transport peer stays
+loopback whatever `FORWARDED_ALLOW_IPS` says. A loopback caller that did arrive
+with a forwarded address would be projected away from loopback and refused, so
+the requirement pins that case to keep this change from introducing the denial
+it does not currently have.
 
 Example: with `FORWARDED_ALLOW_IPS=*`, a request from 203.0.113.24 carrying
 `X-Forwarded-For: 127.0.0.1` and `x-codex-lb-drain-deadline-monotonic: 1.0`

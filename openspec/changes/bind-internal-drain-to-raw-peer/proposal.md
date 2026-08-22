@@ -6,12 +6,10 @@ forwarded projection rather than the transport peer. When `FORWARDED_ALLOW_IPS`
 trusts the caller's peer, a remote client that sends `X-Forwarded-For:
 127.0.0.1` passes that gate.
 
-The consequences run in both directions. A remote caller can start a drain,
-after which every non-allowlisted route answers 503 and readiness fails. Adding
-the drain-deadline header routes the same request to the one-way shutdown
-barrier, which `stop_drain()` refuses to undo, so the replica stays down until
-it is restarted. In the same configuration the legitimate loopback preStop
-helper is projected to the forwarded client and is denied its own drain.
+A remote caller can then start a drain, after which every non-allowlisted route
+answers 503 and readiness fails. Adding the drain-deadline header routes the
+same request to the one-way shutdown barrier, which `stop_drain()` refuses to
+undo, so the replica stays down until it is restarted.
 
 ## What Changes
 
