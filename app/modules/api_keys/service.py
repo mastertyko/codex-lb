@@ -113,7 +113,12 @@ class ApiKeysRepositoryProtocol(Protocol):
     async def replace_limits(self, key_id: str, limits: list[ApiKeyLimit]) -> list[ApiKeyLimit]: ...
 
     async def upsert_limits(
-        self, key_id: str, limits: list[ApiKeyLimit], *, commit: bool = True
+        self,
+        key_id: str,
+        limits: list[ApiKeyLimit],
+        *,
+        commit: bool = True,
+        preserve_matched_usage: bool = False,
     ) -> list[ApiKeyLimit]: ...
     async def replace_account_assignments(
         self, key_id: str, account_ids: list[str], *, commit: bool = True
@@ -727,7 +732,12 @@ class ApiKeysService:
                 await self._repository.replace_source_assignments(key_id, assigned_source_ids, commit=False)
 
             if limit_rows is not None:
-                await self._repository.upsert_limits(key_id, limit_rows, commit=False)
+                await self._repository.upsert_limits(
+                    key_id,
+                    limit_rows,
+                    commit=False,
+                    preserve_matched_usage=not payload.reset_usage,
+                )
 
             await self._repository.commit()
         except Exception as exc:
