@@ -48,6 +48,7 @@ from app.core.clients.codex import (
     require_route_or_direct_egress_opt_in,
 )
 from app.core.clients.codex_version import get_codex_version_cache
+from app.core.clients.headers import CODEX_LB_KEY_HEADER
 from app.core.clients.http import acquire_http_client, lease_http_session
 from app.core.clients.native_egress import (
     NativeEgressClient,
@@ -166,6 +167,7 @@ CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE: Final = CodexWireProfile(
 )
 
 IGNORE_INBOUND_HEADERS = {
+    CODEX_LB_KEY_HEADER,
     "authorization",
     "chatgpt-account-id",
     "content-length",
@@ -1068,6 +1070,8 @@ def _build_upstream_transcribe_headers(
         headers["chatgpt-account-id"] = account_id
     for key, value in inbound.items():
         lower = key.lower()
+        if lower == CODEX_LB_KEY_HEADER:
+            continue
         if lower == "user-agent":
             headers[key] = value
         elif lower.startswith(_TRANSCRIBE_FORWARD_HEADER_PREFIXES):

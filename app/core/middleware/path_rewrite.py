@@ -66,6 +66,9 @@ def _canonicalize_backend_api_codex_path(path: str) -> str:
 
 
 def _realtime_live_scope_redaction(path: str) -> tuple[str, bytes] | None:
+    if path.startswith("/backend-api/codex/desktop-voice/"):
+        redacted = "/backend-api/codex/desktop-voice/<redacted>"
+        return redacted, b"/backend-api/codex/desktop-voice/%3Credacted%3E"
     if path == _V1_REALTIME_PATH:
         return _V1_REALTIME_PATH, _V1_REALTIME_RAW_PATH
 

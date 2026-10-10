@@ -62,6 +62,7 @@ from app.core.middleware import (
 )
 from app.core.middleware.dashboard_gzip import add_dashboard_gzip_middleware
 from app.core.middleware.dashboard_overrides import DashboardOverridesMiddleware
+from app.core.middleware.desktop_voice import add_desktop_voice_credential_middleware
 from app.core.middleware.inflight import InFlightMiddleware
 from app.core.openai.model_refresh_scheduler import build_model_refresh_scheduler
 from app.core.resilience.backpressure import BackpressureMiddleware
@@ -1025,6 +1026,7 @@ def create_app() -> FastAPI:
         ),
     )
     add_backend_api_codex_v1_alias_middleware(app)
+    add_desktop_voice_credential_middleware(app)
     add_app_version_middleware(app)
     add_exception_handlers(app)
     add_trusted_proxy_headers_middleware(app)

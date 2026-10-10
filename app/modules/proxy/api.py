@@ -32,6 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.convertors import Convertor, register_url_convertor
 from starlette.datastructures import Headers
+from starlette.requests import HTTPConnection
 from starlette.websockets import WebSocketState
 
 from app.core import usage as usage_core
@@ -44,6 +45,7 @@ from app.core.auth.dependencies import (
     validate_required_proxy_api_key_authorization,
     validate_usage_api_key,
 )
+from app.core.auth.desktop_voice import DesktopVoiceCredentials, get_desktop_voice_credentials
 from app.core.auth.refresh import RefreshError
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, bump_cache_invalidation_local
 from app.core.clients.files import FileProxyError
@@ -1077,6 +1079,67 @@ async def codex_realtime_calls(
     )
 
 
+def _desktop_voice_credentials(connection: HTTPConnection) -> DesktopVoiceCredentials:
+    credentials = get_desktop_voice_credentials(connection)
+    if connection.headers.getlist(CODEX_LB_REQUIRED_CAPABILITY_HEADER):
+        raise ProxyResponseError(
+            400,
+            openai_error("required_capability_transport_unsupported", "Required capability is unsupported for Voice"),
+        )
+    return credentials
+
+
+def _desktop_voice_failure(exc: ProxyResponseError) -> JSONResponse:
+    # The upstream error envelope can contain private details, including in its code.
+    code = exc.payload.get("error", {}).get("code")
+    allowed = {
+        "invalid_api_key",
+        "desktop_voice_identity_invalid",
+        "desktop_voice_identity_unavailable",
+        "invalid_realtime_call_id",
+        "required_capability_transport_unsupported",
+        "desktop_voice_owner_unavailable",
+        "desktop_voice_owner_not_found",
+        "desktop_voice_capacity_exceeded",
+        "desktop_voice_owner_token_expired",
+        "desktop_voice_owner_token_invalid",
+        "desktop_voice_invalid_call_response",
+        "desktop_voice_call_failed",
+        "upstream_websocket_subprotocol_mismatch",
+        "desktop_voice_request_too_large",
+    }
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=openai_error(code if code in allowed else "desktop_voice_unavailable", "Desktop Voice is unavailable"),
+    )
+
+
+@realtime_call_router.post("/desktop-voice/realtime/calls")
+async def desktop_voice_calls(request: Request, context: ProxyContext = Depends(get_proxy_context)) -> Response:
+    try:
+        credentials = _desktop_voice_credentials(request)
+        payload = bytearray()
+        async for chunk in request.stream():
+            payload.extend(chunk)
+            if len(payload) > MAX_SSE_EVENT_BYTES:
+                raise ProxyResponseError(
+                    413, openai_error("desktop_voice_request_too_large", "Desktop Voice request is too large")
+                )
+        response = await context.service.create_desktop_voice_call(
+            credentials,
+            payload=bytes(payload),
+            headers=dict(request.headers),
+            query_params=list(request.query_params.multi_items()),
+        )
+        return _codex_control_response(response)
+    except ProxyResponseError as exc:
+        return _desktop_voice_failure(exc)
+    except Exception:
+        return JSONResponse(
+            status_code=503, content=openai_error("desktop_voice_unavailable", "Desktop Voice is unavailable")
+        )
+
+
 @router.post("/safety/arc")
 async def codex_safety_arc(
     request: Request,
@@ -1607,6 +1670,68 @@ async def _proxy_realtime_live_websocket_route(
             )
         elif websocket.application_state == WebSocketState.CONNECTED:
             await websocket.close(code=1011)
+
+
+async def _desktop_voice_websocket_route(
+    websocket: WebSocket,
+    call_id: str,
+    context: ProxyContext,
+    *,
+    protocol: RealtimeWebSocketProtocol,
+    query_params: list[tuple[str, str]],
+) -> None:
+    _redact_realtime_live_websocket_scope(websocket, path="/backend-api/codex/desktop-voice/<redacted>")
+    _api_key, denial = await _validate_proxy_websocket_request(websocket, require_api_key=True)
+    if denial is not None:
+        await websocket.send_denial_response(denial)
+        return
+    try:
+        credentials = _desktop_voice_credentials(websocket)
+        await context.service.proxy_desktop_voice_websocket(
+            websocket, call_id, credentials, protocol=protocol, query_params=query_params
+        )
+    except ProxyResponseError as exc:
+        if websocket.application_state == WebSocketState.CONNECTING:
+            await websocket.send_denial_response(_desktop_voice_failure(exc))
+        elif websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1011)
+    except Exception:
+        if websocket.application_state == WebSocketState.CONNECTING:
+            await websocket.send_denial_response(
+                JSONResponse(
+                    status_code=503, content=openai_error("desktop_voice_unavailable", "Desktop Voice is unavailable")
+                )
+            )
+        elif websocket.application_state == WebSocketState.CONNECTED:
+            await websocket.close(code=1011)
+
+
+@ws_router.websocket("/desktop-voice/live/{call_id:realtime_live_call_id}")
+@ws_router.websocket("/desktop-voice/{call_id:realtime_live_call_id}")
+async def desktop_voice_live_websocket(
+    websocket: WebSocket, call_id: str, context: ProxyContext = Depends(get_proxy_websocket_context)
+) -> None:
+    await _desktop_voice_websocket_route(
+        websocket,
+        call_id,
+        context,
+        protocol=RealtimeWebSocketProtocol.LIVE_V3,
+        query_params=list(websocket.query_params.multi_items()),
+    )
+
+
+@ws_router.websocket("/desktop-voice/realtime")
+async def desktop_voice_legacy_websocket(
+    websocket: WebSocket, context: ProxyContext = Depends(get_proxy_websocket_context)
+) -> None:
+    call_ids = websocket.query_params.getlist("call_id")
+    await _desktop_voice_websocket_route(
+        websocket,
+        call_ids[0] if len(call_ids) == 1 else "",
+        context,
+        protocol=RealtimeWebSocketProtocol.REALTIME_V1_V2,
+        query_params=[(key, value) for key, value in websocket.query_params.multi_items() if key != "call_id"],
+    )
 
 
 @v1_ws_router.websocket("/live/{call_id:realtime_live_call_id}")

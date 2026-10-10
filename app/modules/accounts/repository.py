@@ -216,6 +216,20 @@ class AccountsRepository:
         )
         return result.scalar_one_or_none()
 
+    async def find_desktop_voice_owners(self, *, user_id: str, workspace_id: str) -> list[Account]:
+        """Load at most two exact, nondeleted seats; never guess among duplicates."""
+        result = await self._session.execute(
+            select(Account)
+            .where(
+                Account.chatgpt_user_id == user_id,
+                Account.chatgpt_account_id == workspace_id,
+                Account.delete_requested_at.is_(None),
+            )
+            .limit(2)
+            .execution_options(populate_existing=True)
+        )
+        return list(result.scalars().all())
+
     async def list_accounts(self, *, refresh_existing: bool = False) -> list[Account]:
         # Accounts marked for background deletion are already deleted from the
         # operator's point of view: they never appear in listings (dashboard,

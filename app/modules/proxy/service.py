@@ -174,6 +174,7 @@ from app.modules.proxy._service.compact import (
 from app.modules.proxy._service.compact import (
     _sticky_key_from_compact_payload as _sticky_key_from_compact_payload,
 )
+from app.modules.proxy._service.desktop_voice import _DesktopVoiceMixin
 from app.modules.proxy._service.file_ops import _FileOpsMixin
 from app.modules.proxy._service.http_bridge import _HTTPBridgeMixin
 from app.modules.proxy._service.http_bridge.helpers import (
@@ -925,6 +926,7 @@ class ProxyService(
     _TranscribeMixin,
     _CodexControlMixin,
     _RealtimeLiveMixin,
+    _DesktopVoiceMixin,
     _CompactMixin,
     _StreamingMixin,
     _WebSocketMixin,

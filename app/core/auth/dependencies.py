@@ -127,6 +127,13 @@ async def validate_proxy_api_key_authorization(
     *,
     request: HTTPConnection | None = None,
 ) -> ApiKeyData | None:
+    # A separately authenticated Desktop gateway key retains its policies even
+    # when legacy proxy authentication is optional. This is typed ASGI state,
+    # never a caller-supplied marker header.
+    if request is not None:
+        gateway_key = getattr(request.state, "desktop_gateway_api_key", None)
+        if isinstance(gateway_key, ApiKeyData):
+            return gateway_key
     settings = await get_settings_cache().get()
     if not settings.api_key_auth_enabled:
         if request is not None and not is_local_request(request):
