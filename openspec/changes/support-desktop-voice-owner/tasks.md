@@ -14,10 +14,11 @@
 
 ## 3. Public candidate verification and delivery
 
-- [x] 3.1 Run focused route, owner, credential, client, header and privacy regressions against the public candidate: 534 passed; scoped Ruff, type checks and diff checks passed.
+- [x] 3.1 Run focused regressions against the public candidate: initial route/credential/privacy selection 534 passed; after shared-support extraction, Desktop/legacy realtime/header/architecture selection 591 passed. Scoped Ruff, type checks and diff checks passed.
 - [x] 3.2 Document the actual Desktop model, microphone, transcript, delegation and audible-output proof, with direct call/media versus LB sideband boundaries.
 - [x] 3.3 Sync requirements and stable context, and document reversible client configuration.
 - [x] 3.4 Validate the change and main specs strictly: scoped change and affected specs pass; all 17 global failures match upstream main exactly (candidate 51 pass/17 fail, base 50 pass/17 fail).
-- [ ] 3.5 Run the repository's full mandatory local-ci gate against the exact publication candidate in isolated resources.
-- [ ] 3.6 Independently review the committed publication diff and fix actionable findings.
-- [ ] 3.7 Archive only the verified change and scan unpublished history for private material before topic-branch publication.
+- [x] 3.5 Run the repository's full mandatory local-ci gate in isolated resources. Final attempt passed frontend (1649 tests), architecture, Ruff, ty and Rust; unit tests reported 10596 passed, 7 skipped and one failure reproduced identically in upstream on macOS. Full CI remains FAILED; later integration/e2e/PostgreSQL/migration/package/Docker/Helm stages did not complete. Additional broad integration checks were stopped for this fork checkpoint; no full-CI-green claim is made.
+- [x] 3.6 Independently review the committed publication diff and structural delta; resolve the documentation-link finding. No remaining actionable findings or private material were identified.
+- [x] 3.7 Scan unpublished history and preserve only scoped code, tests and public documentation for topic-branch publication.
+- [ ] 3.8 Archive after the remaining repository-wide verification can complete. This fork checkpoint retains the active change and its explicit verification limits.

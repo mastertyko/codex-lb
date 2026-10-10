@@ -16,6 +16,8 @@ The publication candidate is extracted onto current public upstream main. Privat
 
 The full gate identified the existing facade line limit and cross-domain dependency rule during extraction. Shared Live transport and header helpers are moved to the existing support module, preserving their compatibility exports and behavior. The two existing timeout and three task-spawn allowance sites move with those unchanged helpers from `realtime_live.py` to `support.py`; the per-rule totals and architecture limits are unchanged.
 
+The fork checkpoint has 591 passing focused tests after extraction and independent review without remaining findings. The final mandatory local-ci attempt passed frontend (1649 tests), architecture, lint/type checks and Rust, then reported 10596 passing unit tests, seven skips and one macOS temporary-path refusal failure. That test and helper are byte-identical to upstream; a bounded upstream probe reproduces the same behavior. Full local-ci is still FAILED. Its later integration/e2e/PostgreSQL/migration/package/Docker/Helm stages did not complete, and additional broad integration checks were stopped. The active change is retained with these limits rather than presented as fully CI-verified or ready for merge.
+
 ## Related work
 
 - [Codex Live Voice sideband](https://github.com/Soju06/codex-lb/pull/1492) provides the existing pooled-call workflow.
