@@ -31,7 +31,7 @@ from app.core.utils.shared_future import _await_task_deferring_cancellation
 from app.db.models import Account, AccountStatus
 from app.db.session import detach_session_objects
 from app.modules.api_keys.service import ApiKeyData, ApiKeyInvalidError, ApiKeysService
-from app.modules.proxy._service.realtime_live import (
+from app.modules.proxy._service.support import (
     LiveWebSocketConnector,
     _CloseOnceLiveWebSocket,
     _relay_live_websocket,

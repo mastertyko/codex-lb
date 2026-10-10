@@ -392,7 +392,7 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.rate_limit import (
     _RateLimitMixin,
 )
-from app.modules.proxy._service.realtime_live import LiveWebSocketConnector, _RealtimeLiveMixin
+from app.modules.proxy._service.realtime_live import _RealtimeLiveMixin
 from app.modules.proxy._service.refresh import (
     ensure_fresh_with_auth_error,
 )
@@ -565,6 +565,7 @@ from app.modules.proxy._service.support import (
     _REQUEST_TRANSPORT_WEBSOCKET,  # noqa: F401
     _WEBSOCKET_FULL_REPLAY_WAIT_MIN_ITEMS,  # noqa: F401
     _WEBSOCKET_FULL_REPLAY_WAIT_POLL_SECONDS,  # noqa: F401
+    LiveWebSocketConnector,
     _ApiKeyReservationTouchState,  # noqa: F401
     _call_with_supported_optional_kwargs,
     _clear_websocket_request_error_overrides,  # noqa: F401
@@ -603,6 +604,12 @@ from app.modules.proxy._service.support import (
     _WebSocketRequestState,
     _WebSocketUpstreamControl,  # noqa: F401
     opportunistic_admission_account_scope,
+)
+from app.modules.proxy._service.support import (
+    _header_value_case_insensitive as _header_value_case_insensitive,
+)
+from app.modules.proxy._service.support import (
+    _headers_with_authorization as _headers_with_authorization,
 )
 from app.modules.proxy._service.support import (
     _HTTPBridgeOwnerForward as _HTTPBridgeOwnerForward,
@@ -2543,24 +2550,6 @@ def _previous_response_owner_lookup_failed_error_envelope() -> OpenAIErrorEnvelo
         "Previous response owner lookup failed; retry later.",
         error_type="server_error",
     )
-
-
-def _header_value_case_insensitive(headers: Mapping[str, str], name: str) -> str | None:
-    target = name.lower()
-    for key, value in headers.items():
-        if key.lower() == target:
-            return value
-    return None
-
-
-def _headers_with_authorization(headers: Mapping[str, str], authorization: str | None) -> dict[str, str]:
-    merged = dict(headers)
-    if authorization is None:
-        return merged
-    if _header_value_case_insensitive(merged, "authorization") is not None:
-        return merged
-    merged["Authorization"] = authorization
-    return merged
 
 
 def _service_tier_from_response(

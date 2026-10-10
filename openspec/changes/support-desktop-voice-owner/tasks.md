@@ -10,13 +10,14 @@
 - [x] 2.3 Implement explicit native sideband and app-server creation with bounded cleanup, exact-owner capacity and unchanged pause status.
 - [x] 2.4 Accept the bounded native attestation envelope without weakening malformed-input or authorization checks.
 - [x] 2.5 Add fixed rejection diagnostics that preserve public responses and exclude request data.
+- [x] 2.6 Reuse shared Live transport/header support while preserving facade exports, architecture budgets and per-rule timing allowance totals; full architecture checks pass.
 
 ## 3. Public candidate verification and delivery
 
 - [x] 3.1 Run focused route, owner, credential, client, header and privacy regressions against the public candidate: 534 passed; scoped Ruff, type checks and diff checks passed.
 - [x] 3.2 Document the actual Desktop model, microphone, transcript, delegation and audible-output proof, with direct call/media versus LB sideband boundaries.
 - [x] 3.3 Sync requirements and stable context, and document reversible client configuration.
-- [ ] 3.4 Validate the change and main specs strictly, reporting any unchanged baseline failures separately.
+- [x] 3.4 Validate the change and main specs strictly: scoped change and affected specs pass; all 17 global failures match upstream main exactly (candidate 51 pass/17 fail, base 50 pass/17 fail).
 - [ ] 3.5 Run the repository's full mandatory local-ci gate against the exact publication candidate in isolated resources.
 - [ ] 3.6 Independently review the committed publication diff and fix actionable findings.
 - [ ] 3.7 Archive only the verified change and scan unpublished history for private material before topic-branch publication.

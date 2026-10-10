@@ -62,4 +62,4 @@ The dashboard's Recent Requests data accepts the sideband as a typed `realtime_l
 
 ---
 
-*Specs: [realtime-api-compat](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/realtime-api-compat), [desktop-voice-owner](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/desktop-voice-owner)*
+*Specs: [realtime-api-compat](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/realtime-api-compat), [desktop-voice-owner](https://github.com/mastertyko/codex-lb/tree/feature/desktop-voice-owner/openspec/specs/desktop-voice-owner)*

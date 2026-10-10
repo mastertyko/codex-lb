@@ -14,6 +14,8 @@ A real Codex Desktop session verified an ordinary model reply, microphone input,
 
 The publication candidate is extracted onto current public upstream main. Private runtime history, deployment manifests and unrelated changes are excluded. Prior runtime evidence establishes product behavior, while focused tests, the full repository local gate and independent review separately verify this public candidate.
 
+The full gate identified the existing facade line limit and cross-domain dependency rule during extraction. Shared Live transport and header helpers are moved to the existing support module, preserving their compatibility exports and behavior. The two existing timeout and three task-spawn allowance sites move with those unchanged helpers from `realtime_live.py` to `support.py`; the per-rule totals and architecture limits are unchanged.
+
 ## Related work
 
 - [Codex Live Voice sideband](https://github.com/Soju06/codex-lb/pull/1492) provides the existing pooled-call workflow.

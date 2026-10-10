@@ -6,20 +6,27 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal, NoReturn, Protocol, cast
+from urllib.parse import urlparse
 
 import anyio
+from fastapi import WebSocket
+from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from app.core.auth.refresh import RefreshError, is_transient_refresh_contention, refresh_contention_kind
 from app.core.balancer.types import UpstreamError
 from app.core.clients.proxy import CodexControlRequestPrivacyPolicy, ProxyResponseError
 from app.core.clients.proxy_websocket import (
     UPSTREAM_WEBSOCKET_TRANSPORT_FAILURE_DETAIL,
+    RealtimeWebSocketProtocol,
     UpstreamWebSocket,
+    UpstreamWebSocketMessage,
+    UpstreamWebSocketTransportError,
+    normalize_realtime_call_id,
 )
 from app.core.clock import REAL_CLOCK, Clock, Scheduler
 from app.core.config.settings import get_settings
@@ -2120,3 +2127,268 @@ def configured_upstream_stream_transport(dashboard_settings: Any) -> str:
 def upstream_websocket_transport_recently_failed() -> bool:
     marked_at = _upstream_ws_transport_failure_at
     return marked_at is not None and time.monotonic() - marked_at < UPSTREAM_WS_TRANSPORT_FAILURE_TTL_SECONDS
+
+
+_UPSTREAM_CLOSE_CANCEL_DRAIN_MAX_SECONDS = 0.05
+
+
+class LiveWebSocketConnector(Protocol):
+    async def __call__(
+        self,
+        call_id: str,
+        headers: dict[str, str],
+        access_token: str,
+        account_id: str | None,
+        *,
+        protocol: RealtimeWebSocketProtocol,
+        route: ResolvedUpstreamRoute | None,
+        allow_direct_egress: bool,
+        query_params: list[tuple[str, str]],
+        subprotocols: Sequence[str],
+    ) -> UpstreamWebSocket: ...
+
+
+def realtime_call_id_from_location(headers: Mapping[str, str]) -> str | None:
+    location = next((value for key, value in headers.items() if key.lower() == "location"), None)
+    if not location:
+        return None
+
+    # Match the pinned first-party decoder: everything from the first query
+    # delimiter onward is ignored before path inspection. A bare fragment or
+    # semicolon parameter remains part of the path input and fails closed.
+    location_path = location.split("?", maxsplit=1)[0]
+    parsed = urlparse(location_path)
+    root_relative = not parsed.scheme and not parsed.netloc and location_path == parsed.path
+    absolute_http = parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
+    if parsed.params or parsed.query or parsed.fragment or not (root_relative or absolute_http):
+        return None
+
+    path_segments = parsed.path.split("/")
+    if len(path_segments) != 5 or path_segments[:4] != ["", "v1", "realtime", "calls"]:
+        return None
+    return normalize_realtime_call_id(path_segments[4])
+
+
+def _valid_close_code(value: int | None, *, default: int) -> int:
+    if value is None:
+        return default
+    if 1000 <= value <= 1014 and value not in {1004, 1005, 1006}:
+        return value
+    if 3000 <= value <= 4999:
+        return value
+    return default
+
+
+def _bounded_close_reason(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    encoded = value.encode("utf-8")[:123]
+    return encoded.decode("utf-8", errors="ignore")
+
+
+async def _safe_close_downstream(websocket: WebSocket, *, code: int, reason: str = "") -> None:
+    if websocket.application_state != WebSocketState.CONNECTED:
+        return
+    try:
+        await websocket.close(code=code, reason=_bounded_close_reason(reason))
+    except (RuntimeError, WebSocketDisconnect):
+        return
+
+
+class _CloseOnceLiveWebSocket:
+    def __init__(self, wrapped: UpstreamWebSocket) -> None:
+        self._wrapped = wrapped
+        self._close_task: asyncio.Task[None] | None = None
+        self._close_wait_exhausted = False
+
+    async def send_text(self, text: str) -> None:
+        await self._wrapped.send_text(text)
+
+    async def send_bytes(self, data: bytes) -> None:
+        await self._wrapped.send_bytes(data)
+
+    async def receive(self) -> UpstreamWebSocketMessage:
+        return await self._wrapped.receive()
+
+    async def close(
+        self,
+        code: int = 1000,
+        reason: str = "",
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        if self._close_task is None:
+            # The realtime relay is its own transport loop outside the responses
+            # turn lifecycle, so this close owner and its bounded waits stay on
+            # raw asyncio (PR B allowance) rather than a per-turn scheduler.
+            self._close_task = asyncio.create_task(
+                self._wrapped.close(code=code, reason=reason),
+                name="realtime-live-close-upstream",
+            )
+            self._close_task.add_done_callback(_consume_close_task_result)
+        if self._close_wait_exhausted:
+            return
+        if self._close_task.cancelled():
+            return
+        if timeout_seconds is None:
+            await asyncio.shield(self._close_task)
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._close_task), timeout=timeout_seconds)
+        except (TimeoutError, asyncio.CancelledError):
+            self._close_wait_exhausted = True
+            self._close_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._close_task),
+                    timeout=_UPSTREAM_CLOSE_CANCEL_DRAIN_MAX_SECONDS,
+                )
+            except (TimeoutError, asyncio.CancelledError, Exception):
+                pass
+            raise
+
+    def response_header(self, name: str) -> str | None:
+        return self._wrapped.response_header(name)
+
+    def archive_received(self, message: UpstreamWebSocketMessage) -> None:
+        archive_received = getattr(self._wrapped, "archive_received", None)
+        if callable(archive_received):
+            archive_received(message)
+
+
+def _consume_close_task_result(task: asyncio.Task[None]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        # The owning close call reports its bounded failure. A cancellation-
+        # resistant transport cleanup may finish only after that owner has
+        # returned, so consume its terminal result without logging details.
+        return
+
+
+async def _relay_downstream_to_upstream(
+    websocket: WebSocket,
+    upstream: _CloseOnceLiveWebSocket,
+    *,
+    max_message_bytes: int,
+    close_timeout_seconds: float,
+) -> None:
+    while True:
+        message = await websocket.receive()
+        message_type = message.get("type")
+        if message_type == "websocket.disconnect":
+            await upstream.close(
+                code=_valid_close_code(message.get("code"), default=1000),
+                reason=_bounded_close_reason(message.get("reason")),
+                timeout_seconds=close_timeout_seconds,
+            )
+            return
+        text = message.get("text")
+        if isinstance(text, str):
+            if len(text.encode("utf-8")) > max_message_bytes:
+                await upstream.close(code=1009, timeout_seconds=close_timeout_seconds)
+                await _safe_close_downstream(websocket, code=1009)
+                return
+            await upstream.send_text(text)
+            continue
+        data = message.get("bytes")
+        if isinstance(data, bytes):
+            if len(data) > max_message_bytes:
+                await upstream.close(code=1009, timeout_seconds=close_timeout_seconds)
+                await _safe_close_downstream(websocket, code=1009)
+                return
+            await upstream.send_bytes(data)
+            continue
+        raise UpstreamWebSocketTransportError(
+            "Unsupported downstream websocket frame",
+            error_code="upstream_unavailable",
+        )
+
+
+async def _relay_upstream_to_downstream(
+    websocket: WebSocket,
+    upstream: _CloseOnceLiveWebSocket,
+) -> None:
+    while True:
+        message = await upstream.receive()
+        archive_received = getattr(upstream, "archive_received", None)
+        if callable(archive_received):
+            archive_received(message)
+        if message.kind == "text" and message.text is not None:
+            await websocket.send_text(message.text)
+            continue
+        if message.kind == "binary" and message.data is not None:
+            await websocket.send_bytes(message.data)
+            continue
+        if message.kind == "close":
+            await _safe_close_downstream(
+                websocket,
+                code=_valid_close_code(message.close_code, default=1000),
+                reason=message.close_reason or "",
+            )
+            return
+        if message.kind == "error":
+            raise UpstreamWebSocketTransportError(
+                message.error or "Upstream websocket error",
+                error_code=message.error_code or "upstream_unavailable",
+            )
+        raise UpstreamWebSocketTransportError(
+            f"Unexpected upstream websocket message kind: {message.kind}",
+            error_code="upstream_unavailable",
+        )
+
+
+async def _relay_live_websocket(
+    websocket: WebSocket,
+    upstream: _CloseOnceLiveWebSocket,
+    *,
+    max_message_bytes: int,
+    close_timeout_seconds: float,
+) -> None:
+    # Relay children belong to the realtime transport loop, not to a proxy
+    # turn; they stay raw asyncio tasks (PR B allowance).
+    tasks = {
+        asyncio.create_task(
+            _relay_downstream_to_upstream(
+                websocket,
+                upstream,
+                max_message_bytes=max_message_bytes,
+                close_timeout_seconds=close_timeout_seconds,
+            ),
+            name="realtime-live-downstream-to-upstream",
+        ),
+        asyncio.create_task(
+            _relay_upstream_to_downstream(websocket, upstream),
+            name="realtime-live-upstream-to-downstream",
+        ),
+    }
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            task.result()
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _header_value_case_insensitive(headers: Mapping[str, str], name: str) -> str | None:
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return None
+
+
+def _headers_with_authorization(headers: Mapping[str, str], authorization: str | None) -> dict[str, str]:
+    merged = dict(headers)
+    if authorization is None:
+        return merged
+    if _header_value_case_insensitive(merged, "authorization") is not None:
+        return merged
+    merged["Authorization"] = authorization
+    return merged

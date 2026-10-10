@@ -66,8 +66,8 @@ _wait_for_websocket_continuity_gap = ["scheduler", "clock"]
 "app/core/utils/shared_future.py" = { raw-task-spawn = 1 }
 "app/modules/proxy/_service/compact.py" = { raw-sleep = 1, raw-timeout = 1, raw-task-spawn = 1 }
 "app/modules/proxy/_service/http_bridge/mixin.py" = { raw-timeout = 1 }
-"app/modules/proxy/_service/realtime_live.py" = { raw-timeout = 2, raw-task-spawn = 3 }
 "app/modules/proxy/_service/request_log.py" = { raw-timeout = 1 }
+"app/modules/proxy/_service/support.py" = { raw-timeout = 2, raw-task-spawn = 3 }
 "app/modules/proxy/api.py" = { missing-scheduler-kwarg = 19 }
 "app/modules/proxy/http_bridge_event_batcher.py" = { raw-timeout = 3, raw-task-spawn = 3 }
 
