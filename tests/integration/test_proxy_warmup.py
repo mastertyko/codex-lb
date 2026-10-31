@@ -181,6 +181,7 @@ async def test_warmup_normal_mode_uses_configured_model_and_logs_warmup_kind(asy
         ).scalar_one()
     assert len(rows) == 1
     assert rows[0].request_kind == "warmup"
+    assert rows[0].upstream_transport == "http"
     assert rows[0].model == "gpt-5.4-nano"
     assert limit.current_value == 0
 
@@ -411,6 +412,7 @@ async def test_warmup_route_failure_records_fail_closed_reason(async_client, mon
     assert row.status == "error"
     assert row.error_code == "upstream_proxy_unavailable"
     assert row.upstream_proxy_fail_closed_reason == "no_healthy_endpoint"
+    assert row.upstream_transport is None
 
 
 @pytest.mark.asyncio
@@ -1058,6 +1060,10 @@ async def test_warmup_account_rate_limit_failure_does_not_abort_summary(async_cl
             "error_message": "account limited",
         }
     ]
+    async with SessionLocal() as session:
+        rows = (await session.execute(select(RequestLog))).scalars().all()
+        assert len(rows) == 2
+        assert all(row.upstream_transport == "http" for row in rows)
 
 
 @pytest.mark.asyncio

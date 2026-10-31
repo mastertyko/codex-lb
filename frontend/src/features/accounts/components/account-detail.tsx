@@ -150,6 +150,11 @@ export function AccountDetail({
         <p className="mt-0.5 text-xs text-muted-foreground">
           {workspaceLabel} | {formatSlug(account.planType)}{seatLabel}
         </p>
+        {account.usageMultiplier != null ? (
+          <p className="mt-1 text-xs text-muted-foreground" data-testid="account-usage-multiplier">
+            {t("accounts.detail.usageMultiplier", { multiplier: account.usageMultiplier })}
+          </p>
+        ) : null}
       </div>
 
       {onProxyBindingSave ? (

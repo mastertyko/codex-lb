@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import re
 from collections import deque
 from collections.abc import Container, Mapping
 from dataclasses import dataclass
@@ -22,6 +24,14 @@ _ACCOUNT_NEUTRAL_REPLAY_OMITTED_ITEM_TYPES = frozenset(
 )
 _INTERNAL_CHAT_MESSAGE_METADATA_FIELD = "internal_chat_message_metadata_passthrough"
 _ACCOUNT_NEUTRAL_INTERNAL_CHAT_MESSAGE_METADATA_FIELDS = frozenset({"turn_id"})
+_HOST_AUTOMATION_HEARTBEAT_FIELDS = frozenset(
+    {"internal_chat_message_metadata_passthrough", "name", "namespace", "output", "type"}
+)
+_HOST_AUTOMATION_HEARTBEAT_METADATA_FIELDS = frozenset({"create_time", "turn_id"})
+_HOST_AUTOMATION_HEARTBEAT_OUTPUT_RE = re.compile(
+    r"<heartbeat><automation_id>[^<>\s]+</automation_id>"
+    r"(?:<current_time_iso>[^<>\s]+</current_time_iso>)?</heartbeat>"
+)
 _ACCOUNT_NEUTRAL_TOOL_TYPES = frozenset({"custom", "function", "web_search", "web_search_preview"})
 _ACCOUNT_NEUTRAL_TOOL_DECLARATION_FIELDS = {
     "custom": frozenset({"description", "format", "name", "type"}),
@@ -82,13 +92,33 @@ _ACCOUNT_NEUTRAL_INPUT_ITEM_FIELDS = {
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
     ),
     "custom_tool_call": frozenset(
-        {"call_id", "caller", "id", "input", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "name", "status", "type"}
+        {
+            "async",
+            "call_id",
+            "caller",
+            "id",
+            "input",
+            _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+            "name",
+            "status",
+            "type",
+        }
     ),
     "custom_tool_call_output": frozenset(
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
     ),
     "function_call": frozenset(
-        {"arguments", "call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "name", "status", "type"}
+        {
+            "arguments",
+            "async",
+            "call_id",
+            "caller",
+            "id",
+            _INTERNAL_CHAT_MESSAGE_METADATA_FIELD,
+            "name",
+            "status",
+            "type",
+        }
     ),
     "function_call_output": frozenset(
         {"call_id", "caller", "id", _INTERNAL_CHAT_MESSAGE_METADATA_FIELD, "output", "status", "type"}
@@ -254,11 +284,16 @@ def _project_account_neutral_replay_item(
 
 def responses_input_items_are_self_contained_fresh_replay(input_items: list[JsonValue]) -> bool:
     unsettled_call_ids_by_type: dict[str, set[str]] = {item_type: set() for item_type in _TOOL_CALL_TYPES}
+    async_unsettled_call_ids_by_type: dict[str, set[str]] = {item_type: set() for item_type in _TOOL_CALL_TYPES}
     seen_call_ids: set[str] = set()
     settled_call_ids: set[str] = set()
     for item in input_items:
         if not isinstance(item, dict):
             return False
+        if _is_host_automation_heartbeat_input(item):
+            if any(unsettled_call_ids_by_type.values()):
+                return False
+            continue
         if "type" in item and not _is_nonblank_string(item.get("type")):
             return False
         if item.get("id") not in (None, ""):
@@ -270,7 +305,7 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
         if not _input_item_has_only_known_fields(item, item_type):
             return False
         call_id_value = item.get("call_id")
-        call_id = call_id_value if isinstance(call_id_value, str) and call_id_value else None
+        call_id = call_id_value if isinstance(call_id_value, str) and call_id_value.strip() else None
         if item_type in _TOOL_CALL_TYPES:
             if (
                 call_id is None
@@ -280,17 +315,25 @@ def responses_input_items_are_self_contained_fresh_replay(input_items: list[Json
             ):
                 return False
             seen_call_ids.add(call_id)
+            if item.get("async") is True:
+                async_unsettled_call_ids_by_type[item_type].add(call_id)
+                continue
             unsettled_call_ids_by_type[item_type].add(call_id)
             continue
         call_item_type = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.get(item_type or "")
         if call_item_type is not None:
             if (
                 call_id is None
-                or call_id not in unsettled_call_ids_by_type[call_item_type]
                 or call_id in settled_call_ids
                 or not _caller_is_self_contained(item)
                 or not _tool_output_is_self_contained(item_type or "", item)
             ):
+                return False
+            if call_id in async_unsettled_call_ids_by_type[call_item_type]:
+                async_unsettled_call_ids_by_type[call_item_type].remove(call_id)
+                settled_call_ids.add(call_id)
+                continue
+            if call_id not in unsettled_call_ids_by_type[call_item_type]:
                 return False
             unsettled_call_ids_by_type[call_item_type].remove(call_id)
             settled_call_ids.add(call_id)
@@ -323,7 +366,15 @@ def responses_input_suffix_retains_prior_output(
     )
     if prefix_state is None:
         return False
-    pending_suffix_calls, seen_suffix_call_ids = prefix_state
+    pending_suffix_calls, seen_suffix_call_ids, async_calls = prefix_state
+    async_items = [
+        item
+        for item in input_items[:stored_count]
+        if isinstance(item, dict)
+        and isinstance(call_id := item.get("call_id"), str)
+        and call_id in async_calls
+        and async_calls[call_id] == item.get("type")
+    ]
     retained_output_seen = False
     retained_output_is_final_answer = False
     fresh_followup_seen = False
@@ -337,14 +388,25 @@ def responses_input_suffix_retains_prior_output(
         if "type" in item and not _is_nonblank_string(item_type_value):
             return False
         item_type = item_type_value if isinstance(item_type_value, str) else None
+        if _is_host_automation_heartbeat_input(item):
+            if not retained_output_seen or pending_suffix_calls:
+                return False
+            fresh_followup_seen = True
+            fresh_followup_count += 1
+            fresh_followup_is_user_message = False
+            continue
         if item_type in _TOOL_CALL_TYPES:
-            if item.get("status") not in (None, "completed"):
+            if item.get("status") not in (None, "completed") or not _tool_call_has_valid_async_marker(item):
                 return False
             call_id = item.get("call_id")
             if not isinstance(call_id, str) or not call_id or call_id in seen_suffix_call_ids:
                 return False
             seen_suffix_call_ids.add(call_id)
-            pending_suffix_calls.append((item_type, call_id))
+            if item.get("async") is True:
+                async_calls[call_id] = item_type
+                async_items.append(item)
+            else:
+                pending_suffix_calls.append((item_type, call_id))
             # Without a persisted output manifest, a call/output pair cannot
             # prove that an omitted parallel call was not part of the response.
             # Require a later completed assistant message as the turn boundary.
@@ -359,9 +421,19 @@ def responses_input_suffix_retains_prior_output(
             if item.get("status") not in (None, "completed", "failed"):
                 return False
             call_id = item.get("call_id")
-            if not isinstance(call_id, str) or not pending_suffix_calls:
+            if not isinstance(call_id, str):
                 return False
-            if pending_suffix_calls[0] != (call_type, call_id):
+            if call_id in async_calls:
+                if async_calls[call_id] != call_type:
+                    return False
+                del async_calls[call_id]
+                async_items.append(item)
+                if retained_output_seen:
+                    fresh_followup_seen = True
+                    fresh_followup_count += 1
+                    fresh_followup_is_user_message = False
+                continue
+            if not pending_suffix_calls or pending_suffix_calls[0] != (call_type, call_id):
                 return False
             pending_suffix_calls.popleft()
             continue
@@ -393,7 +465,39 @@ def responses_input_suffix_retains_prior_output(
             fresh_developer_followup_seen = True
             continue
         return False
-    return retained_output_seen and fresh_followup_seen and not pending_suffix_calls
+    return (
+        retained_output_seen
+        and fresh_followup_seen
+        and not pending_suffix_calls
+        and all(_is_nonblank_string(item.get("call_id")) for item in async_items)
+        and responses_input_items_are_self_contained_fresh_replay([*async_items])
+    )
+
+
+def project_responses_input_retaining_prior_output(
+    input_items: list[JsonValue],
+) -> AccountNeutralReplayProjection | None:
+    """Project a full resend whose final assistant turn precedes fresh input."""
+
+    last_assistant_index: int | None = None
+    for index in range(len(input_items) - 1, -1, -1):
+        item = input_items[index]
+        if isinstance(item, dict) and item.get("type") in (None, "message") and item.get("role") == "assistant":
+            last_assistant_index = index
+            break
+    if last_assistant_index is None or last_assistant_index == 0:
+        return None
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=last_assistant_index,
+    )
+    if projection is None or not responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        canonical_lite_developer_index=projection.canonical_lite_developer_index,
+    ):
+        return None
+    return projection
 
 
 def responses_input_suffix_matches_pending_tool_calls(
@@ -426,20 +530,44 @@ def responses_input_suffix_matches_pending_tool_calls(
         isinstance(item, dict)
         and isinstance(item.get("type"), str)
         and item.get("type") in (_TOOL_CALL_TYPES | _TOOL_CALL_TYPE_BY_OUTPUT_TYPE.keys())
+        and _is_nonblank_string(item.get("call_id"))
         for item in suffix
     ):
         return False
-    if not responses_input_items_are_self_contained_fresh_replay(suffix):
+    if any(_is_host_automation_heartbeat_input(item) for item in suffix if isinstance(item, dict)):
+        return False
+    # Validate async items before excluding them from the synchronous manifest.
+    # Outstanding prefix calls supply the context for delayed async outputs.
+    prefix_async_calls = [
+        item
+        for item in input_items[:stored_count]
+        if isinstance(item, dict)
+        and isinstance(call_id := item.get("call_id"), str)
+        and call_id in prefix_state[2]
+        and prefix_state[2][call_id] == item.get("type")
+    ]
+    if not responses_input_items_are_self_contained_fresh_replay([*prefix_async_calls, *suffix]):
         return False
     suffix_calls: dict[str, str] = {}
     suffix_outputs: dict[str, str] = {}
+    async_calls: dict[str, str] = dict(prefix_state[2])
     for item in cast(list[dict[str, JsonValue]], suffix):
         item_type = cast(str, item["type"])
         call_id = cast(str, item["call_id"])
         if item_type in _TOOL_CALL_TYPES:
+            if item.get("async") is True:
+                async_calls[call_id] = item_type
+                continue
             suffix_calls[call_id] = item_type
         else:
-            suffix_outputs[call_id] = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+            mapped = _TOOL_CALL_TYPE_BY_OUTPUT_TYPE[item_type]
+            expected_async = async_calls.get(call_id)
+            if expected_async is not None:
+                if expected_async != mapped:
+                    return False
+                del async_calls[call_id]
+                continue
+            suffix_outputs[call_id] = mapped
     expected = dict(pending_tool_calls)
     return suffix_calls == expected and suffix_outputs == expected
 
@@ -449,8 +577,10 @@ def _direct_tool_call_prefix_state(
     *,
     allow_historical_developer_interleave: bool = False,
     canonical_lite_developer_index: int | None = None,
-) -> tuple[deque[tuple[str, str]], set[str]] | None:
+) -> tuple[deque[tuple[str, str]], set[str], dict[str, str]] | None:
     pending_calls: deque[tuple[str, str]] = deque()
+    async_unsettled: dict[str, str] = {}
+    async_items: list[JsonValue] = []
     seen_call_ids: set[str] = set()
     # A pending window opens when ``pending_calls`` becomes non-empty and closes when it
     # drains. Historical interleaving is proven only for a window that never held more than
@@ -464,6 +594,10 @@ def _direct_tool_call_prefix_state(
         if item_type_value is not None and not isinstance(item_type_value, str):
             return None
         item_type = item_type_value if isinstance(item_type_value, str) else None
+        if _is_host_automation_heartbeat_input(item):
+            if pending_calls:
+                return None
+            continue
         if item.get("role") == "developer" and item_type != "additional_tools":
             developer_message_is_transparent = _historical_pending_developer_message_is_transparent(
                 item,
@@ -487,12 +621,16 @@ def _direct_tool_call_prefix_state(
                 continue
             return None
         if item_type in _TOOL_CALL_TYPES:
-            if item.get("status") not in (None, "completed"):
+            if item.get("status") not in (None, "completed") or not _tool_call_has_valid_async_marker(item):
                 return None
             call_id = item.get("call_id")
             if not isinstance(call_id, str) or not call_id or call_id in seen_call_ids:
                 return None
             seen_call_ids.add(call_id)
+            if item.get("async") is True:
+                async_unsettled[call_id] = item_type
+                async_items.append(item)
+                continue
             pending_calls.append((item_type, call_id))
             if len(pending_calls) > 1:
                 # A window that already spent its interleaved developer message must not
@@ -507,15 +645,19 @@ def _direct_tool_call_prefix_state(
             if item.get("status") not in (None, "completed", "failed"):
                 return None
             call_id = item.get("call_id")
-            if not isinstance(call_id, str) or not pending_calls:
+            if not isinstance(call_id, str):
                 return None
-            if pending_calls[0] != (call_type, call_id):
-                return None
-            pending_calls.popleft()
-            if not pending_calls:
-                pending_window_developer_seen = False
-                pending_window_held_parallel_calls = False
-            continue
+            if pending_calls and pending_calls[0] == (call_type, call_id):
+                pending_calls.popleft()
+                if not pending_calls:
+                    pending_window_developer_seen = False
+                    pending_window_held_parallel_calls = False
+                continue
+            if async_unsettled.get(call_id) == call_type:
+                del async_unsettled[call_id]
+                async_items.append(item)
+                continue
+            return None
         if pending_calls and (
             (item_type in (None, "message") and _is_one_of(item.get("role"), _ACCOUNT_NEUTRAL_MESSAGE_ROLES))
             or item_type in {"input_file", "input_image", "input_text"}
@@ -528,7 +670,10 @@ def _direct_tool_call_prefix_state(
         fallthrough_call_id = item.get("call_id")
         if isinstance(fallthrough_call_id, str) and fallthrough_call_id:
             seen_call_ids.add(fallthrough_call_id)
-    return pending_calls, seen_call_ids
+    # Settlement removes outstanding work, not the evidence requiring validation.
+    if not responses_input_items_are_self_contained_fresh_replay(async_items):
+        return None
+    return pending_calls, seen_call_ids, async_unsettled
 
 
 def _historical_pending_developer_message_is_transparent(
@@ -610,6 +755,35 @@ def _is_retained_response_message(item: Mapping[str, JsonValue]) -> bool:
     return _message_has_valid_account_neutral_content(item)
 
 
+def _is_host_automation_heartbeat_input(item: Mapping[str, JsonValue]) -> bool:
+    """Recognize the account-neutral trigger injected by Codex scheduled tasks."""
+
+    if set(item) != _HOST_AUTOMATION_HEARTBEAT_FIELDS:
+        return False
+    if (
+        item.get("type") != "function_call_output"
+        or item.get("name") != "automation_update"
+        or item.get("namespace") != "codex_app"
+    ):
+        return False
+    output = item.get("output")
+    if not isinstance(output, str):
+        return False
+    if _HOST_AUTOMATION_HEARTBEAT_OUTPUT_RE.fullmatch(output) is None:
+        return False
+    metadata = item.get(_INTERNAL_CHAT_MESSAGE_METADATA_FIELD)
+    if not isinstance(metadata, dict) or set(metadata) != _HOST_AUTOMATION_HEARTBEAT_METADATA_FIELDS:
+        return False
+    create_time = metadata.get("create_time")
+    if not isinstance(create_time, (int, float)) or isinstance(create_time, bool):
+        return False
+    try:
+        finite_create_time = math.isfinite(create_time)
+    except OverflowError:
+        return False
+    return _is_nonblank_string(metadata.get("turn_id")) and finite_create_time and create_time > 0
+
+
 def _is_fresh_followup_input(item: Mapping[str, JsonValue]) -> bool:
     item_type = item.get("type")
     if _is_one_of(item_type, {"input_file", "input_image", "input_text"}):
@@ -621,8 +795,12 @@ def _is_fresh_followup_input(item: Mapping[str, JsonValue]) -> bool:
     )
 
 
+def _tool_call_has_valid_async_marker(item: Mapping[str, JsonValue]) -> bool:
+    return "async" not in item or isinstance(item["async"], bool)
+
+
 def _tool_call_is_self_contained(item_type: str, item: Mapping[str, JsonValue]) -> bool:
-    if item.get("status") not in (None, "completed"):
+    if item.get("status") not in (None, "completed") or not _tool_call_has_valid_async_marker(item):
         return False
     if item_type == "function_call":
         return _is_nonblank_string(item.get("name")) and isinstance(item.get("arguments"), str)

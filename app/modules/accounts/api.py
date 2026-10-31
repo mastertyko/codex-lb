@@ -24,7 +24,7 @@ from app.core.multipart import ACCOUNT_IMPORT_MULTIPART_POLICY, bounded_multipar
 from app.core.multipart_fields import required_upload
 from app.core.upstream_proxy import UpstreamProxyRouteError
 from app.dependencies import AccountsContext, get_accounts_context, get_proxy_service_for_app
-from app.modules.accounts.repository import AccountIdentityConflictError
+from app.modules.accounts.repository import AccountIdentityConflictError, ProLegacyAllowancePlanError
 from app.modules.accounts.schemas import (
     AccountAliasRequest,
     AccountAliasResponse,
@@ -272,10 +272,16 @@ async def update_account(
     changed_fields = [field for field, value in payload.model_dump(exclude_unset=True).items() if value is not None]
     if not changed_fields:
         raise DashboardBadRequestError("No supported account fields to update", code="empty_account_update")
-    success = await context.service.update_account(
-        account_id,
-        security_work_authorized=payload.security_work_authorized,
-    )
+    try:
+        success = await context.service.update_account(
+            account_id,
+            security_work_authorized=payload.security_work_authorized,
+            pro_legacy_allowance=payload.pro_legacy_allowance,
+        )
+    except ProLegacyAllowancePlanError:
+        raise DashboardBadRequestError(
+            "Legacy allowance requires a Pro account", code="invalid_pro_legacy_allowance"
+        ) from None
     if not success:
         raise DashboardNotFoundError("Account not found", code="account_not_found")
     AuditService.log_async(

@@ -17,7 +17,7 @@ NOW = datetime(2026, 8, 17, 12, 0, 0)
 
 
 def _account(account_id: str) -> Account:
-    return Account(id=account_id, status=AccountStatus.ACTIVE)
+    return Account(id=account_id, plan_type="pro", status=AccountStatus.ACTIVE)
 
 
 def _summary(
@@ -109,6 +109,37 @@ def test_weekly_pace_verdict_branches_and_legacy_status_mapping(
     assert pace.depletion_eta_hours is not None
 
 
+@pytest.mark.parametrize("missing_reset", [False, True])
+@pytest.mark.parametrize("window_minutes", [10080, None, 0])
+def test_weekly_pace_omits_fleet_forecast_with_fresh_unsupported_weekly_usage(
+    missing_reset: bool,
+    window_minutes: int | None,
+) -> None:
+    known = _summary("pro", used_percent=40.0, reset_in_hours=24.0)
+    unknown = _summary("max", used_percent=20.0, reset_in_hours=24.0, capacity=0.0)
+    unknown.plan_type = "future"
+    unknown_account = _account("max")
+    unknown_account.plan_type = "future"
+    unknown.window_minutes_secondary = window_minutes
+    unknown_row = _row("max", 20.0, NOW - timedelta(minutes=1))
+    unknown_row.window_minutes = window_minutes
+    if missing_reset:
+        unknown.reset_at_secondary = None
+
+    result = build_weekly_credit_pace(
+        accounts=[_account("pro"), unknown_account],
+        account_summaries=[known, unknown],
+        secondary_history={
+            "pro": [_row("pro", 40.0, NOW - timedelta(minutes=1))],
+            "max": [unknown_row],
+        },
+        now=NOW,
+        usage_refresh_interval_seconds=60,
+    )
+
+    assert result is None
+
+
 def test_weekly_pace_relief_clusters_resets_within_one_hour() -> None:
     summaries = [
         _summary("acc-first", used_percent=96.0, reset_in_hours=2.0),
@@ -156,7 +187,7 @@ def test_weekly_pace_recent_burn_counts_delta_across_hour_boundary() -> None:
         },
     )
 
-    assert pace.burn_rate_recent_credits_per_hour == pytest.approx(5_040.0)
+    assert pace.burn_rate_recent_credits_per_hour == pytest.approx(15_120.0)
 
 
 def test_weekly_pace_recent_burn_uses_floored_observed_span() -> None:
@@ -171,7 +202,7 @@ def test_weekly_pace_recent_burn_uses_floored_observed_span() -> None:
         },
     )
 
-    assert pace.burn_rate_recent_credits_per_hour == pytest.approx(10_080.0)
+    assert pace.burn_rate_recent_credits_per_hour == pytest.approx(30_240.0)
 
 
 def test_weekly_pace_recent_burn_skips_reset_delta() -> None:

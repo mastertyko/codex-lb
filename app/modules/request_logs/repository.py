@@ -17,6 +17,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from app.core.usage.logs import (
     CANCELLED_STATUS,
     CLIENT_DISCONNECT_ERROR_CODE,
+    CONTROLLED_INTERRUPTION_ERROR_CODE,
     NON_ERROR_STATUSES,
     RequestLogLike,
     calculated_cost_from_log,
@@ -1044,6 +1045,7 @@ class RequestLogsRepository:
         sticky_key_source: str | None = None,
         sticky_kind: str | None = None,
         sticky_key_hash: str | None = None,
+        cache_write_input_tokens: int | None = None,
     ) -> RequestLog:
         async with sqlite_writer_section():
             # Telemetry write: this transaction only appends one request-log
@@ -1088,6 +1090,7 @@ class RequestLogsRepository:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
+                cache_write_input_tokens=cache_write_input_tokens,
                 reasoning_tokens=reasoning_tokens,
                 cost_usd=None,
                 reasoning_effort=reasoning_effort,
@@ -1268,6 +1271,9 @@ class RequestLogsRepository:
         error_codes_in: list[str] | None = None,
         error_codes_excluding: list[str] | None = None,
         *,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
         cache_mode: str = "since",
         timeframe: str | None = None,
         include_sensitive_metadata: bool = True,
@@ -1277,6 +1283,9 @@ class RequestLogsRepository:
         since = _naive_utc(since) if since is not None else None
         until = _naive_utc(until) if until is not None else None
         filters = self._build_filters(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             search=search,
             since=since,
             until=until,
@@ -1313,7 +1322,17 @@ class RequestLogsRepository:
             return RequestLogsResult(logs=logs, total=total, aggregated_cost_usd=aggregated_cost_usd)
 
         demand_params: _DemandCountParams | None = None
-        if search is None and not error_codes_in and not error_codes_excluding:
+        if (
+            search is None
+            and not error_codes_in
+            and not error_codes_excluding
+            and not request_kinds
+            and not transports
+            and not upstream_transports
+            # Legacy interrupted rows were stored as errors. Demand rollups
+            # lack the error-code grain needed to split them from errors.
+            and include_cancelled == include_error_other
+        ):
             demand_params = _DemandCountParams(
                 since=since,
                 until=until,
@@ -1333,6 +1352,9 @@ class RequestLogsRepository:
         window_identity = ("timeframe", timeframe) if cache_mode == "timeframe" else ("since", since)
         cache_key = (
             search,
+            tuple(sorted(request_kinds or ())),
+            tuple(sorted(transports or ())),
+            tuple(sorted(upstream_transports or ())),
             window_identity,
             until,
             conversation_id,
@@ -1489,8 +1511,14 @@ class RequestLogsRepository:
         model_options: list[tuple[str, str | None]] | None = None,
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
     ) -> tuple[list[str], list[tuple[str, str | None]], list[str], list[tuple[str, str | None]]]:
         filters = self._build_filters(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             since=since,
             until=until,
             account_ids=account_ids,
@@ -1506,6 +1534,9 @@ class RequestLogsRepository:
             exclude_soft_deleted=True,
         )
         api_key_facet_filters = self._build_filters(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             since=since,
             until=until,
             account_ids=account_ids,
@@ -1521,7 +1552,20 @@ class RequestLogsRepository:
             exclude_soft_deleted=True,
         )
 
-        unfiltered = not any((since, until, account_ids, api_key_ids, model_options, models, reasoning_efforts))
+        unfiltered = not any(
+            (
+                since,
+                until,
+                account_ids,
+                api_key_ids,
+                model_options,
+                models,
+                reasoning_efforts,
+                request_kinds,
+                transports,
+                upstream_transports,
+            )
+        )
         if unfiltered:
             # PostgreSQL has no loose index scan: with no user filters each
             # DISTINCT below is a full pass over request_logs, four times per
@@ -1653,6 +1697,9 @@ class RequestLogsRepository:
         model_options: list[tuple[str, str | None]] | None = None,
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
         include_success: bool = True,
         include_cancelled: bool = True,
         include_error_other: bool = True,
@@ -1676,6 +1723,20 @@ class RequestLogsRepository:
             conditions.append(RequestLog.account_id.in_(account_ids))
         if api_key_ids:
             conditions.append(RequestLog.api_key_id.in_(api_key_ids))
+        if request_kinds:
+            kinds = set(request_kinds)
+            if "warmup" in kinds:
+                kinds.add("limit_warmup")
+            conditions.append(RequestLog.request_kind.in_(kinds))
+        for column, values in (
+            (RequestLog.transport, transports),
+            (RequestLog.upstream_transport, upstream_transports),
+        ):
+            if values:
+                transport_conditions = [column.in_([value for value in values if value != "unknown"])]
+                if "unknown" in values:
+                    transport_conditions.append(or_(column.is_(None), column.not_in(("http", "websocket"))))
+                conditions.append(or_(*transport_conditions))
         if model_options:
             pair_conditions = []
             for model, effort in model_options:
@@ -1698,11 +1759,25 @@ class RequestLogsRepository:
         if include_success:
             status_conditions.append(RequestLog.status == "success")
         if include_cancelled:
-            status_conditions.append(RequestLog.status == CANCELLED_STATUS)
+            status_conditions.append(
+                or_(
+                    RequestLog.status == CANCELLED_STATUS,
+                    and_(
+                        RequestLog.status == "error",
+                        RequestLog.error_code == CONTROLLED_INTERRUPTION_ERROR_CODE,
+                    ),
+                )
+            )
         if error_codes_in:
             status_conditions.append(and_(RequestLog.status == "error", RequestLog.error_code.in_(error_codes_in)))
         if include_error_other:
-            error_clause = [RequestLog.status == "error"]
+            error_clause = [
+                RequestLog.status == "error",
+                or_(
+                    RequestLog.error_code.is_(None),
+                    RequestLog.error_code != CONTROLLED_INTERRUPTION_ERROR_CODE,
+                ),
+            ]
             if error_codes_excluding:
                 error_clause.append(
                     or_(
@@ -1721,6 +1796,12 @@ class RequestLogsRepository:
                 RequestLog.model.ilike(search_pattern),
                 RequestLog.reasoning_effort.ilike(search_pattern),
                 RequestLog.source.ilike(search_pattern),
+                RequestLog.request_kind.ilike(search_pattern),
+                RequestLog.transport.ilike(search_pattern),
+                RequestLog.upstream_transport.ilike(search_pattern),
+                case((RequestLog.request_kind == "codex_control_alpha_search", "Web search"), else_="").ilike(
+                    search_pattern
+                ),
                 RequestLog.status.ilike(search_pattern),
                 RequestLog.error_code.ilike(search_pattern),
                 RequestLog.error_message.ilike(search_pattern),

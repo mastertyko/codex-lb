@@ -123,7 +123,7 @@ def _account_to_summary(
         secondary_usage,
     )
 
-    if monthly_usage is not None and usage_core.capacity_for_plan(plan_type, "monthly") is None:
+    if monthly_usage is not None and usage_core.capacity_for_account(account, "monthly") is None:
         monthly_usage = None
     usage_refreshed_at = _latest_usage_recorded_at(primary_usage, secondary_usage, monthly_usage)
     monthly_used_percent = _normalize_used_percent(monthly_usage)
@@ -165,7 +165,7 @@ def _account_to_summary(
         and long_quota_usage.used_percent is not None
         and float(long_quota_usage.used_percent) < 100.0
     )
-    if usage_core.capacity_for_plan(plan_type, "primary") == 0.0:
+    if usage_core.capacity_for_account(account, "primary") == 0.0:
         primary_window_minutes = (
             effective_primary_usage.window_minutes
             if effective_primary_usage is not None
@@ -206,9 +206,9 @@ def _account_to_summary(
         effective_secondary_usage.window_minutes if effective_secondary_usage is not None else None
     )
     window_minutes_monthly = monthly_usage.window_minutes if monthly_usage is not None else None
-    capacity_primary = usage_core.capacity_for_plan(plan_type, "primary")
-    capacity_secondary = usage_core.capacity_for_plan(plan_type, "secondary")
-    capacity_monthly = usage_core.capacity_for_plan(plan_type, "monthly")
+    capacity_primary = usage_core.capacity_for_account(account, "primary")
+    capacity_secondary = usage_core.capacity_for_account(account, "secondary")
+    capacity_monthly = usage_core.capacity_for_account(account, "monthly")
     remaining_credits_primary = usage_core.remaining_credits_from_percent(
         primary_used_percent,
         capacity_primary,
@@ -267,6 +267,9 @@ def _account_to_summary(
         workspace_label=None if redact_identity else account.workspace_label,
         seat_type=account.seat_type,
         plan_type=plan_type,
+        pro_legacy_allowance=bool(account.pro_legacy_allowance),
+        usage_multiplier=usage_core.usage_multiplier_for_account(account),
+        capacity_credits_estimated=True,
         status=effective_status.value,
         routing_policy=_normalize_account_routing_policy(account.routing_policy),
         security_work_authorized=bool(account.security_work_authorized),

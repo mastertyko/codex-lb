@@ -117,6 +117,10 @@ async def validate_proxy_api_key(
     """A required-capability header authenticates even when global proxy API-key auth is disabled."""
 
     authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    from app.core.auth.desktop_oauth import get_desktop_oauth
+
+    if get_desktop_oauth(request) is not None:
+        return await validate_proxy_api_key_authorization(authorization, request=request)
     if request.headers.getlist(CODEX_LB_REQUIRED_CAPABILITY_HEADER):
         return await validate_required_proxy_api_key_authorization(authorization)
     return await validate_proxy_api_key_authorization(authorization, request=request)
@@ -127,6 +131,18 @@ async def validate_proxy_api_key_authorization(
     *,
     request: HTTPConnection | None = None,
 ) -> ApiKeyData | None:
+    # A separately authenticated Desktop gateway key retains its policies even
+    # when legacy proxy authentication is optional. This is typed ASGI state,
+    # never a caller-supplied marker header.
+    if request is not None:
+        from app.core.auth.desktop_oauth import get_desktop_oauth
+
+        native = get_desktop_oauth(request)
+        if native is not None:
+            return native.api_key
+        gateway_key = getattr(request.state, "desktop_gateway_api_key", None)
+        if isinstance(gateway_key, ApiKeyData):
+            return gateway_key
     settings = await get_settings_cache().get()
     if not settings.api_key_auth_enabled:
         if request is not None and not is_local_request(request):
@@ -141,9 +157,17 @@ async def validate_proxy_api_key_authorization(
     return await _validate_api_key_token(token)
 
 
-async def validate_required_proxy_api_key_authorization(authorization: str | None) -> ApiKeyData:
+async def validate_required_proxy_api_key_authorization(
+    authorization: str | None, *, request: HTTPConnection | None = None
+) -> ApiKeyData:
     """Validate a proxy API key even when global proxy auth is disabled."""
 
+    if request is not None:
+        from app.core.auth.desktop_oauth import get_desktop_oauth
+
+        native = get_desktop_oauth(request)
+        if native is not None:
+            return native.api_key
     token = _extract_bearer_token(authorization)
     if not token:
         raise ProxyAuthError("Missing API key in Authorization header")

@@ -54,6 +54,7 @@ class _AffinitySelectionKwargs(TypedDict):
     sticky_seed_key: str | None
     sticky_seed_kind: StickySessionKind | None
     spill_bare_session_on_account_cap: bool
+    allow_burn_first_reallocation: bool
     abandon_unavailable_legacy_owner: bool
     require_unambiguous_account: bool
     sticky_max_age_seconds: int | None
@@ -67,6 +68,8 @@ class _AffinityPolicy:
     # Source capability only. Shared selection still revokes spillover for a
     # required owner or any stage that may carry account-local state.
     spill_on_account_cap: bool = False
+    # Breaking cache affinity for policy alone requires complete portable input.
+    allow_burn_first_reallocation: bool = False
     # An explicit, self-contained Codex goal restart may retire only a raw
     # compatibility owner whose durable account status is unavailable.
     abandon_unavailable_legacy_owner: bool = False
@@ -139,6 +142,7 @@ class _AffinityPolicy:
             "sticky_seed_key": self.seed_selection_key,
             "sticky_seed_kind": self.seed_selection_kind,
             "spill_bare_session_on_account_cap": self.spill_on_account_cap,
+            "allow_burn_first_reallocation": self.allow_burn_first_reallocation,
             "abandon_unavailable_legacy_owner": self.abandon_unavailable_legacy_owner,
             "require_unambiguous_account": self.require_unambiguous_account,
             "sticky_max_age_seconds": self.max_age_seconds,
@@ -533,6 +537,13 @@ def _affinity_with_payload_continuity(
 ) -> _AffinityPolicy:
     if isinstance(payload, ResponsesRequest):
         conversation = payload.conversation
+        replay_payload = dict(payload.to_replay_safety_payload())
+        if replay_payload.get("type") == "response.create":
+            replay_payload.pop("type")
+        policy = replace(
+            policy,
+            allow_burn_first_reallocation=responses_payload_is_account_neutral_fresh_replay(replay_payload),
+        )
     else:
         conversation = (payload.model_extra or {}).get("conversation")
     if conversation is None or (isinstance(conversation, str) and not conversation.strip()):

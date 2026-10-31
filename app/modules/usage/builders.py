@@ -300,7 +300,7 @@ def _build_account_history(
         remaining_percent = usage_core.remaining_percent_from_used(used_percent_value)
         if remaining_percent is None:
             remaining_percent = missing_remaining_percent
-        capacity = usage_core.capacity_for_plan(account.plan_type, window)
+        capacity = usage_core.capacity_for_account(account, window)
         remaining_credits = usage_core.remaining_credits_from_percent(used_percent_value, capacity)
         if remaining_credits is None and missing_remaining_percent is not None:
             remaining_credits = capacity
@@ -310,6 +310,17 @@ def _build_account_history(
                 remaining_percent_avg=remaining_percent,
                 capacity_credits=float(capacity or 0.0),
                 remaining_credits=float(remaining_credits or 0.0),
+                capacity_known=not (
+                    capacity is None
+                    and usage is not None
+                    and usage.used_percent is not None
+                    and (
+                        usage.recorded_at is not None
+                        or (
+                            usage.window_minutes is not None and usage.window_minutes > 0 and usage.reset_at is not None
+                        )
+                    )
+                ),
             )
         )
     return results
@@ -434,6 +445,7 @@ def build_usage_window_summary_model(snapshot: UsageWindowSnapshot) -> UsageWind
         remaining_credits=remaining_credits,
         reset_at=from_epoch_seconds(snapshot.reset_at),
         window_minutes=snapshot.window_minutes,
+        unquantified_account_count=snapshot.unquantified_account_count,
     )
 
 

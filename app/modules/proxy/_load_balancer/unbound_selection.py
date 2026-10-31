@@ -217,6 +217,7 @@ async def run_unbound_selection_path(
                 def _select_from(candidates: list[AccountState]) -> SelectionResult:
                     return _select_account_preferring_budget_safe(
                         candidates,
+                        hard_owner_pool=required_account_id is not None,
                         prefer_earlier_reset=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
                         routing_strategy=routing_strategy,
@@ -236,8 +237,8 @@ async def run_unbound_selection_path(
                 # for cap-error detection below, and when the configured
                 # strategy rejects every overload-free candidate the full pool
                 # is selected from exactly as before. Sticky and continuity
-                # selection never reach this path, so warm sessions on those
-                # accounts keep flowing.
+                # with a sticky key does not reach this path; a resolved
+                # continuity owner without such a key still can.
                 overload_free_states = filter_overload_backoff_candidates(
                     selection_states,
                     owner._runtime,

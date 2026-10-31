@@ -228,6 +228,7 @@ const SettingsPayloadSchema = z.looseObject({
       "round_robin",
       "capacity_weighted",
       "relative_availability",
+    "quota_first_balanced",
       "fill_first",
       "sequential_drain",
       "reset_drain",

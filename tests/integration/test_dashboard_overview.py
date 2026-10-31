@@ -9,7 +9,7 @@ import pytest
 from app.core.crypto import TokenEncryptor
 from app.core.utils.time import naive_utc_to_epoch, utcnow
 from app.db.models import Account, AccountStatus, ApiKey, RequestLog
-from app.db.session import SessionLocal, engine
+from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.schemas import AccountSummary
 from app.modules.dashboard.weekly_pace import _weekly_timing
@@ -206,11 +206,11 @@ async def test_dashboard_overview_carries_weekly_runway_fields_and_attribution(
     pace = response.json()["weeklyCreditPace"]
     assert pace is not None
     assert pace["headroomPercent"] == pytest.approx(5.0)
-    assert pace["headroomCredits"] == pytest.approx(2_520.0)
-    assert pace["burnRateRecentCreditsPerHour"] == pytest.approx(4_473.3727810651)
+    assert pace["headroomCredits"] == pytest.approx(7_560.0)
+    assert pace["burnRateRecentCreditsPerHour"] == pytest.approx(13_420.1183431953)
     assert pace["depletionEtaHours"] == pytest.approx(0.5633333333)
     assert pace["nextReliefInHours"] == pytest.approx(4.0)
-    assert pace["nextReliefCredits"] == pytest.approx(47_880.0)
+    assert pace["nextReliefCredits"] == pytest.approx(143_640.0)
     assert pace["runwayStatus"] == "runs_dry"
     assert pace["status"] == "danger"
     assert pace["saturatedAccountCount"] == 0
@@ -240,6 +240,46 @@ async def test_dashboard_overview_omits_weekly_pace_value_without_weekly_data(
     response = await async_client.get("/api/dashboard/overview")
 
     assert response.status_code == 200
+    assert response.json()["weeklyCreditPace"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/api/dashboard/overview", "/api/dashboard/projections"])
+@pytest.mark.parametrize(
+    "max_window,max_window_minutes",
+    [("primary", 10080), ("secondary", 10080), ("secondary", None), ("secondary", 0)],
+)
+async def test_dashboard_omits_fleet_pace_with_reported_unsupported_secondary_usage(
+    async_client,
+    db_setup,
+    monkeypatch: pytest.MonkeyPatch,
+    endpoint: str,
+    max_window: str,
+    max_window_minutes: int | None,
+):
+    now = datetime(2026, 8, 17, 12, 0, 0)
+    monkeypatch.setattr("app.modules.dashboard.service.utcnow", lambda: now)
+    reset_at = int(naive_utc_to_epoch(now + timedelta(days=1)))
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        await accounts_repo.upsert(_make_account("pro-pace", "pro-pace@example.com", plan_type="pro"))
+        await accounts_repo.upsert(_make_account("max-pace", "max-pace@example.com", plan_type="future"))
+        for account_id, used in (("pro-pace", 40.0), ("max-pace", 20.0)):
+            await usage_repo.add_entry(
+                account_id,
+                used,
+                window=max_window if account_id == "max-pace" else "secondary",
+                window_minutes=max_window_minutes if account_id == "max-pace" else 10080,
+                reset_at=reset_at,
+                recorded_at=now - timedelta(minutes=1),
+            )
+
+    response = await async_client.get(endpoint)
+
+    assert response.status_code == 200
+    if endpoint == "/api/dashboard/overview":
+        assert response.json()["summary"]["secondaryWindow"]["unquantifiedAccountCount"] == 1
     assert response.json()["weeklyCreditPace"] is None
 
 
@@ -655,14 +695,14 @@ async def test_dashboard_overview_counts_prolite_capacity(async_client, db_setup
     account = payload["accounts"][0]
 
     assert account["planType"] == "prolite"
-    assert account["capacityCreditsPrimary"] == pytest.approx(1125.0)
-    assert account["remainingCreditsPrimary"] == pytest.approx(1125.0)
-    assert account["capacityCreditsSecondary"] == pytest.approx(37800.0)
-    assert account["remainingCreditsSecondary"] == pytest.approx(37800.0)
-    assert payload["summary"]["primaryWindow"]["capacityCredits"] == pytest.approx(1125.0)
-    assert payload["summary"]["primaryWindow"]["remainingCredits"] == pytest.approx(1125.0)
-    assert payload["summary"]["secondaryWindow"]["capacityCredits"] == pytest.approx(37800.0)
-    assert payload["summary"]["secondaryWindow"]["remainingCredits"] == pytest.approx(37800.0)
+    assert account["capacityCreditsPrimary"] == pytest.approx(2250.0)
+    assert account["remainingCreditsPrimary"] == pytest.approx(2250.0)
+    assert account["capacityCreditsSecondary"] == pytest.approx(75600.0)
+    assert account["remainingCreditsSecondary"] == pytest.approx(75600.0)
+    assert payload["summary"]["primaryWindow"]["capacityCredits"] == pytest.approx(2250.0)
+    assert payload["summary"]["primaryWindow"]["remainingCredits"] == pytest.approx(2250.0)
+    assert payload["summary"]["secondaryWindow"]["capacityCredits"] == pytest.approx(75600.0)
+    assert payload["summary"]["secondaryWindow"]["remainingCredits"] == pytest.approx(75600.0)
 
 
 @pytest.mark.asyncio
@@ -755,10 +795,10 @@ async def test_dashboard_projections_weekly_credit_pace_excludes_inactive_and_st
     assert pace["accountCount"] == 3
     assert pace["staleAccountCount"] == 1
     assert pace["inactiveAccountCount"] == 1
-    assert pace["totalFullCredits"] == pytest.approx(151_200.0)
+    assert pace["totalFullCredits"] == pytest.approx(453_600.0)
     assert pace["actualUsedPercent"] == pytest.approx(73.333, abs=0.01)
     assert pace["scheduledUsedPercent"] == pytest.approx(42.857, abs=0.01)
-    assert pace["scheduleGapCredits"] == pytest.approx(46_080.0, abs=1.0)
+    assert pace["scheduleGapCredits"] == pytest.approx(138_240.0, abs=1.0)
     # No account has two fresh samples, so burn is unmeasured and headroom is
     # ~26.7%: the runway verdict is safe, which maps to legacy on_track.
     assert pace["runwayStatus"] == "safe"
@@ -813,7 +853,7 @@ async def test_dashboard_projections_weekly_credit_pace_forecast_uses_recent_slo
     assert pace["accountCount"] == 1
     assert pace["actualUsedPercent"] == pytest.approx(24.0)
     assert pace["scheduledUsedPercent"] == pytest.approx(17.857, abs=0.01)
-    assert pace["scheduleGapCredits"] == pytest.approx(3_096.0, abs=1.0)
+    assert pace["scheduleGapCredits"] == pytest.approx(9_288.0, abs=1.0)
     assert pace["projectedShortfallCredits"] == 0
     assert pace["forecastBurnRateCreditsPerHour"] == pytest.approx(0.0)
     assert pace["paceMultiplier"] == pytest.approx(0.0)
@@ -864,7 +904,7 @@ async def test_dashboard_projections_weekly_credit_pace_smooths_displayed_gap(
     assert pace["paceGapSmoothingMinutes"] == 240
     assert pace["actualUsedPercent"] == pytest.approx(24.0)
     assert pace["deltaPercent"] == pytest.approx(6.142, abs=0.01)
-    assert pace["scheduleGapCredits"] == pytest.approx(3_096.0, abs=1.0)
+    assert pace["scheduleGapCredits"] == pytest.approx(9_288.0, abs=1.0)
     assert pace["smoothedDeltaPercent"] == pytest.approx(-5.857, abs=0.01)
     assert pace["smoothedScheduleGapCredits"] == 0
 
@@ -1122,16 +1162,12 @@ async def test_dashboard_projections_ewma_tail_cap_matches_uncapped_history(asyn
     uncapped_payload = uncapped.json()
 
     # One primary-window fetch per request (weekly-only primary-source
-    # account, no secondary rows). On PostgreSQL the capped fetch hydrates
-    # the 18 rows inside the 3h floor plus the 64-row tail; SQLite serves its
-    # shared-floor snapshot cache and ignores the cap.
+    # account, no secondary rows). The capped fetch hydrates the 18 rows
+    # inside the 3h floor plus the 64-row tail across both PostgreSQL and SQLite.
     assert len(fetched_row_counts) == 2
     capped_rows, uncapped_rows = fetched_row_counts
     assert uncapped_rows == 7 * 24 * 6
-    if str(engine.url).startswith("postgresql"):
-        assert capped_rows == 18 + 64
-    else:
-        assert capped_rows == uncapped_rows
+    assert capped_rows == 18 + 64
 
     _assert_json_close(
         capped_payload["depletionSecondary"], uncapped_payload["depletionSecondary"], "$.depletionSecondary"

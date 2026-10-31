@@ -34,6 +34,45 @@ def _account(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("writer", ["metadata", "tokens", "import"])
+async def test_legacy_marker_survives_same_plan_and_clears_on_transition(db_setup, writer):
+    async with SessionLocal() as session:
+        repo = AccountsRepository(session)
+        account = _account()
+        account.plan_type = "pro"
+        await repo.upsert(account)
+        await repo.update_account_preferences(account.id, pro_legacy_allowance=True)
+
+        async def change_plan(plan: str) -> None:
+            if writer == "metadata":
+                assert await repo.update_account_metadata(account.id, plan_type=plan)
+            elif writer == "tokens":
+                assert await repo.rotate_tokens(
+                    account.id,
+                    b"access",
+                    b"refresh",
+                    b"id",
+                    utcnow(),
+                    expected_refresh_token_encrypted=b"refresh",
+                    plan_type=plan,
+                )
+            else:
+                replacement = _account()
+                replacement.plan_type = plan
+                await repo.upsert(replacement)
+
+        await change_plan("pro")
+        await session.refresh(account)
+        assert account.pro_legacy_allowance is True
+        await change_plan("promax")
+        await session.refresh(account)
+        assert account.pro_legacy_allowance is False
+        await change_plan("pro")
+        await session.refresh(account)
+        assert account.pro_legacy_allowance is False
+
+
+@pytest.mark.asyncio
 async def test_list_accounts_refresh_existing_reloads_identity_map(db_setup):
     del db_setup
     async with SessionLocal() as session:

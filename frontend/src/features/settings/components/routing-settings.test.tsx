@@ -942,3 +942,15 @@ describe("RoutingSettings", () => {
     );
   });
 });
+
+
+it("saves quota-first balanced as a separate strategy while preserving other settings", async () => {
+  const user = userEvent.setup();
+  const onSave = vi.fn().mockResolvedValue(undefined);
+  render(<RoutingSettings settings={BASE_SETTINGS} busy={false} onSave={onSave} />);
+  await user.click(screen.getByRole("button", { name: /Quota-first balanced/ }));
+  expect(onSave).toHaveBeenCalledWith({
+    ...BASE_UPDATE_PAYLOAD,
+    routingStrategy: "quota_first_balanced",
+  });
+});

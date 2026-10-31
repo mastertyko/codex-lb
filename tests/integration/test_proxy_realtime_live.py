@@ -1143,7 +1143,7 @@ def test_v1_live_websocket_requires_api_key_before_binding_lookup(app_instance, 
 
 
 def test_v1_live_websocket_unknown_api_key_scoped_binding_is_denied(app_instance, monkeypatch):
-    async def missing_owner(self, call_id, *, api_key):
+    async def missing_owner(self, call_id, *, api_key, request_id=None):
         del self, api_key
         assert call_id == "rtc_missing"
         return None

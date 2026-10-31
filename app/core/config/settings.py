@@ -12,7 +12,7 @@ from typing import Annotated, Literal
 from urllib.parse import urlparse
 
 from dotenv import dotenv_values
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.core.auth.dashboard_mode import DashboardAuthMode, normalize_dashboard_auth_proxy_header
@@ -293,7 +293,34 @@ def _normalize_cidr_list(value: StringListInput, *, field_name: str, invalid_lab
     return cidrs
 
 
+class DesktopOAuthGrant(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    user_id: str = Field(min_length=1, max_length=256, repr=False)
+    workspace_id: str = Field(min_length=1, max_length=256, repr=False)
+    api_key_id: str = Field(min_length=1, max_length=256, repr=False)
+
+    @field_validator("user_id", "workspace_id", "api_key_id")
+    @classmethod
+    def _canonical_identifier(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("Desktop OAuth grant identifiers must be canonical")
+        return value
+
+
 class Settings(BaseSettings):
+    desktop_oauth_grants: list[DesktopOAuthGrant] = Field(default_factory=list, repr=False)
+
+    @field_validator("desktop_oauth_grants")
+    @classmethod
+    def _unique_desktop_grants(cls, value: list[DesktopOAuthGrant]) -> list[DesktopOAuthGrant]:
+        principals = {(grant.user_id, grant.workspace_id) for grant in value}
+        if len(principals) != len(value):
+            raise ValueError("Desktop OAuth grants must identify unique principals")
+        if len({grant.api_key_id for grant in value}) != len(value):
+            raise ValueError("Desktop OAuth grants must use distinct policy keys")
+        return value
+
     model_config = SettingsConfigDict(
         env_prefix="CODEX_LB_",
         env_file=ENV_FILES,

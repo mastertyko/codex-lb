@@ -88,6 +88,17 @@ async def test_account_export_requires_accounts_export_not_write(
 
 
 @pytest.mark.asyncio
+async def test_legacy_allowance_requires_accounts_write(
+    app_instance: FastAPI, async_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _use_principal(app_instance, monkeypatch, _principal_without(Permission.ACCOUNTS_WRITE))
+    _assert_permission_required(
+        await async_client.patch("/api/accounts/missing", json={"proLegacyAllowance": True}),
+        Permission.ACCOUNTS_WRITE,
+    )
+
+
+@pytest.mark.asyncio
 async def test_security_settings_fields_require_security_write(
     app_instance: FastAPI, async_client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

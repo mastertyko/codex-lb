@@ -54,6 +54,7 @@ from app.core.clients.thread_cache_identity import (
 from app.core.clock import REAL_CLOCK, Clock, clock_for, scheduler_for
 from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.errors import openai_error
+from app.core.exceptions import ProxyInvalidRequestError, ProxyReasoningEffortNotAllowed
 from app.core.openai.parsing import parse_sse_event
 from app.core.openai.requests import (
     ResponsesRequest,
@@ -118,6 +119,7 @@ from app.modules.proxy._service.http_bridge.quarantine import (
     _http_bridge_session_key_poison_quarantined,
     _record_http_bridge_quarantine_wedged_pending,
 )
+from app.modules.proxy._service.http_bridge.quota_rebalance import rebalance_http_bridge
 from app.modules.proxy._service.http_bridge.retry_circuit import (
     _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL,
     _HTTP_BRIDGE_RETRY_CIRCUIT_FAILURE_THRESHOLD,
@@ -185,6 +187,7 @@ from app.modules.proxy._service.support import (
     _request_log_client_fields,
     _websocket_request_can_replay_before_visible_output,
     _WebSocketRequestState,
+    submitted_tool_output_types,
 )
 from app.modules.proxy._service.support import (
     _websocket_route_log_kwargs as _websocket_route_log_kwargs,
@@ -244,7 +247,13 @@ from app.modules.proxy.helpers import (
     _normalize_error_code,
     _parse_openai_error,
 )
-from app.modules.proxy.load_balancer import effective_account_concurrency_caps, effective_routing_tunables
+from app.modules.proxy.load_balancer import LoadBalancer, effective_account_concurrency_caps, effective_routing_tunables
+from app.modules.proxy.quota_first import enforce_quota_first_admission
+from app.modules.proxy.request_policy import (
+    prepare_astra_reasoning_policy_continuation,
+    validate_astra_request,
+    validate_configuration_update_policy,
+)
 from app.modules.proxy.tool_call_dedupe import (
     dedupe_replayed_side_effect_input_items,
 )
@@ -416,14 +425,37 @@ def _text_with_thread_cache_identity(text_data: str, identity: ThreadCacheIdenti
     return json.dumps(frame, ensure_ascii=True, separators=(",", ":"))
 
 
+async def _enforce_http_bridge_quota_first(
+    balancer: LoadBalancer,
+    session: "_HTTPBridgeSession",
+    request_state: _WebSocketRequestState,
+) -> None:
+    # Ingress has already populated the cache. Never add a settings DB wait
+    # under a bridge lock or for existing routing strategies.
+    cached_row = getattr(_service_get_settings_cache(), "cached_row", None)
+    settings = cached_row() if callable(cached_row) else None
+    await enforce_quota_first_admission(
+        balancer,
+        routing_strategy=getattr(settings, "routing_strategy", ""),
+        account_id=session.account.id,
+        model=request_state.model,
+        service_tier=request_state.requested_service_tier,
+        api_key=request_state.api_key,
+        require_security_work_authorized=request_state.require_security_work_authorized,
+    )
+
+
 async def _send_http_bridge_request_text_with_archive_id(
     session: "_HTTPBridgeSession",
     request_state: _WebSocketRequestState,
     text_data: str,
     *,
+    balancer: LoadBalancer | None = None,
     on_send_started: Callable[[], None] | None = None,
     clock: Clock = REAL_CLOCK,
 ) -> None:
+    if balancer is not None:
+        await _enforce_http_bridge_quota_first(balancer, session, request_state)
     text_data = _text_with_operation_id(text_data, request_state.operation_id)
     text_data = _text_with_thread_cache_identity(text_data, _bridge_thread_cache_identity(session))
     # Operation metadata is added after the initial payload sizing pass. Check
@@ -608,7 +640,39 @@ def _text_without_account_installation_id(text_data: str) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
-def _text_with_previous_response_id(text_data: str, response_id: str | None) -> str:
+def _astra_client_update_efforts(payload: ResponsesRequest) -> tuple[str, ...]:
+    if payload.model.strip().lower() != "gpt-6-astra" or not isinstance(payload.input, list):
+        return ()
+    efforts: list[str] = []
+    for item in payload.input:
+        if not isinstance(item, dict) or item.get("type") != "configuration_update":
+            continue
+        reasoning = item.get("reasoning")
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+        if isinstance(effort, str) and effort.strip():
+            efforts.append(effort)
+    return tuple(efforts)
+
+
+def _restore_astra_client_update_efforts(request: ResponsesRequest, stored: tuple[str, ...]) -> None:
+    if not stored or not isinstance(request.input, list):
+        return
+    updates = [item for item in request.input if isinstance(item, dict) and item.get("type") == "configuration_update"]
+    if len(updates) != len(stored):
+        return
+    for item, effort in zip(updates, stored, strict=True):
+        reasoning = item.get("reasoning")
+        if isinstance(reasoning, dict):
+            item["reasoning"] = {**reasoning, "effort": effort}
+
+
+def _text_with_previous_response_id(
+    text_data: str,
+    response_id: str | None,
+    *,
+    api_key: ApiKeyData | None = None,
+    request_state: _WebSocketRequestState | None = None,
+) -> str:
     if not response_id:
         return text_data
     try:
@@ -618,6 +682,27 @@ def _text_with_previous_response_id(text_data: str, response_id: str | None) -> 
     if not isinstance(payload, dict) or not response_id:
         return text_data
     payload["previous_response_id"] = response_id
+    model = payload.get("model")
+    if api_key is not None and isinstance(model, str) and model.strip().lower() == "gpt-6-astra":
+        payload.pop("conversation", None)
+        request = ResponsesRequest.model_validate(payload)
+        client_effort = getattr(request_state, "reasoning_effort", None) if request_state is not None else None
+        if isinstance(client_effort, str) and client_effort:
+            request._codex_lb_client_reasoning_effort = client_effort
+        stored_updates = getattr(request_state, "astra_client_update_efforts", ()) if request_state is not None else ()
+        if stored_updates:
+            _restore_astra_client_update_efforts(request, stored_updates)
+        prepare_astra_reasoning_policy_continuation(request, api_key)
+        validate_astra_request(request, api_key)
+        if request_state is not None:
+            request_state.astra_client_update_efforts = _astra_client_update_efforts(request)
+        forwarded_payload = request.to_payload()
+        payload["input"] = forwarded_payload.get("input")
+        if request_state is not None and isinstance(request.input, list):
+            request_state.request_usage_budget = estimate_api_key_request_usage(
+                request,
+                upstream_payload=forwarded_payload,
+            )
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
 
@@ -749,7 +834,14 @@ class _HTTPBridgeRequestSubmitMixin:
         request_log_id: str | None = None,
         enforce_openai_sdk_contract: bool = True,
         upstream_payload_base: JsonObject | None = None,
+        apply_astra_subscription_schema: bool = True,
     ) -> tuple[_WebSocketRequestState, str]:
+        if apply_astra_subscription_schema:
+            if prepare_astra_reasoning_policy_continuation(payload, api_key):
+                upstream_payload_base = None
+            validate_astra_request(payload, api_key)
+        else:
+            validate_configuration_update_policy(payload, api_key, subscription=False)
         deduped_replayed_input_count: int | None = None
         deduped_replayed_input_fingerprint: str | None = None
         deduped_replayed_tool_call_count = 0
@@ -766,6 +858,9 @@ class _HTTPBridgeRequestSubmitMixin:
                 # The caller's dump describes the un-deduped input; it must not
                 # become the forwarded frame or the budget base.
                 upstream_payload_base = None
+                if apply_astra_subscription_schema:
+                    # Removing a replayed call can make updates adjacent.
+                    validate_astra_request(payload, api_key, prepare_continuation=False)
         protected_agent_control_output_occurrences = (
             _historical_agent_control_output_occurrences(cast(list[JsonValue], payload.input))
             if isinstance(payload.input, list)
@@ -813,6 +908,7 @@ class _HTTPBridgeRequestSubmitMixin:
             model=payload.model,
             service_tier=forwarded_service_tier,
             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
+            astra_client_update_efforts=_astra_client_update_efforts(payload),
             api_key_reservation=api_key_reservation,
             started_at=clock_for(self).monotonic(),
             thread_affinity_last_touch_at=clock_for(self).monotonic(),
@@ -842,6 +938,7 @@ class _HTTPBridgeRequestSubmitMixin:
             connection_request_kind=connection_request_kind,
             generate_false_prewarm=generate_false_prewarm,
         )
+        request_state.submitted_tool_output_types = submitted_tool_output_types(payload.input)
         if deduped_replayed_input_count is not None:
             request_state.input_item_count = deduped_replayed_input_count
             request_state.input_full_fingerprint = deduped_replayed_input_fingerprint
@@ -1182,6 +1279,14 @@ class _HTTPBridgeRequestSubmitMixin:
                     "The reattached anchor for this session was proven dead; resend the full conversation.",
                 ),
             )
+        if request_state.quota_rebalance_request_text is not None:
+            text_data = await rebalance_http_bridge(
+                self,
+                session,
+                request_state,
+                text_data,
+                settings=await _service_get_settings_cache().get(),
+            )
         # Persist the recovery checkpoint only after the retry circuit has
         # admitted this request. A client reconnect suppressed by the
         # cooldown must not create or refresh a journal entry for a request
@@ -1370,7 +1475,12 @@ class _HTTPBridgeRequestSubmitMixin:
                         # successive response anchors.
                         seen_hard_turn_response_ids.add(terminal_hard_turn_response_id)
                         hard_turn_chain_advanced = True
-                        text_data = _text_with_previous_response_id(text_data, terminal_hard_turn_response_id)
+                        text_data = _text_with_previous_response_id(
+                            text_data,
+                            terminal_hard_turn_response_id,
+                            api_key=request_state.api_key,
+                            request_state=request_state,
+                        )
                         request_state.request_text = text_data
                         _bind_http_bridge_proxy_injected_anchor(
                             self,
@@ -1423,7 +1533,12 @@ class _HTTPBridgeRequestSubmitMixin:
                                     )
                             completed_response_id = getattr(completed_operation, "response_id", None)
                             if completed_response_id and completed_response_id != request_state.previous_response_id:
-                                text_data = _text_with_previous_response_id(text_data, completed_response_id)
+                                text_data = _text_with_previous_response_id(
+                                    text_data,
+                                    completed_response_id,
+                                    api_key=request_state.api_key,
+                                    request_state=request_state,
+                                )
                                 request_state.request_text = text_data
                                 _bind_http_bridge_proxy_injected_anchor(
                                     self,
@@ -1472,6 +1587,18 @@ class _HTTPBridgeRequestSubmitMixin:
                     parent_response_id=operation_parent_response_id,
                     request_text=text_data,
                 )
+            except (ProxyInvalidRequestError, ProxyReasoningEffortNotAllowed):
+                # Late operation anchors revalidate restored Astra input.
+                # Client-policy failures must keep their 400/403 envelope
+                # and must not leave the already-created reservation hanging.
+                try:
+                    await self._release_websocket_request_state_reservation(request_state)
+                except Exception:
+                    logger.exception(
+                        "Failed to release reservation after Astra policy rejection request_id=%s",
+                        request_state.request_id,
+                    )
+                raise
             except Exception as exc:
                 session.closed = True
                 session.upstream_control.reconnect_requested = True
@@ -1864,6 +1991,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 bridge_session=session,
             )
             gate_acquired = True
+            await _enforce_http_bridge_quota_first(self._load_balancer, session, request_state)
             if request_state.bridge_queue_wait_started_at is not None:
                 request_state.latency_bridge_queue_wait_ms = int(
                     max(0.0, clock.monotonic() - request_state.bridge_queue_wait_started_at) * 1000
@@ -2203,10 +2331,16 @@ class _HTTPBridgeRequestSubmitMixin:
                             session,
                             request_state,
                             text_data,
+                            balancer=self._load_balancer,
                             on_send_started=mark_upstream_send_started,
                             clock=clock,
                         )
                     except BaseException as exc:
+                        if isinstance(exc, ProxyResponseError) and not upstream_send_started:
+                            admission_error = _parse_openai_error(exc.payload)
+                            if admission_error is not None and admission_error.code == "quota_first_owner_unavailable":
+                                # Proven unsent; keep the socket and its context.
+                                raise
                         request_state.recovery_attempt_dispatched = upstream_send_started
                         request_state.operation_dispatched = (
                             request_state.operation_id is not None and upstream_send_started
@@ -2432,6 +2566,7 @@ class _HTTPBridgeRequestSubmitMixin:
         if not _http_bridge_prewarm_enabled(settings):
             request_state.prewarm_status = "not_applicable"
             return
+        await _enforce_http_bridge_quota_first(self._load_balancer, session, request_state)
         prewarm_lock = session.prewarm_lock
         if prewarm_lock is None:
             request_state.prewarm_status = "skipped"
@@ -2556,7 +2691,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     request_enqueued = True
                     warmup_send_started = True
                     await _send_http_bridge_request_text_with_archive_id(
-                        session, warmup_state, warmup_text, clock=clock
+                        session, warmup_state, warmup_text, balancer=self._load_balancer, clock=clock
                     )
                 while True:
                     try:
@@ -3688,7 +3823,7 @@ class _HTTPBridgeRequestSubmitMixin:
                     )
                     request_state.request_text = retry_text_data
                 await _send_http_bridge_request_text_with_archive_id(
-                    session, request_state, retry_text_data, clock=clock
+                    session, request_state, retry_text_data, balancer=self._load_balancer, clock=clock
                 )
             _clear_websocket_request_error_overrides(request_state)
             session.last_used_at = clock.monotonic()
@@ -4132,7 +4267,9 @@ class _HTTPBridgeRequestSubmitMixin:
                     await self._release_request_state_account_response_create_lease(request_state)
                     return False
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)
-            await _send_http_bridge_request_text_with_archive_id(session, request_state, request_text, clock=clock)
+            await _send_http_bridge_request_text_with_archive_id(
+                session, request_state, request_text, balancer=self._load_balancer, clock=clock
+            )
             session.last_used_at = clock.monotonic()
             request_state.clean_close_retry_result = True
             return True
@@ -4246,7 +4383,9 @@ class _HTTPBridgeRequestSubmitMixin:
                 require_preferred_account=bound_to_current_account,
             )
             request_text = self._http_bridge_text_with_account_installation_id(session, request_state, request_text)
-            await _send_http_bridge_request_text_with_archive_id(session, request_state, request_text, clock=clock)
+            await _send_http_bridge_request_text_with_archive_id(
+                session, request_state, request_text, balancer=self._load_balancer, clock=clock
+            )
             session.last_used_at = clock.monotonic()
             return "retried"
         except UpstreamWebSocketTransportError:
@@ -4442,6 +4581,7 @@ class _HTTPBridgeRequestSubmitMixin:
                 session,
                 request_state,
                 retry_text,
+                balancer=self._load_balancer,
                 on_send_started=mark_security_retry_send_started,
                 clock=clock,
             )

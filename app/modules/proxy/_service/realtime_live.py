@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
-from typing import Protocol, cast
+from typing import Literal, Protocol, cast
 from urllib.parse import urlparse
 
 from fastapi import WebSocket
@@ -31,7 +31,7 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, StickySessionKind
 from app.db.session import detach_session_objects
 from app.modules.api_keys.service import ApiKeyData
-from app.modules.proxy._service.support import _request_log_client_fields
+from app.modules.proxy._service.support import _hash_identifier_or_none, _request_log_client_fields
 from app.modules.proxy.helpers import _header_account_id
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
@@ -56,6 +56,34 @@ _UNAVAILABLE_LIVE_OWNER_STATUSES = frozenset(
 
 _realtime_call_cleanup_lock = asyncio.Lock()
 _realtime_call_cleanup_last_monotonic = 0.0
+
+_LiveBindingReason = Literal[
+    "owner_bound", "binding_unknown", "binding_missing", "binding_expired", "binding_abandoned", "owner_out_of_scope"
+]
+_LOOKUP_REJECTION_REASONS: dict[str, _LiveBindingReason] = {
+    "missing": "binding_missing",
+    "expired": "binding_expired",
+    "abandoned": "binding_abandoned",
+}
+
+
+def _record_realtime_call_binding(
+    *,
+    outcome: Literal["bound", "rejected"],
+    reason: _LiveBindingReason,
+    call_id: str,
+    api_key_id: str,
+    request_id: str | None = None,
+) -> None:
+    logger.log(
+        logging.INFO if outcome == "bound" else logging.WARNING,
+        "realtime_call_binding outcome=%s reason=%s call_id_hash=%s api_key_id_hash=%s request_id_hash=%s",
+        outcome,
+        reason,
+        _hash_identifier_or_none(call_id) or "unknown",
+        _hash_identifier_or_none(api_key_id) or "unknown",
+        _hash_identifier_or_none(request_id if request_id is not None else get_request_id()) or "unknown",
+    )
 
 
 class _AccessTokenDecryptor(Protocol):
@@ -429,6 +457,7 @@ class _RealtimeLiveMixin:
         if persisted_owner_id != account_id:
             logger.error("Realtime call ownership conflict rejected")
             raise RuntimeError("Realtime call is already bound to another account")
+        _record_realtime_call_binding(outcome="bound", reason="owner_bound", call_id=call_id, api_key_id=api_key.id)
         await _maybe_purge_realtime_call_affinity(proxy)
         return call_id
 
@@ -437,15 +466,25 @@ class _RealtimeLiveMixin:
         call_id: str,
         *,
         api_key: ApiKeyData,
+        request_id: str | None = None,
     ) -> str | None:
         proxy = cast(_RealtimeLiveServiceProtocol, self)
         affinity_key = realtime_call_affinity_key(call_id, api_key)
         async with proxy._repo_factory() as repos:
-            return await repos.sticky_sessions.get_account_id(
+            lookup = await repos.sticky_sessions.get_account_id_and_abandonment(
                 affinity_key,
                 kind=StickySessionKind.CODEX_SESSION,
                 max_age_seconds=_REALTIME_CALL_AFFINITY_MAX_AGE_SECONDS,
             )
+        if lookup.account_id is None:
+            _record_realtime_call_binding(
+                outcome="rejected",
+                reason=_LOOKUP_REJECTION_REASONS.get(lookup.diagnostic_outcome, "binding_unknown"),
+                call_id=call_id,
+                api_key_id=api_key.id,
+                request_id=request_id,
+            )
+        return lookup.account_id
 
     async def proxy_realtime_live_websocket(
         self,
@@ -466,10 +505,24 @@ class _RealtimeLiveMixin:
             )
 
         proxy = cast(_RealtimeLiveServiceProtocol, self)
-        owner_account_id = await self._resolve_realtime_call_owner(normalized_call_id, api_key=api_key)
+        # The HTTP request-id middleware does not run for WebSockets. Observe
+        # an existing correlation header without establishing request state or
+        # generating an id before the unchanged owner/auth decisions.
+        diagnostic_request_id = get_request_id() or headers.get("x-request-id") or headers.get("request-id")
+        owner_account_id = await self._resolve_realtime_call_owner(
+            normalized_call_id, api_key=api_key, request_id=diagnostic_request_id
+        )
         if owner_account_id is None or (
             api_key.account_assignment_scope_enabled and owner_account_id not in api_key.assigned_account_ids
         ):
+            if owner_account_id is not None:
+                _record_realtime_call_binding(
+                    outcome="rejected",
+                    reason="owner_out_of_scope",
+                    call_id=normalized_call_id,
+                    api_key_id=api_key.id,
+                    request_id=diagnostic_request_id,
+                )
             raise ProxyResponseError(
                 404,
                 openai_error("realtime_call_not_found", "Realtime call binding not found or expired"),

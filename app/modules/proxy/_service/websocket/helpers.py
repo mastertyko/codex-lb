@@ -301,6 +301,7 @@ from app.modules.proxy._service.support import (
     _WebSocketReceiveTimeout,
     _WebSocketRequestState,
     _WebSocketUpstreamControl,
+    update_pending_async_tools,
 )
 from app.modules.proxy._service.support import (
     _HTTPBridgeOwnerForward as _HTTPBridgeOwnerForward,
@@ -349,6 +350,7 @@ from app.modules.proxy.helpers import (
     _is_account_model_unsupported_error,
     _normalize_error_code,
     _parse_openai_error,
+    _upstream_error_from_openai,
     is_upstream_model_capacity_error,
     is_upstream_usage_limit_rejection,
 )
@@ -358,7 +360,11 @@ from app.modules.proxy.http_bridge_forwarding import (
 from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
-from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+from app.modules.proxy.replay_safety import (
+    project_responses_input_for_account_neutral_fresh_replay,
+    responses_input_suffix_retains_prior_output,
+    responses_payload_is_account_neutral_fresh_replay,
+)
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED
 
 
@@ -453,6 +459,8 @@ def _is_websocket_stale_previous_response(
 def _prepare_websocket_request_state_for_visible_output_replay(
     request_state: "_WebSocketRequestState",
 ) -> str | None:
+    if request_state.steering_parent_response_id is not None:
+        return None
     # An identity captured by an earlier replay (or staged by the terminal
     # capacity path before ``response_id`` was cleared) outlives this call, so
     # a bounded extra replay keeps rewriting to the id the client is reading.
@@ -663,10 +671,10 @@ async def _record_or_defer_websocket_accepted_replay_health(
     request_state: "_WebSocketRequestState",
     *,
     account: Account,
-    error_message: str | None,
+    error: UpstreamError,
     error_code: str,
 ) -> None:
-    """Penalize the account an accepted replay leaves, now or after settlement.
+    """Record the original attempt's account penalty, now or after settlement.
 
     The accepted request keeps its API-key reservation open across the
     re-send, and account health must not be written while a reservation is
@@ -679,7 +687,6 @@ async def _record_or_defer_websocket_accepted_replay_health(
     terminal is never finalized on this surface, so a later terminal belongs to
     the replacement attempt and earns its own penalty.
     """
-    error: UpstreamError = {"message": error_message or "Upstream error"}
     if request_state.api_key_reservation is not None:
         request_state.deferred_keyed_stream_health.append(
             _DeferredKeyedStreamHealthPenalty(account=account, error=error, code=error_code)
@@ -692,6 +699,8 @@ def _prepare_websocket_request_state_for_account_switch(
     request_state: "_WebSocketRequestState",
 ) -> str | None:
     """Return an unsent request body only when moving accounts is proven safe."""
+    if request_state.steering_parent_response_id is not None:
+        return None
     if request_state.previous_response_id is None:
         if not _websocket_request_text_is_account_neutral_fresh_replay(request_state.request_text):
             return None
@@ -702,10 +711,12 @@ def _prepare_websocket_request_state_for_account_switch(
 def _retire_websocket_continuity_anchor(continuity_state: _WebSocketContinuityState) -> None:
     """Drop the completed-response anchor and the state that only exists for it."""
     continuity_state.last_completed_response_id = None
+    continuity_state.last_completed_connection_id = None
     continuity_state.last_completed_input_count = 0
     continuity_state.last_completed_input_prefix_fingerprint = None
     continuity_state.last_pending_function_call_ids = []
     continuity_state.last_pending_tool_call_types = {}
+    continuity_state.pending_async_tool_calls.clear()
 
 
 def _websocket_continuity_anchor_for_payload(
@@ -732,7 +743,7 @@ def _websocket_continuity_anchor_for_payload(
         _retire_websocket_continuity_anchor(continuity_state)
         _facade().logger.info(
             "websocket_session_anchor_retired response_id=%s reason=stale_previous_response",
-            previous_response_id,
+            _hash_identifier(previous_response_id),
         )
         return None
     stored_count = continuity_state.last_completed_input_count
@@ -745,6 +756,67 @@ def _websocket_continuity_anchor_for_payload(
     return _WebSocketContinuityAnchor(
         previous_response_id=previous_response_id,
         stored_input_item_count=stored_count,
+    )
+
+
+def _websocket_full_resend_retains_prior_output(
+    continuity_state: _WebSocketContinuityState,
+    input_items: list[JsonValue],
+    *,
+    stored_count: int,
+) -> bool:
+    # Direct WebSocket done-event metadata is not a complete output manifest.
+    # Even a later assistant boundary cannot override known pending work.
+    if (
+        continuity_state.last_pending_function_call_ids
+        or continuity_state.last_pending_tool_call_types
+        or continuity_state.pending_async_tool_calls
+    ):
+        return False
+    projection = project_responses_input_for_account_neutral_fresh_replay(
+        input_items,
+        stored_count=stored_count,
+        preserve_developer_message_ids=True,
+    )
+    return projection is not None and responses_input_suffix_retains_prior_output(
+        projection.input_items,
+        stored_count=projection.stored_prefix_count,
+        canonical_lite_developer_index=projection.canonical_lite_developer_index,
+    )
+
+
+def _prepare_websocket_reconnect_full_resend(
+    request_state: _WebSocketRequestState,
+    *,
+    connection_id: str | None,
+    account_id: str,
+) -> str | None:
+    """Install the original proven input only after resolving its owner and connection."""
+    if (
+        not request_state.proxy_injected_previous_response_id
+        or not request_state.proxy_injected_anchor_retains_prior_output
+        or request_state.proxy_injected_anchor_connection_id is None
+        or connection_id is None
+        or connection_id == request_state.proxy_injected_anchor_connection_id
+        or not request_state.fresh_upstream_request_is_retry_safe
+        or request_state.fresh_upstream_request_text is None
+    ):
+        return None
+    owner_account_id = request_state.previous_response_owner_account_id
+    if owner_account_id is None or request_state.preferred_account_id != owner_account_id:
+        return None
+    if request_state.replay_required_account_id not in (None, owner_account_id):
+        return None
+    # Freeze the resolved owner even if a connector returns the wrong account;
+    # the ordinary dispatch fence must reject that socket before any send.
+    request_state.replay_required_account_id = owner_account_id
+    if account_id != owner_account_id:
+        return None
+    return _install_fresh_replay_body(
+        request_state,
+        request_state.fresh_upstream_request_text,
+        account_neutral=False,
+        release_owner_pin=False,
     )
 
 
@@ -822,7 +894,11 @@ def _record_websocket_continuity_completion(
     # meaningful for fingerprinted list inputs, so the count/fingerprint pair
     # is cleared rather than left stale when the completed turn cannot
     # provide one.
+    if request_state.previous_response_id != continuity_state.last_completed_response_id:
+        continuity_state.pending_async_tool_calls.clear()
+    update_pending_async_tools(continuity_state.pending_async_tool_calls, request_state)
     continuity_state.last_completed_response_id = response_id
+    continuity_state.last_completed_connection_id = request_state.diagnostic_connection_id
     if request_state.input_item_count > 0 and request_state.input_full_fingerprint is not None:
         continuity_state.last_completed_input_count = request_state.input_item_count
         continuity_state.last_completed_input_prefix_fingerprint = request_state.input_full_fingerprint
@@ -955,6 +1031,7 @@ def _websocket_event_error_param(
     event_type: str | None,
     payload: dict[str, JsonValue] | None,
 ) -> OpenAIErrorParam | None:
+    """Extract typed parameters from the upstream frame's error payload."""
     error = _websocket_event_error_payload(event_type, payload)
     if not isinstance(error, dict):
         return None
@@ -962,6 +1039,7 @@ def _websocket_event_error_param(
 
 
 def _websocket_event_error_message(event_type: str | None, payload: dict[str, JsonValue] | None) -> str | None:
+    """Return a nonempty, stripped error message when the frame supplies one."""
     error = _websocket_event_error_payload(event_type, payload)
     if not isinstance(error, dict):
         return None
@@ -972,6 +1050,14 @@ def _websocket_event_error_message(event_type: str | None, payload: dict[str, Js
     return stripped or None
 
 
+def _websocket_event_upstream_error(event_type: str | None, payload: dict[str, JsonValue] | None) -> UpstreamError:
+    """Preserve reset evidence when a retry records the upstream account's health."""
+    error = _websocket_event_error_payload(event_type, payload)
+    upstream_error = _upstream_error_from_openai(_parse_openai_error({"error": error}))
+    upstream_error["message"] = _websocket_event_error_message(event_type, payload) or "Upstream error"
+    return upstream_error
+
+
 def _websocket_precreated_retry_error_code(
     request_state: _WebSocketRequestState | None,
     *,
@@ -979,6 +1065,11 @@ def _websocket_precreated_retry_error_code(
     payload: dict[str, JsonValue] | None,
     has_other_pending_requests: bool,
 ) -> str | None:
+    """Classify errors for retries that have not exposed downstream output.
+
+    Accepted responses delegate to the output-free capacity retry policy;
+    pre-created responses must pass visibility and replay-budget guards.
+    """
     if request_state is None:
         return None
     if request_state.response_id is not None and not request_state.awaiting_response_created:
@@ -1168,6 +1259,8 @@ def _prepare_websocket_request_state_for_auth_replay(
     *,
     current_account_id: str | None = None,
 ) -> str | None:
+    if request_state.steering_parent_response_id is not None:
+        return None
     if request_state.verified_stale_anchor_replay:
         return None
     if request_state.last_downstream_sequence_number is not None:
@@ -1377,7 +1470,7 @@ def _sanitize_public_websocket_event_payload(
     """Copy a terminal event with only a client-safe ``error.param``."""
 
     normalized = payload
-    if event_type in {"error", "response.failed"}:
+    if event_type in {"error", "response.failed", "response.steer.failed"}:
         error_value = payload.get("error")
         if isinstance(error_value, dict):
             sanitized_error = sanitize_public_error_detail(error_value)
@@ -1581,8 +1674,21 @@ def _record_websocket_stale_anchor_failure(
             previous_response_id=request_state.previous_response_id,
             api_key_id=request_state.api_key.id if request_state.api_key is not None else None,
         )
+    _record_websocket_stale_anchor_diagnostics(request_state, surface=surface, upstream_error_code=upstream_error_code)
+
+
+def _record_websocket_stale_anchor_diagnostics(
+    request_state: _WebSocketRequestState,
+    *,
+    surface: str,
+    upstream_error_code: str,
+    count_failure: bool = True,
+) -> None:
+    diagnostics = _websocket_stale_anchor_diagnostics(request_state)
     _record_continuity_fail_closed(
         surface=surface,
+        request_state=request_state,
+        count_failure=count_failure,
         reason="previous_response_not_found",
         previous_response_id=request_state.previous_response_id,
         session_id=request_state.session_id,
@@ -1619,6 +1725,7 @@ def _rewrite_websocket_continuity_corruption_event(
             reason=reason,
             previous_response_id=request_state.previous_response_id,
             session_id=request_state.session_id,
+            request_state=request_state,
             upstream_error_code=(
                 PREVIOUS_RESPONSE_NOT_FOUND_CODE if reason == PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON else None
             ),
@@ -1650,6 +1757,7 @@ def _rewrite_websocket_previous_response_owner_unavailable_event(
         reason="owner_account_unavailable",
         previous_response_id=request_state.previous_response_id,
         session_id=request_state.session_id,
+        request_state=request_state,
     )
     rewritten_event_payload = response_failed_event(
         "upstream_unavailable",
@@ -1765,6 +1873,7 @@ def _sanitize_websocket_previous_response_error(
             reason=reason,
             previous_response_id=previous_response_id,
             session_id=session_id,
+            request_state=request_state,
             upstream_error_code=normalized_code,
         )
     return (
@@ -1820,6 +1929,7 @@ def _sanitize_websocket_terminal_error_fields(
             reason=PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
             previous_response_id=request_state.previous_response_id,
             session_id=request_state.session_id,
+            request_state=request_state,
             upstream_error_code=normalized_code,
         )
     rewritten_code, rewritten_message = _websocket_continuity_error_fields(
@@ -1851,6 +1961,11 @@ def _assign_websocket_response_id(
 ) -> _WebSocketRequestState | None:
     if response_id is None:
         return None
+    pending_requests = deque(
+        state
+        for state in pending_requests
+        if state.steering_parent_response_id is None or state.response_id is not None or state.request_text is not None
+    )
     existing = _find_websocket_request_state_by_response_id(pending_requests, response_id)
     if existing is not None:
         return existing
@@ -1894,6 +2009,11 @@ def _match_websocket_request_state_for_anonymous_event(
     prefer_draining_requests: bool = True,
     event_type: str | None = None,
 ) -> _WebSocketRequestState | None:
+    pending_requests = deque(
+        state
+        for state in pending_requests
+        if state.steering_parent_response_id is None or state.response_id is not None or state.request_text is not None
+    )
     if prefer_previous_response_not_found:
         return _match_websocket_request_state_for_previous_response_error(
             pending_requests,
@@ -1927,14 +2047,13 @@ def _match_websocket_request_state_for_anonymous_event(
         if not visible_requests:
             return draining_requests[0]
 
-    if len(visible_requests) == 1:
-        return visible_requests[0]
-
     unresolved_visible_requests = [
         request_state for request_state in visible_requests if request_state.response_id is None
     ]
     if len(unresolved_visible_requests) == 1:
         return unresolved_visible_requests[0]
+    if len(visible_requests) == 1:
+        return visible_requests[0]
 
     if not visible_requests and draining_requests:
         unresolved_draining_requests = [

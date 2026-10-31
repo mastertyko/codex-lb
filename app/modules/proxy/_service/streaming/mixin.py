@@ -44,6 +44,7 @@ from app.core.errors import synthetic_stream_failure_event as response_failed_ev
 from app.core.openai.parsing import _LIFECYCLE_EVENT_TYPES, classify_event_type, parse_sse_event_payload
 from app.core.openai.requests import ResponsesRequest
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
+from app.core.usage.pricing import subscription_pricing_tier
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import utcnow as utcnow
@@ -651,7 +652,7 @@ class _StreamingMixin(_StreamingRetryMixin):
             event_service_tier = _facade()._service_tier_from_event_payload(first_payload)
             if event_service_tier is not None:
                 actual_service_tier = event_service_tier
-                service_tier = event_service_tier
+                service_tier = subscription_pricing_tier(model, requested_service_tier, event_service_tier)
             if event and event.response and event.response.id:
                 response_id = event.response.id
                 settlement.response_id = response_id
@@ -808,7 +809,7 @@ class _StreamingMixin(_StreamingRetryMixin):
                 event_service_tier = _facade()._service_tier_from_event_payload(event_payload)
                 if event_service_tier is not None:
                     actual_service_tier = event_service_tier
-                    service_tier = event_service_tier
+                    service_tier = subscription_pricing_tier(model, requested_service_tier, event_service_tier)
                 line, event_payload, event, event_type = _rewrite_tool_call_line(line, event_payload, event=event)
                 if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                     saw_text_delta = True
@@ -1028,9 +1029,7 @@ class _StreamingMixin(_StreamingRetryMixin):
             await proxy._load_balancer.release_account_lease(account_response_create_lease)
             input_tokens = usage.input_tokens if usage else None
             output_tokens = usage.output_tokens if usage else None
-            cached_input_tokens = (
-                usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
-            )
+            input_details = usage.input_tokens_details if usage else None
             reasoning_tokens = (
                 usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
             )
@@ -1041,9 +1040,11 @@ class _StreamingMixin(_StreamingRetryMixin):
             settlement.status = status
             settlement.model = model
             settlement.service_tier = service_tier
+            settlement.upstream_transport = route_trace.transport
             settlement.input_tokens = input_tokens
             settlement.output_tokens = output_tokens
-            settlement.cached_input_tokens = cached_input_tokens
+            settlement.cached_input_tokens = input_details.cached_tokens if input_details else None
+            settlement.cache_write_input_tokens = input_details.cache_write_tokens if input_details else None
             if settlement.error_code is None:
                 settlement.error_code = error_code
             settlement.error_message = error_message
@@ -1060,11 +1061,12 @@ class _StreamingMixin(_StreamingRetryMixin):
                 error_message=error_message,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                cached_input_tokens=cached_input_tokens,
+                cached_input_tokens=settlement.cached_input_tokens,
+                cache_write_input_tokens=settlement.cache_write_input_tokens,
                 reasoning_tokens=reasoning_tokens,
                 reasoning_effort=reasoning_effort,
                 transport=request_transport,
-                upstream_transport=upstream_stream_transport,
+                upstream_transport=route_trace.transport,
                 service_tier=service_tier,
                 requested_service_tier=requested_service_tier,
                 actual_service_tier=actual_service_tier,

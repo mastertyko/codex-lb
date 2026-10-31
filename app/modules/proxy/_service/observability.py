@@ -4,8 +4,8 @@ import json
 import logging
 import sys
 from collections.abc import Mapping, Sequence
-from hashlib import sha256
-from typing import Any, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, cast
+from uuid import uuid4
 
 from app.core.config.settings import get_settings
 from app.core.metrics.prometheus import (
@@ -21,11 +21,21 @@ from app.core.openai.requests import ResponsesCompactRequest, ResponsesRequest, 
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_list
 from app.core.utils.request_id import get_request_id
+from app.modules.proxy._service.support import _hash_identifier, _hash_identifier_or_none
 from app.modules.proxy.affinity import (
     _extract_model_class,
     _prompt_cache_key_from_request_model,
     _sticky_key_from_session_header,
 )
+
+if TYPE_CHECKING:
+    from app.modules.proxy._service.support import _WebSocketRequestState, _WebSocketUpstreamControl
+
+
+_WebSocketCloseOutcome = Literal[
+    "unknown", "closed", "transport_error", "timeout", "reconnect", "cancelled", "client_disconnected", "reader_error"
+]
+
 
 logger = logging.getLogger("app.modules.proxy.service")
 
@@ -220,15 +230,6 @@ def _maybe_log_proxy_service_tier_trace(
     )
 
 
-def _hash_identifier_or_none(value: str | None) -> str | None:
-    if value is None:
-        return None
-    stripped = value.strip()
-    if not stripped:
-        return None
-    return _hash_identifier(stripped)
-
-
 def _record_continuity_owner_resolution(
     *,
     surface: str,
@@ -319,10 +320,12 @@ def _record_continuity_fail_closed(
     owner_lookup_outcome: str | None = None,
     previous_response_age_seconds: int | None = None,
     same_session: bool | None = None,
+    request_state: _WebSocketRequestState | None = None,
+    count_failure: bool = True,
 ) -> None:
     prometheus_available = bool(_service_global("PROMETHEUS_AVAILABLE", PROMETHEUS_AVAILABLE))
     counter = _service_global("continuity_fail_closed_total", continuity_fail_closed_total)
-    if prometheus_available and counter is not None:
+    if count_failure and prometheus_available and counter is not None:
         counter.labels(
             surface=surface,
             reason=reason,
@@ -335,21 +338,104 @@ def _record_continuity_fail_closed(
         previous_response_age_seconds=previous_response_age_seconds,
         same_session=same_session,
     )
+    correlation = ""
+    if request_state is not None and request_state.transport == "websocket":
+        category = (
+            reason
+            if reason
+            in {
+                "previous_response_not_found",
+                "previous_response_not_found_malformed_param",
+                "missing_tool_output",
+                "owner_account_unavailable",
+                "owner_lookup_failed",
+                "stream_incomplete",
+            }
+            else "unknown"
+        )
+        upstream_error_code = (
+            upstream_error_code
+            if upstream_error_code
+            in {
+                "previous_response_not_found",
+                "invalid_request_error",
+                "stream_incomplete",
+            }
+            else "unknown"
+        )
+        correlation = (
+            f" request_id={_hash_identifier_or_none(request_state.request_id) or 'unknown'}"
+            f" conversation_id={_hash_identifier_or_none(request_state.conversation_id) or 'unknown'}"
+            f" response_id={_hash_identifier_or_none(request_state.response_id) or 'unknown'}"
+            f" connection_id={request_state.diagnostic_connection_id or 'unknown'}"
+            f" category={category}"
+        )
     logger.warning(
         "continuity_fail_closed surface=%s reason=%s previous_response_id=%s session_id=%s "
-        "upstream_error_code=%s diagnostics=%s",
+        "upstream_error_code=%s diagnostics=%s%s",
         surface,
         reason,
-        _hash_identifier_or_none(previous_response_id),
-        _hash_identifier_or_none(session_id),
+        _hash_identifier_or_none(previous_response_id) or ("unknown" if correlation else None),
+        _hash_identifier_or_none(session_id) or ("unknown" if correlation else None),
         upstream_error_code,
         diagnostics,
+        correlation,
     )
 
 
-def _hash_identifier(value: str) -> str:
-    digest = sha256(value.encode("utf-8")).hexdigest()
-    return f"sha256:{digest[:12]}"
+def _record_websocket_connection_opened(
+    control: _WebSocketUpstreamControl, request_state: _WebSocketRequestState, *, now: float
+) -> None:
+    control.diagnostic_connection_id = _hash_identifier(uuid4().hex)
+    control.diagnostic_opened_at = now
+    logger.info(
+        "websocket_connection_opened connection_id=%s request_id=%s session_id=%s conversation_id=%s",
+        control.diagnostic_connection_id,
+        _hash_identifier_or_none(request_state.request_id) or "unknown",
+        _hash_identifier_or_none(request_state.session_id) or "unknown",
+        _hash_identifier_or_none(request_state.conversation_id) or "unknown",
+    )
+
+
+def _record_websocket_connection_closed(
+    control: _WebSocketUpstreamControl,
+    *,
+    now: float,
+    outcome: _WebSocketCloseOutcome,
+) -> None:
+    if control.diagnostic_connection_id is None or control.diagnostic_opened_at is None:
+        return
+    logger.info(
+        "websocket_connection_closed connection_id=%s outcome=%s lifetime_ms=%d",
+        control.diagnostic_connection_id,
+        outcome,
+        max(0, int((now - control.diagnostic_opened_at) * 1000)),
+    )
+
+
+def _record_websocket_request_terminal(
+    request_state: _WebSocketRequestState, *, status: str, now: float, response_id: str | None = None
+) -> None:
+    if request_state.transport != "websocket" or request_state.diagnostic_terminal_recorded:
+        return
+    request_state.diagnostic_terminal_recorded = True
+    outcome = status if status in {"success", "error", "cancelled"} else "unknown"
+    rejected_at = request_state.continuity_first_rejection_at
+    recovered = outcome == "success" and rejected_at is not None and request_state.replay_count > 0
+    elapsed_ms = max(0, int((now - rejected_at) * 1000)) if recovered and rejected_at is not None else "unknown"
+    logger.info(
+        "websocket_request_terminal request_id=%s session_id=%s conversation_id=%s response_id=%s "
+        "connection_id=%s outcome=%s replay_count=%d recovered=%s elapsed_since_rejection_ms=%s",
+        _hash_identifier_or_none(request_state.request_id) or "unknown",
+        _hash_identifier_or_none(request_state.session_id) or "unknown",
+        _hash_identifier_or_none(request_state.conversation_id) or "unknown",
+        _hash_identifier_or_none(response_id or request_state.response_id) or "unknown",
+        request_state.diagnostic_connection_id or "unknown",
+        outcome,
+        request_state.replay_count,
+        str(recovered).lower(),
+        elapsed_ms,
+    )
 
 
 def _summarize_input(items: JsonValue) -> str:

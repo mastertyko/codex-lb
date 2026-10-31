@@ -41,6 +41,7 @@ from app.core.resilience.network_recovery import ProcessNetworkRecovery
 from app.core.resilience.toggles import bind_resilience_toggles
 from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
+from app.core.usage.pricing import subscription_pricing_tier
 from app.core.utils.request_id import ensure_request_id, get_request_id
 from app.core.utils.retry import backoff_seconds
 from app.core.utils.shared_future import wait_on_shared_future
@@ -82,8 +83,7 @@ from app.modules.proxy.load_balancer import (
     effective_account_concurrency_caps,
 )
 from app.modules.proxy.replay_safety import (
-    project_responses_input_for_account_neutral_fresh_replay,
-    responses_input_suffix_retains_prior_output,
+    project_responses_input_retaining_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
 )
 from app.modules.proxy.selection_errors import selection_failure_response
@@ -544,34 +544,7 @@ def _compact_replay_history_retains_prior_output(input_items: list[JsonValue]) -
     transcript walk can actually refute.
     """
 
-    last_assistant_index: int | None = None
-    for index in range(len(input_items) - 1, -1, -1):
-        item = input_items[index]
-        if isinstance(item, dict) and item.get("type") in (None, "message") and item.get("role") == "assistant":
-            last_assistant_index = index
-            break
-    # ``responses_input_suffix_retains_prior_output`` requires a non-empty
-    # stored prefix, so a history that opens with (or lacks) assistant output
-    # cannot be proven and stays owner-bound.
-    if last_assistant_index is None or last_assistant_index == 0:
-        return False
-    # The projection is an identity transform for input that already passed
-    # the account-neutral fresh-replay gate (no server-assigned ids, no
-    # reasoning or omitted bookkeeping types survive that gate), but it is the
-    # shared authority for recognizing the canonical Responses-Lite developer
-    # instruction behind an ``additional_tools`` bundle — without that index
-    # the suffix walk would reject every Lite full resend.
-    projection = project_responses_input_for_account_neutral_fresh_replay(
-        input_items,
-        stored_count=last_assistant_index,
-    )
-    if projection is None:
-        return False
-    return responses_input_suffix_retains_prior_output(
-        projection.input_items,
-        stored_count=projection.stored_prefix_count,
-        canonical_lite_developer_index=projection.canonical_lite_developer_index,
-    )
+    return project_responses_input_retaining_prior_output(input_items) is not None
 
 
 def _compact_account_neutral_replay_payload(
@@ -798,6 +771,7 @@ class _CompactMixin:
         response: CompactResponsePayload | None = None
         request_service_tier: str | None = None
         actual_service_tier: str | None = None
+        upstream_transport: str | None = None
         route_mode: str | None = None
         route_pool_id: str | None = None
         route_endpoint_id: str | None = None
@@ -1134,6 +1108,7 @@ class _CompactMixin:
                 account_response_create_lease: AccountLease | None = None,
             ) -> CompactResponsePayload:
                 nonlocal route_fallback_used, route_mode, route_pool_id, route_endpoint_id
+                nonlocal upstream_transport
                 access_token = proxy._encryptor.decrypt(target.access_token_encrypted)
                 account_id = _header_account_id(target.chatgpt_account_id)
                 remaining_budget = _remaining_budget_seconds(deadline)
@@ -1191,6 +1166,7 @@ class _CompactMixin:
                             upstream_budget,
                             remaining_budget,
                         )
+                        upstream_transport = _REQUEST_TRANSPORT_HTTP
                         response = await asyncio.wait_for(
                             _call_with_supported_optional_kwargs(
                                 _service_core_compact_responses(),
@@ -2179,12 +2155,16 @@ class _CompactMixin:
                 cached_input_tokens=(
                     usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
                 ),
+                cache_write_input_tokens=(
+                    usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
+                ),
                 reasoning_tokens=(
                     usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
                 ),
                 reasoning_effort=reasoning_effort,
                 transport=_REQUEST_TRANSPORT_HTTP,
-                service_tier=_effective_service_tier(request_service_tier, actual_service_tier),
+                upstream_transport=upstream_transport,
+                service_tier=subscription_pricing_tier(payload.model, request_service_tier, actual_service_tier),
                 requested_service_tier=request_service_tier,
                 actual_service_tier=actual_service_tier,
                 failure_phase=failure_metadata.failure_phase,

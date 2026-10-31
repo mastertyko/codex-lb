@@ -5,7 +5,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable, Collection
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Literal, Mapping, NoReturn, TypeVar, cast
+from typing import Any, AsyncIterator, Literal, Mapping, NoReturn, TypeVar, cast, get_args
 
 import aiohttp
 import anyio
@@ -709,6 +709,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_event_error_param,  # noqa: F401
     _websocket_event_error_payload,  # noqa: F401
     _websocket_event_error_type,  # noqa: F401
+    _websocket_event_upstream_error,  # noqa: F401
     _websocket_full_resend_conflicts_with_visible_pending,  # noqa: F401
     _websocket_input_item_type,  # noqa: F401
     _websocket_owner_pinned_quota_error_code,  # noqa: F401
@@ -720,6 +721,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_top_level_error_payload,  # noqa: F401
     _wrapped_websocket_error_event,  # noqa: F401
 )
+from app.modules.proxy._service.websocket.retained import RetainedWebSockets
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _CodexSessionSource,
@@ -944,6 +946,9 @@ class ProxyService(
         self._clock, self._scheduler = clock, scheduler
         self._encryptor = TokenEncryptor()
         self._load_balancer = LoadBalancer(repo_factory, encryptor=self._encryptor, clock=clock)
+        self._websocket_retained = RetainedWebSockets(
+            self._load_balancer.release_account_lease, self._close_retained_websocket
+        )
         self._capability_router = CapabilityRouter(repo_factory)
         self._live_websocket_connector = live_websocket_connector
         self._ring_membership = RingMembershipService(SessionLocal)
@@ -1735,6 +1740,7 @@ class ProxyService(
         sticky_seed_key: str | None = None,
         sticky_seed_kind: StickySessionKind | None = None,
         spill_bare_session_on_account_cap: bool = False,
+        allow_burn_first_reallocation: bool = False,
         abandon_unavailable_legacy_owner: bool = False,
         require_unambiguous_account: bool = False,
         sticky_max_age_seconds: int | None = None,
@@ -1968,6 +1974,9 @@ class ProxyService(
                         request_stage,
                     ),
                     abandon_unavailable_legacy_owner=abandon_unavailable_legacy_owner,
+                    allow_burn_first_reallocation=(
+                        allow_burn_first_reallocation and preferred_account_id is None and request_stage == "first_turn"
+                    ),
                     require_unambiguous_account=require_unambiguous_account,
                     sticky_max_age_seconds=sticky_max_age_seconds,
                     prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
@@ -2329,20 +2338,8 @@ def _partial_output_proxy_error_event_block(
 
 def _routing_strategy(settings: DashboardSettings) -> RoutingStrategy:
     value = getattr(settings, "routing_strategy", None) or "capacity_weighted"
-    if value == "single_account":
-        return "single_account"
-    if value == "sequential_drain":
-        return "sequential_drain"
-    if value == "reset_drain":
-        return "reset_drain"
-    if value == "round_robin":
-        return "round_robin"
-    if value == "usage_weighted":
-        return "usage_weighted"
-    if value == "relative_availability":
-        return "relative_availability"
-    if value == "fill_first":
-        return "fill_first"
+    if value in get_args(RoutingStrategy):
+        return cast(RoutingStrategy, value)
     return "capacity_weighted"
 
 

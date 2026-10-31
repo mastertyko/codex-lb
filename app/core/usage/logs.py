@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import isclose
 from typing import Protocol
 
 from app.core.usage.pricing import (
@@ -17,6 +18,7 @@ from app.core.usage.pricing import (
 # so only statuses outside this tuple count as errors.
 SUCCESS_STATUS = "success"
 CANCELLED_STATUS = "cancelled"
+CONTROLLED_INTERRUPTION_ERROR_CODE = "interrupted"
 NON_ERROR_STATUSES: tuple[str, ...] = (SUCCESS_STATUS, CANCELLED_STATUS)
 # The error code cancelled rows carry; excluded read-side from historical
 # error-satellite rollup rows that were folded under the legacy
@@ -39,6 +41,9 @@ class RequestLogLike(Protocol):
 
     @property
     def cached_input_tokens(self) -> int | None: ...
+
+    @property
+    def cache_write_input_tokens(self) -> int | None: ...
 
     @property
     def reasoning_tokens(self) -> int | None: ...
@@ -70,6 +75,7 @@ def usage_tokens_from_log(log: RequestLogLike) -> UsageTokens | None:
         input_tokens=float(input_tokens),
         output_tokens=float(output_tokens),
         cached_input_tokens=float(cached_tokens),
+        cache_write_input_tokens=float(log.cache_write_input_tokens or 0),
     )
 
 
@@ -114,7 +120,7 @@ def _totals_match(left: float | None, right: float | None, *, precision: int | N
     if left is None or right is None:
         return False
     if precision is None:
-        return left == right
+        return isclose(left, right, rel_tol=1e-12)
     return abs(left - right) < (10 ** (-precision)) / 2
 
 
@@ -151,6 +157,7 @@ def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None
                         input_tokens=float(input_tokens),
                         output_tokens=0.0,
                         cached_input_tokens=float(cached_tokens),
+                        cache_write_input_tokens=float(log.cache_write_input_tokens or 0),
                     ),
                     price,
                     service_tier=log.service_tier,
@@ -165,6 +172,7 @@ def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None
                         input_tokens=float(input_tokens or 0),
                         output_tokens=float(output_tokens),
                         cached_input_tokens=float(cached_tokens or 0),
+                        cache_write_input_tokens=float(log.cache_write_input_tokens or 0),
                     ),
                     price,
                     service_tier=log.service_tier,

@@ -80,6 +80,10 @@ class StickyOwnerLookup:
     # the deadline against the clock immediately before omitting the write,
     # and must never skip a write that changes the owner account.
     refresh_skip_deadline: datetime | None = None
+    # Observation only: do not use this category to select or retire an owner.
+    # A missing row cannot reveal whether it was never bound, purged, or looked
+    # up in another key namespace. Defaults keep synthetic lookups honest.
+    diagnostic_outcome: Literal["unknown", "missing", "expired", "abandoned", "hit"] = "unknown"
 
 
 def _continuity_is_abandoned_for_source(
@@ -127,11 +131,13 @@ def _owner_lookup_from_row(
                 row.continuity_abandonment_scope,
                 continuity_source,
             ),
+            diagnostic_outcome="abandoned",
         )
     return StickyOwnerLookup(
         account_id=row.account_id,
         continuity_abandoned=False,
         refresh_skip_deadline=refresh_skip_deadline,
+        diagnostic_outcome="hit",
     )
 
 
@@ -202,7 +208,7 @@ class StickySessionsRepository:
             return StickyOwnerLookup(account_id=None, continuity_abandoned=False)
         row = await self.get_entry(key, kind=kind)
         if row is None:
-            return StickyOwnerLookup(account_id=None, continuity_abandoned=False)
+            return StickyOwnerLookup(account_id=None, continuity_abandoned=False, diagnostic_outcome="missing")
         if max_age_seconds is None:
             return _owner_lookup_from_row(row, continuity_source=continuity_source)
         now = utcnow()
@@ -259,7 +265,7 @@ class StickySessionsRepository:
             await self._session.commit()
 
         if deleted_key is not None or current is None:
-            return StickyOwnerLookup(account_id=None, continuity_abandoned=False)
+            return StickyOwnerLookup(account_id=None, continuity_abandoned=False, diagnostic_outcome="expired")
         (
             current_account_id,
             current_updated_at,
@@ -267,7 +273,7 @@ class StickySessionsRepository:
             current_continuity_abandonment_scope,
         ) = current
         if to_utc_naive(current_updated_at) < cutoff:
-            return StickyOwnerLookup(account_id=None, continuity_abandoned=False)
+            return StickyOwnerLookup(account_id=None, continuity_abandoned=False, diagnostic_outcome="expired")
         if _continuity_is_abandoned_for_source(
             current_continuity_abandoned_at,
             current_continuity_abandonment_scope,
@@ -281,8 +287,9 @@ class StickySessionsRepository:
                     current_continuity_abandonment_scope,
                     continuity_source,
                 ),
+                diagnostic_outcome="abandoned",
             )
-        return StickyOwnerLookup(account_id=current_account_id, continuity_abandoned=False)
+        return StickyOwnerLookup(account_id=current_account_id, continuity_abandoned=False, diagnostic_outcome="hit")
 
     async def release_read_snapshot(self) -> None:
         """End the session's current read transaction.

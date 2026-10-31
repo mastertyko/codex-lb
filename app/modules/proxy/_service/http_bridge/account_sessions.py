@@ -54,4 +54,5 @@ class _HTTPBridgeAccountSessionsMixin:
 
         for session in sessions_to_close:
             await self._close_http_bridge_session_bounded(session, reason="account_binding_changed")
-        return len(sessions_to_close)
+        retained_closed = await self._websocket_retained.close_all(account_id)
+        return len(sessions_to_close) + retained_closed

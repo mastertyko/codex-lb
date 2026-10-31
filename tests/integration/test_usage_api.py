@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -9,6 +9,8 @@ from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus
 from app.db.session import SessionLocal
 from app.modules.accounts.repository import AccountsRepository
+from app.modules.api_keys.repository import ApiKeysRepository
+from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
 from app.modules.usage.repository import UsageRepository
 
 pytestmark = pytest.mark.integration
@@ -57,6 +59,99 @@ async def test_usage_summary_empty_returns_zeroes(async_client):
     assert metrics["cachedTokensSecondaryWindow"] == 0
     assert metrics["errorRate7d"] is None
     assert metrics["topError"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scoped", [True, False])
+async def test_account_legacy_selection_does_not_change_current_allowance_across_api_surfaces(
+    async_client, monkeypatch, scoped
+):
+    instant = datetime(2026, 10, 29, 23, 59, 59, tzinfo=timezone.utc)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant if tz is not None else instant.replace(tzinfo=None)
+
+    monkeypatch.setattr("app.core.usage.datetime", FrozenDatetime)
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("legacy", "legacy@example.com", "pro"))
+        await UsageRepository(session).add_entry(
+            "legacy",
+            20,
+            window="secondary",
+            window_minutes=10080,
+            recorded_at=utcnow(),
+            reset_at=int((utcnow() + timedelta(days=7)).replace(tzinfo=timezone.utc).timestamp()),
+            credits_has=True,
+            credits_balance=123.0,
+        )
+        created = await ApiKeysService(ApiKeysRepository(session)).create_key(
+            ApiKeyCreateData(
+                name="legacy-cutoff", allowed_models=None, assigned_account_ids=["legacy"] if scoped else None
+            )
+        )
+    headers = {"Authorization": f"Bearer {created.key}"}
+
+    before = (await async_client.get("/api/accounts")).json()["accounts"][0]
+    assert before["proLegacyAllowance"] is False
+    assert before["usageMultiplier"] == 20
+    assert before["capacityCreditsSecondary"] == 151200
+
+    edited = await async_client.patch(
+        "/api/accounts/legacy", json={"proLegacyAllowance": True, "securityWorkAuthorized": True}
+    )
+    assert edited.status_code == 200, edited.text
+    async with SessionLocal() as session:
+        stored = await session.get(Account, "legacy")
+        assert stored is not None
+        assert stored.pro_legacy_allowance is True
+        assert stored.security_work_authorized is True
+
+    marked = (await async_client.get("/api/accounts")).json()["accounts"][0]
+    assert marked["usageMultiplier"] == 20
+    assert marked["capacityCreditsEstimated"] is True
+    assert marked["capacityCreditsSecondary"] == 151200
+    assert marked["creditsBalance"] == 123
+    summary = (await async_client.get("/api/usage/summary")).json()
+    assert summary["secondaryWindow"]["capacityCredits"] == 151200
+    assert summary["secondaryWindow"]["remainingCredits"] == 120960
+    dashboard = (await async_client.get("/api/dashboard/overview")).json()
+    assert dashboard["accounts"][0]["usageMultiplier"] == 20
+    assert dashboard["accounts"][0]["capacityCreditsSecondary"] == 151200
+    usage = (await async_client.get("/v1/usage", headers=headers)).json()
+    assert usage["upstream_limits"][0]["max_value"] == 151200
+
+    instant = datetime(2026, 10, 30, tzinfo=timezone.utc)
+    expired = (await async_client.get("/api/accounts")).json()["accounts"][0]
+    assert expired["proLegacyAllowance"] is True
+    assert expired["usageMultiplier"] == 20
+    assert expired["capacityCreditsSecondary"] == 151200
+    assert expired["creditsBalance"] == 123
+    assert (await async_client.get("/api/usage/summary")).json()["secondaryWindow"]["capacityCredits"] == 151200
+    dashboard = (await async_client.get("/api/dashboard/overview")).json()
+    assert dashboard["accounts"][0]["proLegacyAllowance"] is True
+    assert dashboard["accounts"][0]["usageMultiplier"] == 20
+    assert dashboard["accounts"][0]["capacityCreditsSecondary"] == 151200
+    usage = (await async_client.get("/v1/usage", headers=headers)).json()
+    assert usage["upstream_limits"][0]["max_value"] == 151200
+
+
+@pytest.mark.asyncio
+async def test_legacy_selection_rejects_invalid_atomic_update(async_client):
+    async with SessionLocal() as session:
+        await AccountsRepository(session).upsert(_make_account("plus", "plus@example.com", "plus"))
+    invalid = await async_client.patch(
+        "/api/accounts/plus", json={"proLegacyAllowance": True, "securityWorkAuthorized": True}
+    )
+    assert invalid.status_code == 400
+    malformed = await async_client.patch("/api/accounts/plus", json={"proLegacyAllowance": "yes"})
+    assert malformed.status_code == 422
+    async with SessionLocal() as session:
+        account = await session.get(Account, "plus")
+        assert account is not None
+        assert account.pro_legacy_allowance is False
+        assert account.security_work_authorized is False
 
 
 @pytest.mark.asyncio
@@ -185,6 +280,45 @@ async def test_usage_window_secondary_includes_weekly_only_primary_entries(async
 
     assert accounts["acc_with_secondary"]["remainingPercentAvg"] == pytest.approx(60.0)
     assert accounts["acc_weekly_only"]["remainingPercentAvg"] == pytest.approx(40.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_has_reset", [True, False])
+async def test_usage_routes_report_mixed_weekly_capacity_estimates(async_client, db_setup, max_has_reset):
+    now = utcnow()
+    async with SessionLocal() as session:
+        accounts_repo = AccountsRepository(session)
+        usage_repo = UsageRepository(session)
+        for plan, used in (("pro", 40.0), ("plus", 50.0), ("promax", 20.0)):
+            await accounts_repo.upsert(_make_account(plan, f"{plan}@example.com", plan_type=plan))
+            await usage_repo.add_entry(
+                plan,
+                used,
+                window="primary" if plan == "promax" else "secondary",
+                window_minutes=10080,
+                reset_at=int((now + timedelta(days=6)).timestamp()) if plan != "promax" or max_has_reset else None,
+                recorded_at=now,
+            )
+
+    summary_response = await async_client.get("/api/usage/summary")
+    assert summary_response.status_code == 200
+    summary = summary_response.json()
+    assert summary["secondaryWindow"]["capacityCredits"] == 536760
+    assert summary["secondaryWindow"]["remainingCredits"] == 396900
+    assert summary["secondaryWindow"]["unquantifiedAccountCount"] == 0
+    assert summary["primaryWindow"]["unquantifiedAccountCount"] == 0
+
+    window_response = await async_client.get("/api/usage/window?window=secondary")
+    assert window_response.status_code == 200
+    max_item = next(item for item in window_response.json()["accounts"] if item["accountId"] == "promax")
+    assert max_item["remainingPercentAvg"] == 80.0
+    assert max_item["capacityKnown"] is True
+    assert max_item["capacityCredits"] == 378000
+
+    short_response = await async_client.get("/api/usage/window?window=primary")
+    assert short_response.status_code == 200
+    max_short = next(item for item in short_response.json()["accounts"] if item["accountId"] == "promax")
+    assert max_short["capacityKnown"] is True
 
 
 @pytest.mark.asyncio
@@ -326,3 +460,64 @@ async def test_usage_summary_sql_aggregate_matches_legacy_python_summation(async
     assert [(entry.model, entry.usd) for entry in aggregate_cost.by_model] == [
         (entry.model, entry.usd) for entry in legacy_cost.by_model
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("plan", "legacy", "multiplier", "capacity"),
+    [
+        ("prolite", False, 10, 75600),
+        ("pro", False, 20, 151200),
+        ("pro", True, 20, 151200),
+        ("promax", False, 50, 378000),
+    ],
+)
+async def test_current_pro_allowance_preserves_observed_weekly_quota(async_client, plan, legacy, multiplier, capacity):
+    now = utcnow()
+    async with SessionLocal() as session:
+        account = _make_account("current-pro", "current-pro@example.invalid", plan)
+        account.pro_legacy_allowance = legacy
+        await AccountsRepository(session).upsert(account)
+        await UsageRepository(session).add_entry(
+            account.id,
+            63,
+            window="primary",
+            window_minutes=10080,
+            recorded_at=now,
+            reset_at=int((now + timedelta(days=6)).replace(tzinfo=timezone.utc).timestamp()),
+            credits_has=True,
+            credits_balance=123.0,
+        )
+        created = await ApiKeysService(ApiKeysRepository(session)).create_key(
+            ApiKeyCreateData(name="current-pro", allowed_models=None, assigned_account_ids=[account.id])
+        )
+    headers = {"Authorization": f"Bearer {created.key}"}
+    account_response = await async_client.get("/api/accounts")
+    assert account_response.status_code == 200
+    item = account_response.json()["accounts"][0]
+    assert item["usageMultiplier"] == multiplier
+    assert item["capacityCreditsEstimated"] is True
+    assert item["capacityCreditsSecondary"] == capacity
+    assert item["remainingCreditsSecondary"] == pytest.approx(capacity * 0.37)
+    assert item["usage"]["primaryRemainingPercent"] is None
+    assert item["usage"]["secondaryRemainingPercent"] == 37.0
+    assert item["creditsBalance"] == 123.0
+
+    summary_response = await async_client.get("/api/usage/summary")
+    assert summary_response.status_code == 200
+    weekly = summary_response.json()["secondaryWindow"]
+    assert weekly["capacityCredits"] == capacity
+    assert weekly["remainingCredits"] == pytest.approx(capacity * 0.37)
+
+    dashboard_response = await async_client.get("/api/dashboard/overview")
+    assert dashboard_response.status_code == 200
+    dashboard_account = dashboard_response.json()["accounts"][0]
+    assert dashboard_account["usageMultiplier"] == multiplier
+    assert dashboard_account["creditsBalance"] == 123.0
+
+    key_response = await async_client.get("/v1/usage", headers=headers)
+    assert key_response.status_code == 200
+    pooled = key_response.json()
+    assert pooled["account_pool_usage"]["secondary"] == pytest.approx(37.0)
+    assert pooled["account_pool_usage"]["primary"] is None
+    assert pooled["upstream_limits"][0]["max_value"] == capacity

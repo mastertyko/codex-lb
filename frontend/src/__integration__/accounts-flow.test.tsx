@@ -1,11 +1,30 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { HttpResponse, http } from "msw";
 import { describe, expect, it } from "vitest";
 
 import App from "@/App";
+import { createAccountSummary } from "@/test/mocks/factories";
+import { server } from "@/test/mocks/server";
 import { renderWithProviders } from "@/test/utils";
 
 describe("accounts flow integration", () => {
+  it.each([false, true])("shows the current Pro estimate without a legacy control (stored flag %s)", async (legacy) => {
+    const account = createAccountSummary({
+      planType: "pro",
+      proLegacyAllowance: legacy,
+      usageMultiplier: 20,
+      capacityCreditsEstimated: true,
+      capacityCreditsSecondary: 151200,
+    });
+    server.use(http.get("/api/accounts", () => HttpResponse.json({ accounts: [account] })));
+    window.history.pushState({}, "", "/accounts");
+    renderWithProviders(<App />);
+    expect(await screen.findByTestId("account-usage-multiplier")).toHaveTextContent("20x Plus allowance (estimated credits)");
+    expect(screen.queryByRole("switch", { name: "Legacy Pro allowance" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/October 29, 2026/)).not.toBeInTheDocument();
+  });
+
   it("supports account selection and pause/resume actions", async () => {
     const user = userEvent.setup({ delay: null });
 

@@ -6,7 +6,7 @@ import logging
 import os
 import re
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Mapping, NoReturn, Protocol, Sequence, cast
 from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
@@ -54,6 +54,7 @@ from app.core.clients.proxy import (
     _openai_error_detail,
     filter_inbound_headers,
 )
+from app.core.clients.websocket_dispatch import WebSocketDispatchTransport, current_websocket_send_callback
 from app.core.config.dashboard_overrides import with_dashboard_overrides
 from app.core.config.settings import get_settings
 from app.core.conversation_archive import archive_bytes, archive_text
@@ -232,6 +233,7 @@ def is_account_neutral_websocket_error_code(error_code: str | None) -> bool:
         PROCESS_NETWORK_UNAVAILABLE_CODE,
         UPSTREAM_WEBSOCKET_LIVENESS_TIMEOUT_CODE,
         "upstream_keepalive_timeout",
+        "upstream_consumer_backpressure",
     }
 
 
@@ -333,13 +335,21 @@ class WebsocketsUpstreamWebSocket:
         self._connection = connection
         self._uses_proxy = uses_proxy
         self._preserve_close_semantics = preserve_close_semantics
+        self._dispatch_transport: WebSocketDispatchTransport | None = None
+        if isinstance(connection, ClientConnection):
+            self._dispatch_transport = WebSocketDispatchTransport(connection.transport)
+            connection.transport = self._dispatch_transport.as_transport()
         connection_lost_waiter = getattr(connection, "connection_lost_waiter", None)
         if isinstance(connection_lost_waiter, asyncio.Future):
             connection_lost_waiter.add_done_callback(_consume_connection_lost_exception)
 
     async def send_text(self, text: str) -> None:
         try:
-            await self._connection.send(text)
+            if self._dispatch_transport is None:
+                await self._connection.send(text)
+            else:
+                with self._dispatch_transport.send_context():
+                    await self._connection.send(text)
         except Exception as exc:
             await _raise_websocket_send_error(exc, uses_proxy=self._uses_proxy)
 
@@ -442,6 +452,25 @@ class NativeUpstreamWebSocket:
             message = await self._websocket.receive()
         except NativeEgressError as exc:
             error = _native_websocket_transport_error(exc, operation="receive")
+            phase = exc.failure_phase if isinstance(exc, NativeEgressTransportError) else "protocol"
+            safe_phase = (
+                phase
+                if phase
+                in {
+                    "consumer_backpressure",
+                    "transport",
+                    "protocol",
+                    "liveness_timeout",
+                    "websocket_receive",
+                    "cancelled",
+                    "helper_exit",
+                    "helper_read",
+                    "helper_write",
+                    "shutdown",
+                }
+                else "unknown"
+            )
+            logger.warning("native_websocket_receive_failed phase=%s", safe_phase)
             return UpstreamWebSocketMessage(
                 kind="error",
                 error=str(error),
@@ -472,6 +501,11 @@ def _native_websocket_transport_error(
     operation: str,
 ) -> UpstreamWebSocketTransportError:
     phase = exc.failure_phase if isinstance(exc, NativeEgressTransportError) else "protocol"
+    if phase == "consumer_backpressure":
+        return UpstreamWebSocketTransportError(
+            "Local websocket receive buffer exceeded its bounded capacity",
+            error_code="upstream_consumer_backpressure",
+        )
     if phase == "liveness_timeout":
         return UpstreamWebSocketTransportError(
             f"Upstream websocket {operation} failed",
@@ -501,12 +535,36 @@ class CodexUpstreamWebSocket:
         self._owns_codex_client = owns_codex_client
         self._endpoint_id = endpoint_id
         self._response_headers = _normalize_response_headers(response_headers)
+        self._dispatch_transport: WebSocketDispatchTransport | None = None
 
     async def send_text(self, text: str) -> None:
+        if self._dispatch_transport is None and current_websocket_send_callback() is not None:
+            if isinstance(self._websocket, aiohttp.ClientWebSocketResponse):
+                try:
+                    writer = self._websocket._writer
+                    transport = writer.transport
+                    if not isinstance(transport, asyncio.Transport):
+                        raise TypeError("unsupported aiohttp transport")
+                    dispatch_transport = WebSocketDispatchTransport(transport)
+                    writer.transport = dispatch_transport.as_transport()
+                except (AttributeError, TypeError):
+                    raise ProxyResponseError(
+                        503,
+                        openai_error(
+                            "steering_not_supported",
+                            "Steering dispatch is unavailable on this transport; retry on a new connection.",
+                            error_type="server_error",
+                        ),
+                    ) from None
+                self._dispatch_transport = dispatch_transport
         try:
-            result = self._websocket.send_str(text)
-            if asyncio.iscoroutine(result):
-                await result
+            if self._dispatch_transport is None:
+                result = self._websocket.send_str(text)
+                if asyncio.iscoroutine(result):
+                    await result
+            else:
+                with self._dispatch_transport.send_context():
+                    await self._websocket.send_str(text)
         except Exception as exc:
             classification_exc = _aiohttp_stored_liveness_exception(self._websocket) or exc
             await _raise_websocket_send_error(classification_exc, endpoint_id=self._endpoint_id, uses_proxy=True)
@@ -1272,6 +1330,7 @@ async def connect_responses_websocket(
     codex_client: CodexClient | None = None,
     allow_direct_egress: bool = False,
     routing_hint: tuple[str, str | None] | None = None,
+    caller_owned: bool = False,
 ) -> UpstreamWebSocket:
     settings = get_settings()
     upstream_base = (base_url or settings.upstream_base_url).rstrip("/")
@@ -1283,7 +1342,18 @@ async def connect_responses_websocket(
         route=route,
         codex_client=codex_client,
         allow_direct_egress=allow_direct_egress,
-        policy=_RESPONSES_WEBSOCKET_POLICY,
+        policy=(
+            replace(
+                _RESPONSES_WEBSOCKET_POLICY,
+                archive_payloads=False,
+                retry_handshake_status=False,
+                preserve_handshake_status=True,
+                credential_safe_connect_errors=True,
+                retry_routed_network_errors=False,
+            )
+            if caller_owned
+            else _RESPONSES_WEBSOCKET_POLICY
+        ),
         routing_hint=routing_hint,
     )
 

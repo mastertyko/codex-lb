@@ -195,6 +195,7 @@ class _HTTPBridgeSessionRegistryMixin:
         )
 
         async def finish_shutdown() -> bool:
+            retained_results = await asyncio.gather(self._websocket_retained.close_all(), return_exceptions=True)
             for inflight_future in inflight_futures:
                 if inflight_future.done():
                     continue
@@ -217,7 +218,7 @@ class _HTTPBridgeSessionRegistryMixin:
             close_batcher = getattr(event_batcher, "close", None)
             if callable(close_batcher):
                 await close_batcher()
-            for result in close_results:
+            for result in [*retained_results, *close_results]:
                 if isinstance(result, BaseException):
                     raise result
             return background_cleanup_drained

@@ -69,6 +69,7 @@ RoutingStrategy = Literal[
     "round_robin",
     "capacity_weighted",
     "relative_availability",
+    "quota_first_balanced",
     "fill_first",
     "sequential_drain",
     "reset_drain",
@@ -151,6 +152,9 @@ class AccountState:
     # neutral. The balancer derives it from the account's recent upstream
     # error rate. Deterministic strategies ignore it.
     selection_weight_multiplier: float = 1.0
+    subscription_exhausted: bool = False
+    has_usable_credits: bool = False
+    fresh_thread_allocations: int = 0
 
 
 @dataclass
@@ -274,6 +278,33 @@ def _primary_usage_sort_key(state: AccountState) -> tuple[float, float, float, s
     secondary_used = _priority_secondary_used(state, primary_used)
     last_selected = state.last_selected_at or 0.0
     return primary_used, secondary_used, last_selected, state.account_id
+
+
+def quota_first_consumption(state: AccountState) -> float | None:
+    """Measured quota pressure shared by selection and proactive rebalancing."""
+    primary = state.priority_used_percent if state.priority_used_percent is not None else state.used_percent
+    secondary = (
+        state.priority_secondary_used_percent
+        if state.priority_secondary_used_percent is not None
+        else None
+        if state.limit_scoped_usage
+        else state.secondary_used_percent
+    )
+    measured = [value for value in (primary, secondary) if value is not None and math.isfinite(value)]
+    # State construction already normalizes resets and adds reservation pressure.
+    # Unknown quota is not unused quota, nor evidence for credit admission.
+    return min(100.0, max(0.0, max(measured))) if measured else None
+
+
+def _quota_first_sort_key(state: AccountState, current: float) -> tuple[int, int, int, float, str]:
+    consumption = quota_first_consumption(state)
+    return (
+        int((consumption if consumption is not None else 100.0) // 5),
+        state.fresh_thread_allocations,
+        _reset_preference_bucket(state, current, "secondary"),
+        state.last_selected_at or float("-inf"),
+        state.account_id,
+    )
 
 
 def _routing_policy(state: AccountState) -> str:
@@ -471,6 +502,7 @@ def select_account(
     prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
     routing_strategy: RoutingStrategy = "capacity_weighted",
     allow_backoff_fallback: bool = True,
+    hard_owner_pool: bool = False,
     deterministic_probe: bool = False,
     recovery_probe_only: bool = False,
     relative_availability_power: float = DEFAULT_RELATIVE_AVAILABILITY_POWER,
@@ -511,6 +543,9 @@ def select_account(
         allow_backoff_fallback: Whether to allow a fallback attempt with the
             backoff account nearest to recovery when no fully available
             account exists.
+        hard_owner_pool: Whether the caller already narrowed this pool to a
+            resolved hard continuity owner. Only its own transient error
+            backoff may be bypassed; hard eligibility filters still apply.
         deterministic_probe: Whether weighted strategies should use a
             deterministic probe order instead of random weighted choice.
         recovery_probe_only: Whether to return only a due probing-account
@@ -634,7 +669,11 @@ def select_account(
             and state.account_id not in in_error_backoff_ids
             for state in all_states
         )
-        if allow_backoff_fallback and (len(in_error_backoff) > 1 or (in_error_backoff and hard_blocked_exists)):
+        if allow_backoff_fallback and (
+            len(in_error_backoff) > 1
+            or (in_error_backoff and hard_blocked_exists)
+            or (hard_owner_pool and len(all_states) == 1 and len(in_error_backoff) == 1)
+        ):
 
             def _backoff_expires_at(s: AccountState) -> float:
                 backoff = min(300, 30 * (2 ** (s.error_count - ERROR_BACKOFF_THRESHOLD)))
@@ -783,7 +822,9 @@ def select_account(
     effective_pool = burn_first or normal or preserve or health_pool
     effective_prefer_earlier_reset = prefer_earlier_reset and routing_strategy != "relative_availability"
 
-    if routing_strategy == "round_robin":
+    if routing_strategy == "quota_first_balanced":
+        selected = min(effective_pool, key=lambda state: _quota_first_sort_key(state, current))
+    elif routing_strategy == "round_robin":
         selected = (
             _seeded_pick(_lowest_planner_cost_candidates(effective_pool, routing_costs), selection_seed)
             if selection_seed is not None

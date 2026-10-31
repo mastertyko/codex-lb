@@ -680,10 +680,10 @@ async def test_request_logs_tokens_and_cost_use_reasoning_tokens(async_client, d
     assert entry["reasoningTokens"] == 400
     assert entry["cachedInputTokens"] == 100
     assert entry["reasoningEffort"] == "xhigh"
-    expected = round(_cost(1000, 400, 100), 6)
+    expected = _cost(1000, 400, 100)
     assert entry["costUsd"] == pytest.approx(expected)
-    assert entry["costBreakdown"]["inputUsd"] == pytest.approx(round((900 / 1_000_000) * 1.25, 6))
-    assert entry["costBreakdown"]["cachedInputUsd"] == pytest.approx(round((100 / 1_000_000) * 0.125, 6))
+    assert entry["costBreakdown"]["inputUsd"] == pytest.approx((900 / 1_000_000) * 1.25)
+    assert entry["costBreakdown"]["cachedInputUsd"] == pytest.approx((100 / 1_000_000) * 0.125)
     assert entry["costBreakdown"]["outputUsd"] == pytest.approx(round((400 / 1_000_000) * 10.0, 6))
     assert entry["costBreakdown"]["totalUsd"] == pytest.approx(expected)
 
@@ -719,8 +719,8 @@ async def test_request_logs_partial_rows_keep_nullable_cost_breakdown_shape(asyn
     assert entry["outputTokens"] is None
     assert entry["costUsd"] is None
     assert entry["costBreakdown"] == {
-        "inputUsd": pytest.approx(round((900 / 1_000_000) * 1.25, 6)),
-        "cachedInputUsd": pytest.approx(round((100 / 1_000_000) * 0.125, 6)),
+        "inputUsd": pytest.approx((900 / 1_000_000) * 1.25),
+        "cachedInputUsd": pytest.approx((100 / 1_000_000) * 0.125),
         "outputUsd": None,
         "totalUsd": None,
     }

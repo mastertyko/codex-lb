@@ -46,7 +46,7 @@ describe("AccountDetail", () => {
   it("disables alias and proxy binding controls for read-only guests", () => {
     const onSetAlias = vi.fn().mockResolvedValue(undefined);
     const onProxyBindingSave = vi.fn().mockResolvedValue(undefined);
-    const account = createAccountSummary({ accountId: "acc_primary", alias: "Personal" });
+    const account = createAccountSummary({ accountId: "acc_primary", alias: "Personal", planType: "pro" });
 
     renderWithClient(
       <AccountDetail
@@ -78,6 +78,7 @@ describe("AccountDetail", () => {
     expect(screen.getByRole("switch", { name: "Enable account proxy binding" })).toBeDisabled();
     expect(screen.getByRole("combobox", { name: "Account proxy pool" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Save binding" })).toBeDisabled();
+    expect(screen.queryByRole("switch", { name: "Legacy Pro allowance" })).not.toBeInTheDocument();
   });
 
   it("disables usage reset for paused accounts", () => {

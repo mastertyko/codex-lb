@@ -32,6 +32,80 @@ def _make_account(account_id: str, email: str) -> Account:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("saved_cost", [None, 0.0000002, 0.00000020000000000000004])
+async def test_request_logs_preserve_positive_microcosts(async_client, db_setup, monkeypatch, saved_cost):
+    from app.core.usage import pricing_catalog
+    from app.core.usage.pricing import ModelPrice
+
+    monkeypatch.setattr(pricing_catalog, "_prices", {"gpt-6-luna": ModelPrice(0.1, 0.5, cached_input_per_1m=0.01)})
+    async with SessionLocal() as session:
+        log = RequestLog(
+            request_id="microcost-prewarm",
+            model="gpt-6-luna",
+            request_kind="prewarm",
+            status="success",
+            input_tokens=2,
+            output_tokens=0,
+            cached_input_tokens=0,
+            cost_usd=saved_cost,
+        )
+        session.add(log)
+        await session.commit()
+        log_id = log.id
+
+    response = await async_client.get("/api/request-logs?search=microcost-prewarm")
+    assert response.status_code == 200
+    entry = response.json()["requests"][0]
+    assert entry["costUsd"] == (saved_cost if saved_cost is not None else 0.0000002)
+    assert entry["costBreakdown"] == {
+        "inputUsd": 0.0000002,
+        "cachedInputUsd": 0.0,
+        "outputUsd": 0.0,
+        "totalUsd": entry["costUsd"],
+    }
+    async with SessionLocal() as session:
+        saved_log = await session.get(RequestLog, log_id)
+        assert saved_log is not None
+        assert saved_log.cost_usd == saved_cost
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("saved_cost", [0.0, 0.0000001, 4.32123456789])
+async def test_request_logs_preserve_historical_cost_without_conflicting_breakdown(
+    async_client, db_setup, monkeypatch, saved_cost
+):
+    from app.core.usage import pricing_catalog
+    from app.core.usage.pricing import ModelPrice
+
+    monkeypatch.setattr(pricing_catalog, "_prices", {"gpt-6-luna": ModelPrice(0.1, 0.5, cached_input_per_1m=0.01)})
+    async with SessionLocal() as session:
+        session.add(
+            RequestLog(
+                request_id="historical-microcost",
+                model="gpt-6-luna",
+                request_kind="prewarm",
+                status="success",
+                input_tokens=2,
+                output_tokens=0,
+                cached_input_tokens=0,
+                cost_usd=saved_cost,
+            )
+        )
+        await session.commit()
+
+    response = await async_client.get("/api/request-logs?search=historical-microcost")
+    assert response.status_code == 200
+    entry = response.json()["requests"][0]
+    assert entry["costUsd"] == saved_cost
+    assert entry["costBreakdown"] == {
+        "inputUsd": None,
+        "cachedInputUsd": None,
+        "outputUsd": None,
+        "totalUsd": saved_cost,
+    }
+
+
+@pytest.mark.asyncio
 async def test_request_logs_api_returns_recent(async_client, db_setup):
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)
@@ -81,6 +155,10 @@ async def test_request_logs_api_returns_recent(async_client, db_setup):
             api_key_id="key_logs_1",
             transport="websocket",
             connection_request_kind="prewarm",
+            latency_response_created_ms=40,
+            latency_first_upstream_event_ms=30,
+            latency_response_create_gate_wait_ms=0,
+            latency_bridge_queue_wait_ms=5,
         )
 
     response = await async_client.get("/api/request-logs?limit=2")
@@ -114,6 +192,11 @@ async def test_request_logs_api_returns_recent(async_client, db_setup):
     assert latest["transport"] == "websocket"
     assert latest["requestKind"] == "normal"
     assert latest["connectionRequestKind"] == "prewarm"
+    assert latest["latencyResponseCreatedMs"] == 40
+    assert latest["latencyFirstUpstreamEventMs"] == 30
+    assert latest["latencyResponseCreateGateWaitMs"] == 0
+    assert latest["latencyBridgeQueueWaitMs"] == 5
+    assert latest["latencyFirstTokenMs"] is None
 
     older = payload[1]
     assert older["status"] == "ok"
@@ -134,6 +217,91 @@ async def test_request_logs_api_returns_recent(async_client, db_setup):
     assert older["transport"] == "http"
     assert older["requestKind"] == "normal"
     assert older["connectionRequestKind"] is None
+    assert older["latencyResponseCreatedMs"] is None
+    assert older["latencyFirstUpstreamEventMs"] is None
+    assert older["latencyResponseCreateGateWaitMs"] is None
+    assert older["latencyBridgeQueueWaitMs"] is None
+
+
+@pytest.mark.asyncio
+async def test_request_log_operational_filters_search_facets_and_cached_totals(async_client, db_setup, monkeypatch):
+    from app.modules.request_logs import repository as logs_repository_module
+
+    monkeypatch.setattr(logs_repository_module, "_COUNT_CACHE_TTL_SECONDS", 30.0)
+    logs_repository_module._clear_recent_count_cache()
+    rows = [
+        ("prewarm_ws", "prewarm", "websocket", "websocket", "success"),
+        ("prewarm_http", "prewarm", "websocket", "http", "error"),
+        ("compact", "compaction", "http", "http", "success"),
+        ("search", "codex_control_alpha_search", "http", "http", "success"),
+        ("warmup", "warmup", "http", None, "success"),
+        ("legacy_warmup", "limit_warmup", "http", "legacy", "success"),
+        ("normal", "normal", None, None, "success"),
+    ]
+    async with SessionLocal() as session:
+        for index, (request_id, kind, transport, upstream, status) in enumerate(rows):
+            session.add(
+                RequestLog(
+                    request_id=request_id,
+                    model=request_id,
+                    request_kind=kind,
+                    requested_at=utcnow() - timedelta(seconds=index),
+                    transport=transport,
+                    upstream_transport=upstream,
+                    status=status,
+                )
+            )
+        session.add(
+            RequestLog(
+                request_id="deleted",
+                model="deleted",
+                request_kind="prewarm",
+                status="success",
+                transport="websocket",
+                upstream_transport="websocket",
+                deleted_at=utcnow(),
+            )
+        )
+        await session.commit()
+
+    cases = [
+        ("requestKind=prewarm", {"prewarm_ws", "prewarm_http"}),
+        ("requestKind=compaction", {"compact"}),
+        ("requestKind=prewarm&upstreamTransport=websocket", {"prewarm_ws"}),
+        ("requestKind=prewarm&upstreamTransport=http&status=error", {"prewarm_http"}),
+        ("requestKind=prewarm&upstreamTransport=http&status=ok", set()),
+        ("requestKind=compaction&requestKind=codex_control_alpha_search&transport=http", {"compact", "search"}),
+        ("requestKind=warmup", {"warmup", "legacy_warmup"}),
+        ("upstreamTransport=unknown", {"warmup", "legacy_warmup", "normal"}),
+        ("transport=unknown", {"normal"}),
+        ("transport=websocket", {"prewarm_ws", "prewarm_http"}),
+        ("upstreamTransport=unknown&upstreamTransport=websocket", {"warmup", "legacy_warmup", "normal", "prewarm_ws"}),
+        ("search=Web%20search", {"search"}),
+        ("search=codex_control_alpha_search", {"search"}),
+        ("search=websocket", {"prewarm_ws", "prewarm_http"}),
+    ]
+    try:
+        for query, expected in cases:
+            response = await async_client.get(f"/api/request-logs?{query}")
+            assert response.status_code == 200
+            body = response.json()
+            assert {row["requestId"] for row in body["requests"]} == expected, query
+            assert body["total"] == len(expected), query
+            assert body["hasMore"] is False
+
+        for offset in (0, 1):
+            response = await async_client.get(f"/api/request-logs?requestKind=prewarm&limit=1&offset={offset}")
+            body = response.json()
+            assert body["total"] == 2
+            assert len(body["requests"]) == 1
+            assert body["hasMore"] is (offset == 0)
+
+        options = await async_client.get("/api/request-logs/options?requestKind=prewarm&upstreamTransport=http")
+        assert options.status_code == 200
+        assert options.json()["modelOptions"] == [{"model": "prewarm_http", "reasoningEffort": None}]
+        assert options.json()["statuses"] == ["error"]
+    finally:
+        logs_repository_module._clear_recent_count_cache()
 
 
 @pytest.mark.asyncio

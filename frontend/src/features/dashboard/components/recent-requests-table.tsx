@@ -43,6 +43,7 @@ import {
   type RequestLogColumnWidths,
 } from "@/features/dashboard/request-log-columns";
 import type { AccountSummary, RequestLog } from "@/features/dashboard/schemas";
+import { formatRequestCost, requestCostPresentation, REQUEST_KIND_LABEL_KEYS } from "@/features/dashboard/request-log-presentation";
 import { usePermission } from "@/features/auth/hooks/use-auth";
 import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { cn } from "@/lib/utils";
@@ -51,7 +52,6 @@ import {
   formatDateTimeInline,
   formatDateTimeLines,
   formatCompactNumber,
-  formatCurrency,
   formatModelLabel,
   formatElapsed,
   formatSlug,
@@ -87,11 +87,21 @@ const PLAN_CLASS_MAP: Record<string, string> = {
   pro: "bg-violet-500/15 text-violet-700 border-violet-500/20 hover:bg-violet-500/20 dark:text-violet-300",
 };
 
-const REQUEST_KIND_LABELS: Record<string, string> = {
-  normal: "Normal",
-  warmup: "Warmup",
-  limit_warmup: "Warmup",
-};
+const PHASE_TIMING_FIELDS = [
+  ["latencyResponseCreatedMs", "responseCreated"],
+  ["latencyFirstUpstreamEventMs", "firstUpstreamEvent"],
+  ["latencyResponseCreateGateWaitMs", "responseCreateGateWait"],
+  ["latencyBridgeQueueWaitMs", "bridgeQueueWait"],
+] as const;
+
+const FAILURE_FIELDS = [
+  ["failurePhase", "failurePhase"],
+  ["failureDetail", "failureDetail"],
+  ["failureExceptionType", "failureExceptionType"],
+  ["upstreamStatusCode", "upstreamStatusCode"],
+  ["upstreamErrorCode", "upstreamErrorCode"],
+  ["bridgeStage", "bridgeStage"],
+] as const;
 
 export type RecentRequestsTableProps = {
   requests: RequestLog[];
@@ -243,7 +253,7 @@ function formatRequestCostSummary(request: RequestLog | null, t: ReturnType<type
       t("dashboard.requestDetails.costSegment", {
         count: formatCompactNumber(nonCachedInputTokens),
         label: t("common.units.input"),
-        cost: formatCurrency(request.costBreakdown.inputUsd),
+        cost: formatRequestCost(request.costBreakdown.inputUsd, true),
       }),
     );
   }
@@ -253,7 +263,7 @@ function formatRequestCostSummary(request: RequestLog | null, t: ReturnType<type
       t("dashboard.requestDetails.costSegment", {
         count: formatCompactNumber(request.cachedInputTokens),
         label: t("common.units.cached"),
-        cost: formatCurrency(request.costBreakdown.cachedInputUsd),
+        cost: formatRequestCost(request.costBreakdown.cachedInputUsd, true),
       }),
     );
   }
@@ -263,7 +273,7 @@ function formatRequestCostSummary(request: RequestLog | null, t: ReturnType<type
       t("dashboard.requestDetails.costSegment", {
         count: formatCompactNumber(request.outputTokens),
         label: t("common.units.output"),
-        cost: formatCurrency(request.costBreakdown.outputUsd),
+        cost: formatRequestCost(request.costBreakdown.outputUsd, true),
       }),
     );
   }
@@ -276,7 +286,7 @@ function formatRequestCostSummary(request: RequestLog | null, t: ReturnType<type
     return segments.join(" + ");
   }
 
-  return `${formatCurrency(totalUsd)} = ${segments.join(" + ")}`;
+  return `${formatRequestCost(totalUsd, true)} ≈ ${segments.join(" + ")}`;
 }
 
 function formatGenerationSpeed(request: RequestLog): string | null {
@@ -325,6 +335,7 @@ export function RecentRequestsTable({
   const canReadConversations = usePermission("conversations:read");
   const dateDisplayFormat = useDateDisplayFormatStore((state) => state.dateDisplayFormat);
   const selectedRequestCostSummary = formatRequestCostSummary(selectedRequest, t);
+  const selectedPricing = selectedRequest ? requestCostPresentation(selectedRequest) : null;
   const visibleColumns = configuredVisibleColumns ?? ALL_REQUEST_LOG_COLUMNS;
   const visibleColumnSet = useMemo(() => new Set(visibleColumns), [visibleColumns]);
   const hasConfiguredLayout =
@@ -344,6 +355,12 @@ export function RecentRequestsTable({
   const isColumnVisible = (column: RequestLogColumnId) => visibleColumnSet.has(column);
   const resizeLabel = (label: string) =>
     t("dashboard.requests.resizeColumn", { column: label });
+  const requestKindLabel = (kind: string) =>
+    REQUEST_KIND_LABEL_KEYS[kind] ? t(REQUEST_KIND_LABEL_KEYS[kind]) : kind;
+  const requestModelLabel = (request: RequestLog) =>
+    request.requestKind === "codex_control_alpha_search"
+      ? requestKindLabel(request.requestKind)
+      : formatModelLabel(request.model, request.reasoningEffort, request.actualServiceTier ?? request.serviceTier);
 
   const accountLabelMap = useMemo(() => {
     const index = new Map<string, string>();
@@ -421,7 +438,11 @@ export function RecentRequestsTable({
               const planType = request.planType?.trim().toLowerCase() || null;
               const planLabel = planType ? formatSlug(planType) : "--";
               const upstreamTransport = request.upstreamTransport;
+              const upstreamTransportLabel = upstreamTransport === "http" || upstreamTransport === "websocket"
+                ? TRANSPORT_LABELS[upstreamTransport]
+                : t("dashboard.requests.unknownTransport");
               const generationSpeed = formatGenerationSpeed(request);
+              const pricing = requestCostPresentation(request);
 
               return (
                 <TableRow key={request.requestId}>
@@ -456,11 +477,11 @@ export function RecentRequestsTable({
                   {isColumnVisible("model") ? <TableCell className="truncate align-top">
                     <div className="leading-tight">
                       <span className="font-mono text-xs">
-                        {formatModelLabel(request.model, request.reasoningEffort, visibleServiceTier)}
+                        {requestModelLabel(request)}
                       </span>
-                      {request.requestKind === "warmup" || request.requestKind === "limit_warmup" ? (
+                      {request.requestKind !== "normal" && request.requestKind !== "codex_control_alpha_search" ? (
                         <div className="mt-1 text-xs text-muted-foreground">
-                          {REQUEST_KIND_LABELS.warmup}
+                          {requestKindLabel(request.requestKind)}
                         </div>
                       ) : null}
                       {showRequestedTier ? (
@@ -480,11 +501,9 @@ export function RecentRequestsTable({
                         >
                           {TRANSPORT_LABELS[request.transport] ?? request.transport}
                         </Badge>
-                        {upstreamTransport ? (
-                          <div className="text-[11px] text-muted-foreground">
-                            {t("dashboard.requests.upstreamTransport", { transport: TRANSPORT_LABELS[upstreamTransport] ?? upstreamTransport })}
+                        <div className="text-[11px] text-muted-foreground">
+                            {t("dashboard.requests.upstreamTransport", { transport: upstreamTransportLabel })}
                           </div>
-                        ) : null}
                       </div>
                     ) : (
                       <span className="text-xs text-muted-foreground">--</span>
@@ -522,7 +541,13 @@ export function RecentRequestsTable({
                     </div>
                   </TableCell> : null}
                   {isColumnVisible("cost") ? <TableCell className="text-right align-top font-mono text-xs tabular-nums">
-                    {formatCurrency(request.costUsd)}
+                    {formatRequestCost(request.costUsd)}
+                    {pricing.tier ? (
+                      <div className="font-sans text-[10px] leading-tight text-muted-foreground" title={t(`dashboard.requestDetails.estimateBasis.${pricing.basis}`)}>
+                        <div>{t(`dashboard.requestDetails.priceTier.${pricing.tier}`)}</div>
+                        {pricing.basis === "requested" ? <div>{t("dashboard.requests.requestedEstimate")}</div> : null}
+                      </div>
+                    ) : null}
                   </TableCell> : null}
                   {isColumnVisible("details") ? <TableCell className="pr-4 align-top whitespace-normal">
                     {hasError ? (
@@ -596,12 +621,13 @@ export function RecentRequestsTable({
               />
               <div className="grid gap-3 sm:grid-cols-3">
                 <RequestDetailField label={t("dashboard.requests.columns.status")} value={selectedRequest ? t(`dashboard.requestStatus.${selectedRequest.status}`, { defaultValue: REQUEST_STATUS_LABELS[selectedRequest.status] ?? selectedRequest.status }) : "—"} />
-                <RequestDetailField label={t("dashboard.requests.columns.model")} value={selectedRequest ? formatModelLabel(selectedRequest.model, selectedRequest.reasoningEffort, selectedRequest.actualServiceTier ?? selectedRequest.serviceTier) : "—"} mono />
-                <RequestDetailField label={t("dashboard.requestDetails.requestKind")} value={selectedRequest ? (REQUEST_KIND_LABELS[selectedRequest.requestKind] ?? selectedRequest.requestKind) : "—"} />
+                <RequestDetailField label={t("dashboard.requests.columns.model")} value={selectedRequest ? requestModelLabel(selectedRequest) : "—"} mono />
+                <RequestDetailField label={t("dashboard.requestDetails.requestKind")} value={selectedRequest ? requestKindLabel(selectedRequest.requestKind) : "—"} />
                 <RequestDetailField label={t("dashboard.requests.columns.plan")} value={selectedRequest?.planType ? formatSlug(selectedRequest.planType) : "—"} />
                 <RequestDetailField label={t("dashboard.requestDetails.elapsed")} value={formatElapsed(selectedRequest?.latencyMs ?? null)} />
                 <RequestDetailField label="TTFT" value={formatElapsed(selectedRequest?.latencyFirstTokenMs ?? null)} />
                 <RequestDetailField label={t("dashboard.requestDetails.queue")} value={formatElapsed(selectedRequest?.latencyQueueMs ?? null)} />
+                <RequestDetailField label={t("dashboard.requestDetails.estimatedCost")} value={formatRequestCost(selectedRequest?.costUsd, true)} mono />
                 <RequestDetailField label="TPS" value={selectedRequest ? (formatGenerationSpeed(selectedRequest) ?? "—") : "—"} />
                 {selectedRequest?.reasoningTokens != null ? (
                   <RequestDetailField
@@ -611,8 +637,44 @@ export function RecentRequestsTable({
                   />
                 ) : null}
               </div>
+              {selectedPricing ? (
+                <div className="space-y-2 rounded-md border bg-background/50 p-3" data-testid="request-cost-basis">
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <RequestDetailField
+                      label={t("dashboard.requestDetails.priceTier")}
+                      value={selectedPricing.tier
+                        ? t(`dashboard.requestDetails.priceTier.${selectedPricing.tier}`)
+                        : t(`dashboard.requestDetails.estimateBasis.${selectedPricing.basis}`)}
+                    />
+                    <RequestDetailField label={t("dashboard.requestDetails.requestedTier")} value={selectedRequest?.requestedServiceTier ?? "—"} mono />
+                    <RequestDetailField label={t("dashboard.requestDetails.upstreamTier")} value={selectedRequest?.actualServiceTier ?? "—"} mono />
+                  </div>
+                  <p className="text-xs font-medium">
+                    {t("dashboard.requestDetails.estimateBasis")}: {t(`dashboard.requestDetails.estimateBasis.${selectedPricing.basis}`)}
+                  </p>
+                  <p className="text-xs text-muted-foreground">{t(`dashboard.requestDetails.estimateExplanation.${selectedPricing.basis}`)}</p>
+                  {selectedPricing.basis !== "provider" && selectedPricing.basis !== "unavailable" ? (
+                    <p className="text-xs text-muted-foreground">{t("dashboard.requestDetails.apiCostExplanation")}</p>
+                  ) : null}
+                </div>
+              ) : null}
+              {PHASE_TIMING_FIELDS.some(([field]) => selectedRequest?.[field] != null) ? (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {PHASE_TIMING_FIELDS.map(([field, label]) => selectedRequest?.[field] != null ? (
+                    <RequestDetailField key={field} label={t(`dashboard.requestDetails.${label}`)} value={formatElapsed(selectedRequest[field])} />
+                  ) : null)}
+                </div>
+              ) : null}
+              {FAILURE_FIELDS.some(([field]) => selectedRequest?.[field] != null) ? (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  {FAILURE_FIELDS.map(([field, label]) => selectedRequest?.[field] != null ? (
+                    <RequestDetailField key={field} label={t(`dashboard.requestDetails.${label}`)} value={String(selectedRequest[field])} mono />
+                  ) : null)}
+                </div>
+              ) : null}
               <div className="grid gap-3 sm:grid-cols-3">
                 <RequestDetailField label={t("dashboard.requests.columns.transport")} value={selectedRequest?.transport ? (TRANSPORT_LABELS[selectedRequest.transport] ?? selectedRequest.transport) : "—"} />
+                <RequestDetailField label={t("dashboard.requestDetails.upstreamTransport")} value={selectedRequest?.upstreamTransport === "http" || selectedRequest?.upstreamTransport === "websocket" ? TRANSPORT_LABELS[selectedRequest.upstreamTransport] : t("dashboard.requests.unknownTransport")} />
                 <RequestDetailField label={t("dashboard.requests.columns.time")} value={selectedRequest ? formatDateTimeInline(selectedRequest.requestedAt, dateDisplayFormat) : "—"} />
                 <RequestDetailField label={t("dashboard.requestDetails.errorCode")} value={selectedRequest?.errorCode ?? "—"} mono />
               </div>

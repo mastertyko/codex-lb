@@ -7,7 +7,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
-from math import ceil
+from math import ceil, inf, nextafter
 from typing import Protocol
 
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -167,7 +167,20 @@ class ApiKeysRepositoryProtocol(Protocol):
         items: list[UsageReservationItemData],
     ) -> None: ...
 
+    async def add_usage_reservation_item(self, reservation_id: str, item: UsageReservationItemData) -> None: ...
+
     async def get_usage_reservation(self, reservation_id: str) -> UsageReservationData | None: ...
+
+    async def get_usage_reservation_for_update(self, reservation_id: str) -> UsageReservationData | None: ...
+
+    async def set_usage_reservation_item_reserved_delta(
+        self,
+        reservation_id: str,
+        *,
+        limit_id: int,
+        reserved_delta: int,
+        expected_reset_at: datetime | None = None,
+    ) -> bool: ...
 
     async def transition_usage_reservation_status(
         self,
@@ -194,6 +207,7 @@ class ApiKeysRepositoryProtocol(Protocol):
         output_tokens: int | None,
         cached_input_tokens: int | None,
         cost_microdollars: int | None,
+        cache_write_input_tokens: int | None = None,
     ) -> None: ...
 
     async def touch_usage_reservation(self, reservation_id: str) -> bool: ...
@@ -379,6 +393,8 @@ class PooledCreditData:
     remaining_percent_primary: float | None = None
     remaining_percent_secondary: float | None = None
     capacity_credits_primary: float = 0.0
+    unquantified_account_count_primary: int = 0
+    unquantified_account_count_secondary: int = 0
 
 
 def _compute_pooled_credits(
@@ -427,14 +443,25 @@ def _compute_pooled_credits(
     # Secondary (weekly) rows pool raw: upstream still reports long windows,
     # so an elapsed sample is transient staleness the next refresh rewrites —
     # zeroing it would briefly report an exhausted weekly pool as 100% free.
-    primary_rows = _seed_missing_usage_rows(primary_rows, account_ids)
+    weekly_only_account_ids = {
+        row.account_id for row in primary_rows_raw if usage_core.is_weekly_window_minutes(row.window_minutes)
+    }
+    primary_rows = _seed_missing_usage_rows(primary_rows, account_ids - weekly_only_account_ids)
     secondary_rows = _seed_missing_usage_rows(secondary_rows, account_ids)
 
     primary_summary = usage_core.summarize_usage_window(primary_rows, account_map, "primary")
     secondary_summary = usage_core.summarize_usage_window(secondary_rows, account_map, "secondary")
 
-    primary_remaining = usage_core.remaining_percent_from_used(primary_summary.used_percent)
-    secondary_remaining = usage_core.remaining_percent_from_used(secondary_summary.used_percent)
+    primary_remaining = (
+        usage_core.remaining_percent_from_used(primary_summary.used_percent)
+        if primary_summary.unquantified_account_count == 0
+        else None
+    )
+    secondary_remaining = (
+        usage_core.remaining_percent_from_used(secondary_summary.used_percent)
+        if secondary_summary.unquantified_account_count == 0
+        else None
+    )
 
     if primary_summary.capacity_credits == 0.0 or not has_live_primary:
         primary_remaining = None
@@ -443,6 +470,8 @@ def _compute_pooled_credits(
         remaining_percent_primary=primary_remaining,
         remaining_percent_secondary=secondary_remaining,
         capacity_credits_primary=primary_summary.capacity_credits,
+        unquantified_account_count_primary=primary_summary.unquantified_account_count,
+        unquantified_account_count_secondary=secondary_summary.unquantified_account_count,
     )
 
 
@@ -1024,6 +1053,207 @@ class ApiKeysService:
             has_applicable_limits=bool(reservation_items),
         )
 
+    async def extend_usage_reservation(
+        self,
+        reservation_id: str,
+        *,
+        request_service_tier: str | None,
+        request_usage_budget: ApiKeyRequestUsageBudget | None,
+        successor_usage_budget: ApiKeyRequestUsageBudget | None = None,
+    ) -> bool:
+        return await self._adjust_usage_reservation_input_budget(
+            reservation_id,
+            request_service_tier=request_service_tier,
+            request_usage_budget=request_usage_budget,
+            successor_usage_budget=successor_usage_budget,
+            direction=1,
+        )
+
+    async def reduce_usage_reservation(
+        self,
+        reservation_id: str,
+        *,
+        request_service_tier: str | None,
+        request_usage_budget: ApiKeyRequestUsageBudget | None,
+    ) -> bool:
+        return await self._adjust_usage_reservation_input_budget(
+            reservation_id,
+            request_service_tier=request_service_tier,
+            request_usage_budget=request_usage_budget,
+            direction=-1,
+        )
+
+    async def _adjust_usage_reservation_input_budget(
+        self,
+        reservation_id: str,
+        *,
+        request_service_tier: str | None,
+        request_usage_budget: ApiKeyRequestUsageBudget | None,
+        direction: int,
+        successor_usage_budget: ApiKeyRequestUsageBudget | None = None,
+    ) -> bool:
+        for attempt in range(_SQLITE_BUSY_RETRY_ATTEMPTS):
+            try:
+                return await self._adjust_usage_reservation_input_budget_once(
+                    reservation_id,
+                    request_service_tier=request_service_tier,
+                    request_usage_budget=request_usage_budget,
+                    direction=direction,
+                    successor_usage_budget=successor_usage_budget,
+                )
+            except OperationalError as exc:
+                await self._repository.rollback()
+                if not await should_retry_after_sqlite_lock(
+                    exc,
+                    what="adjust_usage_reservation_input_budget",
+                    attempt=attempt,
+                    max_attempts=_SQLITE_BUSY_RETRY_ATTEMPTS,
+                    base_delay_seconds=_SQLITE_BUSY_RETRY_BASE_SECONDS,
+                ):
+                    raise
+        raise RuntimeError("unreachable")
+
+    async def _reset_elapsed_windows_before_reconciliation(self, reservation_id: str, *, now: datetime) -> None:
+        # Lazy resets commit, so they must happen before the reservation row is locked.
+        reservation = await self._repository.get_usage_reservation(reservation_id)
+        if reservation is None or reservation.status != "reserved":
+            return
+        key = _ensure_valid_api_key_row(await self._repository.get_for_limit_enforcement(reservation.api_key_id))
+        await _lazy_reset_expired_limits(self._repository, key.limits, now=now)
+
+    async def _rebase_usage_reservation_item(
+        self,
+        reservation_id: str,
+        *,
+        item: UsageReservationItemData,
+        limit: ApiKeyLimit,
+        input_delta: int,
+    ) -> None:
+        # The window advanced, so the item's earlier budget no longer counts against the live counter.
+        rebased_delta = item.reserved_delta + input_delta
+        result = await self._repository.try_reserve_usage(
+            limit.id, delta=rebased_delta, expected_reset_at=limit.reset_at
+        )
+        if not result.success:
+            raise _rate_limit_exceeded_error(limit)
+        updated = await self._repository.set_usage_reservation_item_reserved_delta(
+            reservation_id,
+            limit_id=item.limit_id,
+            reserved_delta=rebased_delta,
+            expected_reset_at=limit.reset_at,
+        )
+        if not updated:
+            raise RuntimeError("API key usage reservation item disappeared")
+
+    async def _adjust_usage_reservation_input_budget_once(
+        self,
+        reservation_id: str,
+        *,
+        request_service_tier: str | None,
+        request_usage_budget: ApiKeyRequestUsageBudget | None,
+        direction: int,
+        successor_usage_budget: ApiKeyRequestUsageBudget | None = None,
+    ) -> bool:
+        if direction not in {-1, 1}:
+            raise ValueError("direction must be -1 or 1")
+        normalized_budget = _normalize_request_usage_budget(request_usage_budget)
+        input_tokens = normalized_budget.input_tokens or 0
+        now = utcnow()
+        async with sqlite_writer_section():
+            if direction > 0:
+                await self._reset_elapsed_windows_before_reconciliation(reservation_id, now=now)
+            reservation = await self._repository.get_usage_reservation_for_update(reservation_id)
+            if reservation is None or reservation.status != "reserved":
+                await self._repository.rollback()
+                return False
+            try:
+                if direction > 0:
+                    key = _ensure_valid_api_key_row(
+                        await self._repository.get_for_limit_enforcement(reservation.api_key_id)
+                    )
+                    if key.expires_at is not None and key.expires_at < now:
+                        raise ApiKeyInvalidError("API key has expired")
+                    existing_limit_ids = {item.limit_id for item in reservation.items}
+                    live_limits_by_id = {limit.id: limit for limit in key.limits}
+                    for limit in key.limits:
+                        if not _limit_applies_for_request(limit, request_model=reservation.model):
+                            continue
+                        if limit.id in existing_limit_ids:
+                            continue
+                        if limit.current_value >= limit.max_value:
+                            raise _rate_limit_exceeded_error(limit)
+                        delta = _reserve_delta_for_limit(
+                            limit,
+                            request_model=reservation.model,
+                            request_service_tier=request_service_tier,
+                            request_usage_budget=_normalize_request_usage_budget(successor_usage_budget),
+                        )
+                        result = await self._repository.try_reserve_usage(
+                            limit.id, delta=delta, expected_reset_at=limit.reset_at
+                        )
+                        if not result.success:
+                            raise _rate_limit_exceeded_error(limit)
+                        await self._repository.add_usage_reservation_item(
+                            reservation_id,
+                            UsageReservationItemData(
+                                limit_id=limit.id,
+                                limit_type=limit.limit_type,
+                                reserved_delta=delta,
+                                expected_reset_at=limit.reset_at,
+                            ),
+                        )
+                for item in reservation.items:
+                    input_delta = _reserve_additional_input_delta_for_limit_type(
+                        item.limit_type,
+                        request_model=reservation.model,
+                        request_service_tier=request_service_tier,
+                        input_tokens=input_tokens,
+                    )
+                    if input_delta <= 0:
+                        continue
+                    if direction > 0:
+                        live_limit = live_limits_by_id.get(item.limit_id)
+                        if live_limit is not None and live_limit.reset_at != item.expected_reset_at:
+                            await self._rebase_usage_reservation_item(
+                                reservation_id, item=item, limit=live_limit, input_delta=input_delta
+                            )
+                            continue
+                        result = await self._repository.try_reserve_usage(
+                            item.limit_id,
+                            delta=input_delta,
+                            expected_reset_at=item.expected_reset_at,
+                        )
+                        if not result.success:
+                            raise ApiKeyRateLimitExceededError(
+                                message=f"API key {item.limit_type.value} limit exceeded",
+                                reset_at=result.reset_at or item.expected_reset_at,
+                            )
+                    else:
+                        if input_delta > item.reserved_delta:
+                            raise RuntimeError("usage reservation input budget underflow")
+                        adjusted = await self._repository.adjust_reserved_usage(
+                            item.limit_id,
+                            delta=-input_delta,
+                            expected_reset_at=item.expected_reset_at,
+                        )
+                        if not adjusted:
+                            raise RuntimeError("failed to reduce API key usage reservation")
+                    updated = await self._repository.set_usage_reservation_item_reserved_delta(
+                        reservation_id,
+                        limit_id=item.limit_id,
+                        reserved_delta=item.reserved_delta + direction * input_delta,
+                    )
+                    if not updated:
+                        raise RuntimeError("API key usage reservation item disappeared")
+                touched = await self._repository.touch_usage_reservation(reservation_id)
+                if not touched:
+                    raise RuntimeError("API key usage reservation changed while adjusting")
+                await self._repository.commit()
+                return True
+            except Exception:
+                await self._repository.rollback()
+                raise
+
     async def finalize_usage_reservation(
         self,
         reservation_id: str,
@@ -1034,6 +1264,7 @@ class ApiKeysService:
         cached_input_tokens: int = 0,
         service_tier: str | None = None,
         cost_microdollars: int | None = None,
+        cache_write_input_tokens: int = 0,
     ) -> None:
         for attempt in range(_SQLITE_BUSY_RETRY_ATTEMPTS):
             try:
@@ -1045,6 +1276,7 @@ class ApiKeysService:
                     cached_input_tokens=cached_input_tokens,
                     service_tier=service_tier,
                     status="finalized",
+                    cache_write_input_tokens=cache_write_input_tokens,
                     cost_microdollars_override=cost_microdollars,
                 )
                 return
@@ -1070,6 +1302,7 @@ class ApiKeysService:
         output_tokens: int | None = None,
         cached_input_tokens: int | None = None,
         service_tier: str | None = None,
+        cache_write_input_tokens: int | None = None,
     ) -> None:
         for attempt in range(_SQLITE_BUSY_RETRY_ATTEMPTS):
             try:
@@ -1081,6 +1314,7 @@ class ApiKeysService:
                     cached_input_tokens=cached_input_tokens,
                     service_tier=service_tier,
                     status="failed",
+                    cache_write_input_tokens=cache_write_input_tokens,
                 )
                 return
             except OperationalError as exc:
@@ -1107,18 +1341,21 @@ class ApiKeysService:
         service_tier: str | None,
         status: str,
         cost_microdollars_override: int | None = None,
+        cache_write_input_tokens: int | None = None,
     ) -> None:
         async with sqlite_writer_section():
-            reservation = await self._repository.get_usage_reservation(reservation_id)
-            if reservation is None or reservation.status != "reserved":
-                return
-
             claimed = await self._repository.transition_usage_reservation_status(
                 reservation_id,
                 expected_status="reserved",
                 new_status="settling",
             )
             if not claimed:
+                await self._repository.rollback()
+                return
+            # Claim first, then read the current items once. The status update
+            # owns the row lock, so concurrent adjustments cannot race this read.
+            reservation = await self._repository.get_usage_reservation(reservation_id)
+            if reservation is None:
                 await self._repository.rollback()
                 return
 
@@ -1134,6 +1371,7 @@ class ApiKeysService:
                     effective_output_tokens,
                     effective_cached_input_tokens,
                     service_tier,
+                    cache_write_input_tokens=cache_write_input_tokens or 0,
                 )
             )
 
@@ -1165,6 +1403,7 @@ class ApiKeysService:
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
                     cost_microdollars=cost_microdollars,
+                    cache_write_input_tokens=cache_write_input_tokens,
                 )
                 await self._repository.commit()
             except Exception:
@@ -1217,16 +1456,16 @@ class ApiKeysService:
 
     async def _release_usage_reservation_once(self, reservation_id: str) -> None:
         async with sqlite_writer_section():
-            reservation = await self._repository.get_usage_reservation(reservation_id)
-            if reservation is None or reservation.status != "reserved":
-                return
-
             claimed = await self._repository.transition_usage_reservation_status(
                 reservation_id,
                 expected_status="reserved",
                 new_status="released",
             )
             if not claimed:
+                await self._repository.rollback()
+                return
+            reservation = await self._repository.get_usage_reservation(reservation_id)
+            if reservation is None:
                 await self._repository.rollback()
                 return
 
@@ -1264,6 +1503,7 @@ class ApiKeysService:
         output_tokens: int,
         cached_input_tokens: int = 0,
         service_tier: str | None = None,
+        cache_write_input_tokens: int = 0,
     ) -> None:
         cost_microdollars = _calculate_cost_microdollars(
             model,
@@ -1271,6 +1511,7 @@ class ApiKeysService:
             output_tokens,
             cached_input_tokens,
             service_tier,
+            cache_write_input_tokens=cache_write_input_tokens,
         )
         await self._repository.increment_limit_usage(
             key_id,
@@ -1803,6 +2044,25 @@ def _reserve_budget_for_limit_type(
     return 1
 
 
+def _reserve_additional_input_delta_for_limit_type(
+    limit_type: LimitType,
+    *,
+    request_model: str | None,
+    request_service_tier: str | None,
+    input_tokens: int,
+) -> int:
+    if limit_type in {LimitType.TOTAL_TOKENS, LimitType.INPUT_TOKENS}:
+        return input_tokens
+    if limit_type == LimitType.COST_USD:
+        return _reserve_cost_budget_microdollars(
+            request_model,
+            request_service_tier,
+            input_tokens=input_tokens,
+            output_tokens=0,
+        )
+    return 0
+
+
 def _reserve_cost_budget_microdollars(
     model: str | None,
     service_tier: str | None,
@@ -2073,6 +2333,8 @@ def _calculate_cost_microdollars(
     output_tokens: int,
     cached_input_tokens: int,
     service_tier: str | None = None,
+    *,
+    cache_write_input_tokens: int = 0,
 ) -> int:
     resolved = get_pricing_for_model(model)
     if resolved is None:
@@ -2082,11 +2344,13 @@ def _calculate_cost_microdollars(
         input_tokens=float(input_tokens),
         output_tokens=float(output_tokens),
         cached_input_tokens=float(cached_input_tokens),
+        cache_write_input_tokens=float(cache_write_input_tokens),
     )
     cost_usd = calculate_cost_from_usage(usage, price, service_tier=service_tier)
     if cost_usd is None:
         return 0
-    return int(cost_usd * 1_000_000)
+    # Preserve fractional truncation without losing an integral microdollar to float error.
+    return int(nextafter(cost_usd * 1_000_000, inf))
 
 
 def _build_api_key_trends(

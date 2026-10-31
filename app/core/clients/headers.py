@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from app.core.utils.request_id import get_request_id
 
+CODEX_LB_KEY_HEADER = "x-codex-lb-key"
+
 
 def build_chatgpt_auth_headers(
     access_token: str,

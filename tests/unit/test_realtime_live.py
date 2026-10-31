@@ -211,7 +211,7 @@ class _ProxyService(_RealtimeLiveMixin):
         self.decrypt_calls.append(value)
         return f"decrypted:{value}"
 
-    async def _resolve_realtime_call_owner(self, call_id: str, *, api_key):
+    async def _resolve_realtime_call_owner(self, call_id: str, *, api_key, request_id=None):
         assert call_id == "rtc_example"
         assert api_key is not None
         return self.owner_account_id

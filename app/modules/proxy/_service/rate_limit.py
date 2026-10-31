@@ -66,7 +66,7 @@ def _has_available_usage_account(
         known_applicable_used_percents = [
             float(row.used_percent)
             for window, row in account_rows.items()
-            if usage_core.capacity_for_plan(account.plan_type, window) is not None and row.used_percent is not None
+            if (usage_core.capacity_for_account(account, window) is not None) and row.used_percent is not None
         ]
         if known_applicable_used_percents and all(
             used_percent < 100.0 for used_percent in known_applicable_used_percents

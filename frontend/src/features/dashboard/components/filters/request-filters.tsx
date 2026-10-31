@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { MultiSelectFilter, type MultiSelectOption } from "@/features/dashboard/components/filters/multi-select-filter";
 import { TimeframeSelect } from "@/features/dashboard/components/filters/timeframe-select";
 import type { FilterState } from "@/features/dashboard/schemas";
+import { REQUEST_KIND_LABEL_KEYS } from "@/features/dashboard/request-log-presentation";
 
 export type RequestFiltersProps = {
   filters: FilterState;
@@ -22,6 +23,9 @@ export type RequestFiltersProps = {
   onApiKeyChange: (values: string[]) => void;
   onModelChange: (values: string[]) => void;
   onStatusChange: (values: string[]) => void;
+  onRequestKindChange: (values: string[]) => void;
+  onTransportChange: (values: string[]) => void;
+  onUpstreamTransportChange: (values: string[]) => void;
   onConversationDismiss: () => void;
   onReset: () => void;
 };
@@ -39,10 +43,21 @@ export function RequestFilters({
   onApiKeyChange,
   onModelChange,
   onStatusChange,
+  onRequestKindChange,
+  onTransportChange,
+  onUpstreamTransportChange,
   onConversationDismiss,
   onReset,
 }: RequestFiltersProps) {
   const { t } = useTranslation();
+  const kindOptions = Object.entries(REQUEST_KIND_LABEL_KEYS)
+    .filter(([value]) => value !== "limit_warmup")
+    .map(([value, key]) => ({ value, label: t(key) }));
+  const transportOptions = [
+    { value: "http", label: "HTTP" },
+    { value: "websocket", label: "WS" },
+    { value: "unknown", label: t("dashboard.filters.unknownTransport") },
+  ];
 
   return (
     <div className="space-y-2 rounded-xl border bg-card p-4">
@@ -86,6 +101,24 @@ export function RequestFilters({
           values={filters.statuses}
           options={statusOptions}
           onChange={onStatusChange}
+        />
+        <MultiSelectFilter
+          label={t("dashboard.filters.requestKinds")}
+          values={filters.requestKinds}
+          options={kindOptions}
+          onChange={onRequestKindChange}
+        />
+        <MultiSelectFilter
+          label={t("dashboard.filters.transport")}
+          values={filters.transports}
+          options={transportOptions}
+          onChange={onTransportChange}
+        />
+        <MultiSelectFilter
+          label={t("dashboard.filters.upstreamTransport")}
+          values={filters.upstreamTransports}
+          options={transportOptions}
+          onChange={onUpstreamTransportChange}
         />
         {filters.conversationId ? (
           <Badge variant="outline" className="h-8 gap-1.5 px-3 text-xs font-normal">

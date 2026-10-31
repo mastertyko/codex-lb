@@ -76,6 +76,9 @@ export const AccountSummarySchema = z.object({
   seatType: z.string().nullable().optional(),
   planType: z.string(),
   routingPolicy: z.enum(["normal", "burn_first", "preserve"]).optional(),
+  proLegacyAllowance: z.boolean().optional(),
+  usageMultiplier: z.number().nullable().optional(),
+  capacityCreditsEstimated: z.boolean().optional(),
   status: z.string(),
   securityWorkAuthorized: z.boolean().optional(),
   usage: AccountUsageSchema.nullable().optional(),
@@ -265,6 +268,7 @@ export const AccountRoutingPolicyUpdateResponseSchema = z.object({
 
 export const AccountUpdateRequestSchema = z.object({
   securityWorkAuthorized: z.boolean().optional(),
+  proLegacyAllowance: z.boolean().optional(),
 });
 
 export const OauthStartRequestSchema = z.object({

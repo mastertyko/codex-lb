@@ -678,6 +678,8 @@ class AuthManager:
         account.last_refresh = new_last_refresh
         account.chatgpt_account_id = new_chatgpt_account_id
         account.chatgpt_user_id = new_chatgpt_user_id
+        if new_plan_type != "pro":
+            account.pro_legacy_allowance = False
         account.plan_type = new_plan_type
         account.email = new_email
         account.workspace_id = next_workspace_id

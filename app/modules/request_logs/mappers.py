@@ -4,6 +4,7 @@ from typing import cast as typing_cast
 
 from app.core.usage.logs import (
     CANCELLED_STATUS,
+    CONTROLLED_INTERRUPTION_ERROR_CODE,
     RequestLogLike,
     cached_input_tokens_from_log,
     cost_breakdown_from_log,
@@ -20,7 +21,7 @@ QUOTA_CODES = {"insufficient_quota", "usage_not_included", "quota_exceeded"}
 def normalize_log_status(status: str, error_code: str | None) -> str:
     if status == "success":
         return "ok"
-    if status == CANCELLED_STATUS:
+    if status == CANCELLED_STATUS or (status == "error" and error_code == CONTROLLED_INTERRUPTION_ERROR_CODE):
         return "cancelled"
     if error_code in RATE_LIMIT_CODES:
         return "rate_limit"
@@ -41,7 +42,8 @@ def to_request_log_entry(
     include_api_key_identity: bool = True,
 ) -> RequestLogEntry:
     log_like = typing_cast(RequestLogLike, log)
-    cost_breakdown = cost_breakdown_from_log(log_like, precision=6)
+    # Leave display rounding to the dashboard so positive microcosts survive.
+    cost_breakdown = cost_breakdown_from_log(log_like)
     return RequestLogEntry(
         sticky_key_source=log.sticky_key_source if include_sensitive_metadata else None,
         sticky_kind=log.sticky_kind if include_sensitive_metadata else None,
@@ -94,4 +96,8 @@ def to_request_log_entry(
         latency_ms=log.latency_ms,
         latency_first_token_ms=log.latency_first_token_ms,
         latency_queue_ms=log.latency_queue_ms,
+        latency_response_created_ms=log.latency_response_created_ms,
+        latency_first_upstream_event_ms=log.latency_first_upstream_event_ms,
+        latency_response_create_gate_wait_ms=log.latency_response_create_gate_wait_ms,
+        latency_bridge_queue_wait_ms=log.latency_bridge_queue_wait_ms,
     )

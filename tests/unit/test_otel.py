@@ -431,6 +431,39 @@ def test_init_tracing_redacts_private_live_server_span_attributes(
     }
 
 
+@pytest.mark.parametrize("prefix", ["/backend-api/codex/desktop-voice", "/backend-api/codex/v1/desktop-voice"])
+@pytest.mark.parametrize("suffix", ["", "/", "/live/rtc_private", "/live/not-valid", "/realtime/calls"])
+def test_desktop_voice_tracing_redacts_alias_and_rejected_namespace(
+    monkeypatch: pytest.MonkeyPatch, prefix: str, suffix: str
+) -> None:
+    state = _install_fake_otel(monkeypatch)
+    path = prefix + suffix
+    raw_url = f"https://codex-lb.test{path}?call_id=rtc_private#private-fragment"
+    span = _RecordingSpan({"url.full": raw_url, "url.query": "call_id=rtc_private"})
+    assert otel.init_tracing() is True
+    state.fastapi_server_request_hook(
+        span,
+        {
+            "type": "websocket",
+            "scheme": "https",
+            "headers": [(b"host", b"codex-lb.test")],
+            "path": path,
+            "query_string": b"call_id=rtc_private",
+        },
+    )
+    safe_path = prefix + "/<redacted>"
+    safe_url = "https://codex-lb.test" + safe_path
+    assert span.attributes == {
+        "http.target": safe_path,
+        "http.url": safe_url,
+        "url.full": safe_url,
+        "url.path": safe_path,
+        "url.query": "",
+        "url.fragment": "",
+    }
+    assert state.aiohttp_url_filter(raw_url) == safe_url
+
+
 def test_init_tracing_keeps_ordinary_responses_server_span_attributes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

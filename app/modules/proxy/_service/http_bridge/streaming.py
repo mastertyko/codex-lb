@@ -42,6 +42,7 @@ from app.core.errors import (
     openai_error,
     response_failed_event,
 )
+from app.core.exceptions import ProxyInvalidRequestError, ProxyReasoningEffortNotAllowed
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
     bridge_durable_recover_total,
@@ -126,10 +127,15 @@ from app.modules.proxy._service.http_bridge.helpers import (
 from app.modules.proxy._service.http_bridge.owner_forwarding import (
     _owner_forward_failure_allows_local_recovery,
 )
+from app.modules.proxy._service.http_bridge.owner_replay import retains_owner_bound_tool_context
 from app.modules.proxy._service.http_bridge.quarantine import (
     _http_bridge_quarantine_clear_fence,
     _http_bridge_session_key_poison_quarantined,
     _http_bridge_session_key_quarantined,
+)
+from app.modules.proxy._service.http_bridge.quota_rebalance import (
+    prepare_cold_http_quota_rebalance,
+    prepare_http_quota_rebalance,
 )
 from app.modules.proxy._service.http_bridge.retry_circuit import (
     _HTTP_BRIDGE_RETRY_CIRCUIT_ANCHOR_ABANDONED_DETAIL,
@@ -273,6 +279,10 @@ from app.modules.proxy.replay_safety import (
     responses_input_suffix_matches_pending_tool_calls,
     responses_input_suffix_retains_prior_output,
     responses_payload_is_account_neutral_fresh_replay,
+)
+from app.modules.proxy.request_policy import (
+    prepare_astra_reasoning_policy_continuation,
+    validate_astra_request,
 )
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED
 
@@ -477,7 +487,9 @@ class _VerifiedDurableFullResend:
                 canonical_lite_developer_index=replay_projection.canonical_lite_developer_index,
             )
         )
-        if not safe_fresh_context:
+        if not safe_fresh_context and not retains_owner_bound_tool_context(
+            input_items, stored_count=stored_count, pending_tool_calls=pending_tool_calls
+        ):
             return None
         return cls(
             _token=cls.__construction_token,
@@ -564,6 +576,17 @@ def _http_bridge_durable_owner_is_dead(
     owner_instance_is_dead = lookup.owner_instance_id is not None and lookup.owner_instance_id != current_instance
     process_epoch_is_dead = previous_process_epoch is not None and previous_process_epoch != current_process_epoch
     return owner_instance_is_dead or process_epoch_is_dead or not lookup.lease_is_active(now=utcnow())
+
+
+def _prepare_http_fallback_payload(payload: ResponsesRequest, api_key: ApiKeyData | None) -> ResponsesRequest:
+    if (
+        payload.previous_response_id is not None
+        and isinstance(payload.input, list)
+        and payload.model.strip().lower() == "gpt-6-astra"
+    ):
+        payload = payload.model_copy(update={"input": _trim_http_bridge_previous_response_input_items(payload.input)})
+    validate_astra_request(payload, api_key)
+    return payload
 
 
 def _http_bridge_payload_is_account_neutral_fresh_replay(payload: ResponsesRequest) -> bool:
@@ -753,6 +776,17 @@ async def _iter_account_capacity_wait_sse(
         remaining_sleep_seconds -= chunk_seconds
 
 
+def _http_bridge_reset_pending_tools_for_anchor(
+    session: _HTTPBridgeSession,
+    *,
+    response_id: str | None,
+    account_id: str | None,
+) -> None:
+    if response_id != session.last_completed_response_id or account_id != session.last_completed_response_account_id:
+        session.last_pending_tool_calls = {}
+        session.pending_async_tool_calls.clear()
+
+
 def _http_bridge_interrupted_tool_outputs_input(
     session: _HTTPBridgeSession,
     *,
@@ -780,7 +814,9 @@ def _http_bridge_interrupted_tool_outputs_input(
     input_item_list = cast(list[JsonValue], input_items)
     missing_call_ids = _missing_function_call_outputs_for_previous_response(
         input_item_list,
-        pending_call_ids=list(session.last_pending_tool_calls),
+        pending_call_ids=[
+            call_id for call_id in session.last_pending_tool_calls if call_id not in session.pending_async_tool_calls
+        ],
     )
     if not missing_call_ids:
         return None
@@ -1072,6 +1108,7 @@ class _HTTPBridgeStreamingMixin:
                 runtime_config = dataclasses.replace(runtime_config, enabled=False)
             force_upstream_stream_transport = "http"
         if not runtime_config.enabled:
+            payload = _prepare_http_fallback_payload(payload, api_key)
             stream_with_retry = cast(Callable[..., AsyncIterator[str]], self._stream_with_retry)
             async for line in stream_with_retry(
                 payload,
@@ -1252,6 +1289,7 @@ class _HTTPBridgeStreamingMixin:
                     )
         if not bridge_transport_unavailable:
             return
+        payload = _prepare_http_fallback_payload(payload, api_key)
         logger.warning(
             "stream_responses http bridge upstream unavailable; retrying over http upstream transport request_id=%s",
             request_id,
@@ -1364,6 +1402,11 @@ class _HTTPBridgeStreamingMixin:
             *,
             reservation: ApiKeyUsageReservationData | None = api_key_reservation,
         ) -> tuple[_WebSocketRequestState, str]:
+            # Astra resets must not shift the client prefix used by later trimming.
+            client_input = request_payload.input
+            request_payload = request_payload.model_copy()
+            reset_inserted = prepare_astra_reasoning_policy_continuation(request_payload, api_key)
+            validate_astra_request(request_payload, api_key)
             if bridge_uses_responses_lite:
                 request_state, text_data = self._prepare_http_bridge_request(
                     request_payload,
@@ -1383,6 +1426,10 @@ class _HTTPBridgeStreamingMixin:
                     request_id=request_id,
                     client_ip=client_ip,
                 )
+            if reset_inserted:
+                assert isinstance(client_input, list)
+                request_state.input_item_count = len(client_input)
+                request_state.input_full_fingerprint = _fingerprint_input_items(client_input)
             request_state.capacity_startup_wait_event = capacity_startup_wait_event
             request_state.capacity_startup_ready_event = capacity_startup_ready_event
             lifecycle = begin_bridge_lifecycle(request_state.api_key_reservation)
@@ -1682,6 +1729,8 @@ class _HTTPBridgeStreamingMixin:
                             )
                     except ProxyResponseError:
                         raise
+                    except (ProxyInvalidRequestError, ProxyReasoningEffortNotAllowed):
+                        raise
                     except Exception:
                         logger.warning("Failed to inspect HTTP bridge recovery attempt", exc_info=True)
                         raise ProxyResponseError(
@@ -1811,7 +1860,13 @@ class _HTTPBridgeStreamingMixin:
             if (
                 fresh_reattach_can_use_durable_anchor
                 and payload_looks_like_full_resend
-                and durable_full_resend_has_safe_fresh_context
+                and (
+                    durable_full_resend_has_safe_fresh_context
+                    or (
+                        durable_full_resend_proof is not None
+                        and durable_full_resend_proof.matches(payload, durable_lookup)
+                    )
+                )
             ):
                 if durable_full_resend_proof is not None and durable_full_resend_proof.matches(payload, durable_lookup):
                     durable_full_resend_fresh_bridge_proof = durable_full_resend_proof
@@ -2480,6 +2535,44 @@ class _HTTPBridgeStreamingMixin:
                 record_account_neutral_replay_rejection(replay_rejection)
             raise owner_unavailable
 
+        cold_quota_handoff = False
+        if (
+            dashboard_settings.routing_strategy == "quota_first_balanced"
+            and durable_lookup is not None
+            and bridge_session_key.affinity_kind in {"thread_header", "prompt_cache"}
+            and not forwarded_request
+            and not live_local_session_exists
+            and not forwards_to_active_owner
+            and (dead_owner_process_epoch_mismatch or not durable_lookup.lease_is_active(now=utcnow()))
+            and payload.previous_response_id is None
+            and incoming_turn_state_header is None
+            and not file_required_preferred_account
+            and not account_neutral_recovery
+        ):
+            fresh_state, fresh_text = prepare_bridge_request(payload)
+            fresh_state.affinity_policy = affinity
+            fresh_state.excluded_account_ids.update(request_state.excluded_account_ids)
+            candidate = await prepare_cold_http_quota_rebalance(
+                self, fresh_state, durable_lookup, fresh_text=fresh_text
+            )
+            if candidate is not None:
+                from app.modules.proxy._service.websocket.helpers import _install_fresh_replay_body
+
+                text_data = _install_fresh_replay_body(request_state, candidate[0], account_neutral=True)
+                request_state.hard_continuity_anchor = False
+                request_state.previous_response_owner_account_id = None
+                request_state.previous_response_owner_lookup_outcome = None
+                _bind_http_bridge_proxy_injected_anchor(self, request_state, response_id=None)
+                fresh_replay_excluded_account_ids.update(candidate[1])
+                request_state.excluded_account_ids.update(candidate[1])
+                affinity = dataclasses.replace(affinity, reallocate_sticky=True)
+                request_state.affinity_policy = affinity
+                preferred_account_has_continuity_provenance = False
+                effective_payload = payload
+                proxy_injected_previous_response_id = False
+                cold_quota_handoff = True
+                logger.info("http_bridge_cold_quota_rebalance full_context=true")
+
         while True:
             try:
                 session_or_forward = await self._get_or_create_http_bridge_session(
@@ -2951,8 +3044,11 @@ class _HTTPBridgeStreamingMixin:
                             recovery_anchor_fence_response_id,
                             request_id,
                         )
-                        if durable_lookup.latest_response_id != session.last_completed_response_id:
-                            session.last_pending_tool_calls = {}
+                        _http_bridge_reset_pending_tools_for_anchor(
+                            session,
+                            response_id=durable_lookup.latest_response_id,
+                            account_id=durable_lookup.account_id,
+                        )
                         session.last_completed_response_id = durable_lookup.latest_response_id
                         session.last_completed_response_account_id = durable_lookup.account_id
                         session.last_completed_input_count = durable_full_resend_anchor_count
@@ -2975,6 +3071,20 @@ class _HTTPBridgeStreamingMixin:
                 )
                 if recovery_injected_input is not None:
                     recovery_payload = recovery_payload.model_copy(update={"input": recovery_injected_input})
+                try:
+                    prepare_astra_reasoning_policy_continuation(recovery_payload, api_key)
+                    validate_astra_request(recovery_payload, api_key)
+                except (ProxyInvalidRequestError, ProxyReasoningEffortNotAllowed):
+                    # A server-owned retry may carry a different reservation
+                    # from the API's original request. Settle this unsubmitted
+                    # lifecycle before returning the terminal policy error.
+                    try:
+                        await release_unowned_bridge_lifecycle(
+                            request_state.deferred_account_backoff_lifecycle, request_state
+                        )
+                    except Exception:
+                        logger.warning("Failed to release policy-rejected bridge reservation", exc_info=True)
+                    raise
                 owner_recovery_scope_id = ensure_request_scope_id() if original_request_unanchored else None
                 if owner_recovery_scope_id is not None:
                     _reserve_http_bridge_unanchored_handoff(
@@ -3060,6 +3170,10 @@ class _HTTPBridgeStreamingMixin:
                             session.last_used_at = clock.monotonic()
                 return
         session = session_or_forward
+        if cold_quota_handoff:
+            # The fenced claim has replaced the account and cleared its old
+            # aliases. Never hydrate the predecessor's upstream-only anchors.
+            durable_lookup = None
         if (
             # A quarantine-suppressed anchor (#1534) must not be rehydrated
             # into the session either: doing so would let the session-level
@@ -3067,16 +3181,23 @@ class _HTTPBridgeStreamingMixin:
             # and trim the prefix, rebuilding the wedged reattach.
             not fresh_reattach_anchor_suppressed_quarantined
             and not durable_full_resend_has_safe_fresh_context
+            and not (
+                durable_full_resend_fresh_bridge_proof is not None
+                and durable_full_resend_fresh_bridge_proof.matches(payload, durable_lookup)
+            )
             and durable_full_resend_anchor_count is not None
             and durable_full_resend_anchor_fingerprint is not None
             and durable_lookup is not None
             and durable_lookup.latest_response_id is not None
         ):
-            if durable_lookup.latest_response_id != session.last_completed_response_id:
-                # The pending tool calls were recorded for the session's own
-                # last completed response; a durable anchor pointing elsewhere
-                # must not trigger interrupted-output injection.
-                session.last_pending_tool_calls = {}
+            # Pending tool calls belong to the session's last completed
+            # response and owner. A durable anchor with a different id or
+            # account must not trigger interrupted-output injection.
+            _http_bridge_reset_pending_tools_for_anchor(
+                session,
+                response_id=durable_lookup.latest_response_id,
+                account_id=durable_lookup.account_id,
+            )
             session.last_completed_response_id = durable_lookup.latest_response_id
             # The durable anchor is owned by the durable session's account, which
             # may differ from this session's account after a failover. Record the
@@ -3367,6 +3488,17 @@ class _HTTPBridgeStreamingMixin:
             elif client_full_resend_fresh_upstream_request_text is not None:
                 request_state.fresh_upstream_request_text = client_full_resend_fresh_upstream_request_text
                 request_state.fresh_upstream_request_is_retry_safe = True
+        if (
+            dashboard_settings.routing_strategy == "quota_first_balanced"
+            and payload.previous_response_id is None
+            and _sticky_key_from_turn_state_header(headers) is None
+            and not forwarded_request
+            and not account_neutral_recovery
+            and not file_required_preferred_account
+        ):
+            request_state.quota_rebalance_request_text = prepare_http_quota_rebalance(
+                session, request_state, payload.input
+            )
         initial_handoff_session = session
         initial_handoff_scope_id = ensure_request_scope_id() if original_request_unanchored else None
         if initial_handoff_scope_id is not None:
@@ -3780,12 +3912,18 @@ class _HTTPBridgeStreamingMixin:
                 effective_payload.previous_response_id is not None
                 and _http_bridge_should_attempt_local_previous_response_recovery(exc)
             )
+            owner_bound_full_resend_verified = bool(
+                durable_full_resend_proof is not None
+                and durable_full_resend_proof.matches(payload, durable_lookup)
+                and durable_lookup is not None
+                and durable_lookup.account_id == session.account.id
+            )
             previous_response_rejected_same_owner_full_resend = bool(
                 explicit_previous_response_rejection
                 and verified_stale_anchor_operation_fenced
                 and request_state.response_event_count == 0
                 and request_state.replay_count == 0
-                and durable_full_resend_retains_required_context()
+                and (durable_full_resend_retains_required_context() or owner_bound_full_resend_verified)
             )
             previous_response_rejected_full_resend = (
                 explicit_previous_response_rejection
@@ -3799,7 +3937,7 @@ class _HTTPBridgeStreamingMixin:
                 and not verified_stale_anchor_operation_fenced
                 and request_state.response_event_count == 0
                 and request_state.replay_count == 0
-                and durable_full_resend_retains_required_context()
+                and (durable_full_resend_retains_required_context() or owner_bound_full_resend_verified)
             )
             should_attempt_context_overflow_fresh_turn_recovery = (
                 is_context_overflow
@@ -4117,6 +4255,8 @@ class _HTTPBridgeStreamingMixin:
                 retry_api_key_reservation = api_key_reservation
                 retry_reservation_reacquired = False
                 if api_key is not None and api_key_reservation is not None:
+                    prepare_astra_reasoning_policy_continuation(retry_payload, api_key)
+                    validate_astra_request(retry_payload, api_key)
                     retry_api_key_reservation = await self._reserve_websocket_api_key_usage(
                         api_key,
                         request_model=retry_payload.model,

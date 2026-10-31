@@ -92,7 +92,7 @@ class TestComputePooledCredits:
         assert result.remaining_percent_primary < 80.0
         assert result.remaining_percent_secondary is not None
         assert result.remaining_percent_secondary < 90.0
-        assert result.capacity_credits_primary == 225.0 + 1500.0
+        assert result.capacity_credits_primary == 225.0 + 4500.0
 
     def test_free_tier_hides_primary_bar(self) -> None:
         acc_free = _make_account("acc-free", "free")
@@ -254,7 +254,7 @@ class TestComputePooledCredits:
             },
         )
 
-        assert result.capacity_credits_primary == 225.0 + 1500.0
+        assert result.capacity_credits_primary == 225.0 + 4500.0
         assert result.remaining_percent_primary is not None
         assert result.remaining_percent_primary > 0
 
@@ -285,3 +285,38 @@ class TestComputePooledCredits:
 
         assert result.remaining_percent_primary == pytest.approx(0.0)
         assert result.remaining_percent_secondary == pytest.approx(0.0)
+
+    def test_weekly_only_max_includes_pool_percentage_without_short_count(self) -> None:
+        max_account = _make_account("max", "promax")
+        plus_account = _make_account("plus", "plus")
+        excluded = _make_account("paused", "promax")
+        excluded.status = AccountStatus.PAUSED
+
+        result = _compute_pooled_credits(
+            assigned_account_ids=["max", "plus", "paused"],
+            all_accounts=[max_account, plus_account, excluded, _make_account("unassigned", "promax")],
+            primary_usage={
+                "max": _make_usage("max", "primary", 20.0, window_minutes=10080),
+                "plus": _make_usage("plus", "primary", 25.0),
+            },
+            secondary_usage={
+                "plus": _make_usage("plus", "secondary", 50.0, window_minutes=10080),
+                "paused": _make_usage("paused", "secondary", 10.0, window_minutes=10080),
+                "unassigned": _make_usage("unassigned", "secondary", 10.0, window_minutes=10080),
+            },
+        )
+
+        assert result.unquantified_account_count_primary == 0
+        assert result.unquantified_account_count_secondary == 0
+        assert result.remaining_percent_primary == pytest.approx(75.0)
+        assert result.remaining_percent_secondary == pytest.approx(306180 / 385560 * 100)
+
+        scoped = _compute_pooled_credits(
+            assigned_account_ids=["plus"],
+            all_accounts=[max_account, plus_account],
+            primary_usage={"plus": _make_usage("plus", "primary", 25.0)},
+            secondary_usage={"plus": _make_usage("plus", "secondary", 50.0, window_minutes=10080)},
+            account_assignment_scope_enabled=True,
+        )
+        assert scoped.unquantified_account_count_secondary == 0
+        assert scoped.remaining_percent_secondary == pytest.approx(50.0)

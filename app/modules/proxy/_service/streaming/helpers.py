@@ -1053,6 +1053,7 @@ async def _select_account_with_budget_for_stream(proxy: Any, deadline: float, **
         "preferred_account_is_continuity_owner",
         "preferred_account_overrides_single_account_routing",
         "spill_bare_session_on_account_cap",
+        "allow_burn_first_reallocation",
         "require_unambiguous_account",
     )
     if any(name in kwargs for name in optional_kwargs):

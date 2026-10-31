@@ -13,7 +13,7 @@ from app.core.balancer.logic import RATE_LIMITED_MIN_COOLDOWN_SECONDS
 from app.core.plan_types import normalize_account_plan_type
 from app.core.resilience.toggles import resolve_resilience_toggles
 from app.core.scheduling.leader_election_handle import get_leader_election as _get_leader_election
-from app.core.usage import capacity_for_plan, default_window_minutes
+from app.core.usage import capacity_for_account, default_window_minutes
 from app.core.usage.refresh_policy import USAGE_REFRESH_INTERVAL_SECONDS
 from app.core.utils.time import naive_utc_to_epoch
 from app.db.models import Account, AccountLimitWarmup, AccountStatus, UsageHistory
@@ -506,7 +506,7 @@ def _short_window_blocks_recovery(entry: UsageHistory | None, *, account: Accoun
         return False
     if _is_long_window_minutes(entry.window_minutes):
         return False
-    capacity = capacity_for_plan(account.plan_type, "primary")
+    capacity = capacity_for_account(account, "primary")
     if capacity is not None and capacity <= 0:
         return False
     return entry.reset_at is None or entry.reset_at > now
@@ -690,7 +690,7 @@ def _select_long_window_entry(
     monthly_entry: UsageHistory | None,
     secondary_entry: UsageHistory | None,
 ) -> UsageHistory | None:
-    if monthly_entry is not None and capacity_for_plan(account.plan_type, "monthly") is not None:
+    if monthly_entry is not None and capacity_for_account(account, "monthly") is not None:
         return monthly_entry
     return secondary_entry
 

@@ -578,7 +578,7 @@ class QuotaWarmupService:
         if latest_recorded_at is None:
             return False
         for window in ("secondary", "monthly"):
-            if window == "monthly" and usage_core.capacity_for_plan(account.plan_type, "monthly") is None:
+            if window == "monthly" and usage_core.capacity_for_account(account, "monthly") is None:
                 continue
             sibling = (await self._usage.latest_by_account(window=window)).get(account.id)
             if sibling is None:

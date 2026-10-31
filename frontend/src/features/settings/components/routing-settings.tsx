@@ -49,6 +49,7 @@ const WEEKLY_PACE_SMOOTHING_OPTIONS = [
 const STRATEGY_GUIDE_VALUES: Record<string, string> = {
   capacityWeighted: "capacity_weighted",
   relativeAvailability: "relative_availability",
+  quotaFirstBalanced: "quota_first_balanced",
   usageWeighted: "usage_weighted",
   roundRobin: "round_robin",
   fillFirst: "fill_first",
@@ -605,6 +606,7 @@ export function RoutingSettings({
               {[
                 "capacityWeighted",
                 "relativeAvailability",
+                "quotaFirstBalanced",
                 "usageWeighted",
                 "roundRobin",
                 "fillFirst",

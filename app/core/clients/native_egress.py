@@ -8,7 +8,7 @@ import logging
 import math
 import os
 import shutil
-from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -17,6 +17,7 @@ from typing import Protocol, cast
 from multidict import CIMultiDict
 
 from app.core.clients.stream_errors import StreamEventTooLargeError, StreamIdleTimeoutError
+from app.core.clients.websocket_dispatch import current_websocket_send_callback
 from app.core.types import JsonValue
 from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 
@@ -53,7 +54,7 @@ _NATIVE_EVENT_LINE_LIMIT = 24 * 1024 * 1024
 # the shared reader hostage.
 _NATIVE_STREAM_QUEUE_LIMIT = 4096
 _NATIVE_STREAM_QUEUE_BYTES_LIMIT = 32 * 1024 * 1024
-_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT = 64
+_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT = _NATIVE_STREAM_QUEUE_LIMIT
 _NATIVE_CANCEL_TIMEOUT_SECONDS = 2.0
 _NATIVE_WEBSOCKET_COMMAND_TIMEOUT_SECONDS = 30.0
 
@@ -61,6 +62,10 @@ _NATIVE_WEBSOCKET_COMMAND_TIMEOUT_SECONDS = 30.0
 def _event_payload_size(item: object) -> int:
     """Queued payload bytes of one helper event: its base64 ``data`` (ASCII, so
     the string length is the byte length) or UTF-8 SSE text and type metadata."""
+    if isinstance(item, NativeWebSocketMessage):
+        text_bytes = len(item.text.encode("utf-8")) if item.text is not None else 0
+        copies = 2 if item.responses_interpreted else 1
+        return copies * text_bytes + (len(item.data) if item.data is not None else 0)
     if not isinstance(item, dict):
         return 0
     data = item.get("data")
@@ -83,7 +88,7 @@ def _event_payload_size(item: object) -> int:
     return 0
 
 
-class _BoundedEventQueue(asyncio.Queue[dict[str, object] | BaseException]):
+class _ByteBoundedQueue[T](asyncio.Queue[T]):
     """``asyncio.Queue`` whose ``full()`` also trips on a queued-bytes budget.
 
     ``put_nowait`` consults ``full()`` before enqueueing, so the reader's
@@ -96,7 +101,7 @@ class _BoundedEventQueue(asyncio.Queue[dict[str, object] | BaseException]):
         self._max_bytes = max_bytes
         self.queued_bytes = 0
 
-    def put_nowait(self, item: dict[str, object] | BaseException) -> None:
+    def put_nowait(self, item: T) -> None:
         # The byte budget is enforced against the projected total, so a queue
         # just under budget rejects an event that would carry it past, while a
         # zero-byte event (``end``/``error``/``cancelled`` or a failure object)
@@ -109,14 +114,18 @@ class _BoundedEventQueue(asyncio.Queue[dict[str, object] | BaseException]):
             raise asyncio.QueueFull
         super().put_nowait(item)
 
-    def _put(self, item: dict[str, object] | BaseException) -> None:
+    def _put(self, item: T) -> None:
         super()._put(item)
         self.queued_bytes += _event_payload_size(item)
 
-    def _get(self) -> dict[str, object] | BaseException:
+    def _get(self) -> T:
         item = super()._get()
         self.queued_bytes -= _event_payload_size(item)
         return item
+
+
+class _BoundedEventQueue(_ByteBoundedQueue[dict[str, object] | BaseException]):
+    pass
 
 
 def _new_stream_queue() -> _BoundedEventQueue:
@@ -428,6 +437,12 @@ class NativeEgressResponse:
         await self.aclose()
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingWebSocketCommand:
+    future: asyncio.Future[None]
+    on_dispatched: Callable[[], None] | None
+
+
 class NativeEgressWebSocket:
     """Bidirectional WebSocket multiplexed through one native helper stream."""
 
@@ -450,10 +465,11 @@ class NativeEgressWebSocket:
         self._request_id = request_id
         self._generation = generation
         self._events = events
-        self._messages: asyncio.Queue[NativeWebSocketMessage | BaseException] = asyncio.Queue(
-            maxsize=_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT
+        self._messages = _ByteBoundedQueue[NativeWebSocketMessage | BaseException](
+            max_events=_NATIVE_WEBSOCKET_MESSAGE_QUEUE_LIMIT,
+            max_bytes=_NATIVE_STREAM_QUEUE_BYTES_LIMIT,
         )
-        self._pending: dict[str, asyncio.Future[None]] = {}
+        self._pending: dict[str, _PendingWebSocketCommand] = {}
         self._command_sequence = 0
         self._completed = False
         self._closing = False
@@ -547,7 +563,10 @@ class NativeEgressWebSocket:
         self._command_sequence += 1
         command_id = f"{self._request_id}:{self._command_sequence}"
         future = asyncio.get_running_loop().create_future()
-        self._pending[command_id] = future
+        self._pending[command_id] = _PendingWebSocketCommand(
+            future=future,
+            on_dispatched=current_websocket_send_callback() if event_type == "websocket_send_text" else None,
+        )
         try:
             await self._client._send_command(
                 self._process,
@@ -584,9 +603,15 @@ class NativeEgressWebSocket:
                     command_id = item.get("command_id")
                     if not isinstance(command_id, str):
                         raise NativeEgressProtocolError("native websocket acknowledgement is missing command_id")
-                    future = self._pending.get(command_id)
-                    if future is not None and not future.done():
-                        future.set_result(None)
+                    pending = self._pending.get(command_id)
+                    if pending is not None and not pending.future.done():
+                        # The worker emits this after socket send and before
+                        # reading again. Notify here: subsequent frames can be
+                        # consumed before the sending coroutine resumes.
+                        if pending.on_dispatched is not None:
+                            pending.on_dispatched()
+                        pending.future.set_result(None)
+                        self._pending.pop(command_id, None)
                     continue
                 if event_type == "websocket_text":
                     text = item.get("text")
@@ -704,9 +729,10 @@ class NativeEgressWebSocket:
             self._messages.put_nowait(failure)
 
     def _fail_pending(self, failure: BaseException) -> None:
-        for future in tuple(self._pending.values()):
-            if not future.done():
-                future.set_exception(failure)
+        for pending in tuple(self._pending.values()):
+            if not pending.future.done():
+                pending.future.set_exception(failure)
+        self._pending.clear()
 
     def _finish(self) -> None:
         if self._completed:

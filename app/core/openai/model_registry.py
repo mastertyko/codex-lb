@@ -120,6 +120,7 @@ _BOOTSTRAP_AVAILABLE_IN_PLANS = frozenset(
         "plus",
         "pro",
         "prolite",
+        "promax",
         "team",
         "business",
         "enterprise",
@@ -625,7 +626,19 @@ class ModelRegistry:
             if self._snapshot.account_catalogs_authoritative:
                 return frozenset()
             return None
-        return tier_accounts.get(normalized_service_tier, frozenset())
+        advertised_accounts = tier_accounts.get(normalized_service_tier, frozenset())
+        # Pro 500 includes Ultrafast, but upstream can omit its tier metadata
+        # for an account that serves the model at the same Ultrafast speed.
+        # Require positive same-model, same-plan evidence; never broaden model
+        # access or infer other tiers/plans from a peer's catalog.
+        if normalized_service_tier == "ultrafast" and any(
+            self._snapshot.account_plans.get(account_id) == "promax" for account_id in advertised_accounts
+        ):
+            model_accounts = self._snapshot.model_accounts.get(normalized_slug, frozenset())
+            return advertised_accounts | frozenset(
+                account_id for account_id in model_accounts if self._snapshot.account_plans.get(account_id) == "promax"
+            )
+        return advertised_accounts
 
     def model_advertises_service_tier(self, slug: str, service_tier: str | None) -> bool:
         """Report whether the catalog lists ``service_tier`` for ``slug`` at all.

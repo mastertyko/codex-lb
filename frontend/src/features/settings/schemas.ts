@@ -10,6 +10,7 @@ const RoutingStrategySchema = z.enum([
   "reset_drain",
   "single_account",
   "relative_availability",
+    "quota_first_balanced",
   "fill_first",
 ]);
 const UpstreamStreamTransportSchema = z.enum([

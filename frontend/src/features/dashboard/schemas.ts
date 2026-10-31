@@ -30,6 +30,7 @@ const UsageHistoryItemSchema = z.object({
   remainingPercentAvg: z.number().nullable(),
   capacityCredits: z.number(),
   remainingCredits: z.number(),
+  capacityKnown: z.boolean().default(true),
 });
 
 export const UsageWindowSchema = z.object({
@@ -42,6 +43,7 @@ const UsageSummaryWindowSchema = z.object({
   remainingPercent: z.number(),
   capacityCredits: z.number(),
   remainingCredits: z.number(),
+  unquantifiedAccountCount: z.number().int().nonnegative().default(0),
   resetAt: z.iso.datetime({ offset: true }).nullable(),
   windowMinutes: z.number().nullable(),
 });
@@ -206,7 +208,7 @@ export const RequestLogSchema = z.object({
   apiKeyId: z.string().nullable().optional().default(null),
   requestId: z.string(),
   archiveRequestId: z.string().nullable().optional(),
-  requestKind: z.enum(["normal", "warmup", "limit_warmup", "prewarm", "compaction", "realtime_live"]).optional().default("normal"),
+  requestKind: z.enum(["normal", "warmup", "limit_warmup", "prewarm", "compaction", "realtime_live", "codex_control_alpha_search"]).optional().default("normal"),
   connectionRequestKind: z.enum(["normal", "prewarm"]).nullable().optional(),
   model: z.string(),
   source: z.string().nullable().optional().default(null),
@@ -247,6 +249,10 @@ export const RequestLogSchema = z.object({
   latencyMs: z.number().nullable(),
   latencyFirstTokenMs: z.number().nullable().optional().default(null),
   latencyQueueMs: z.number().nullable().optional().default(null),
+  latencyResponseCreatedMs: z.number().nullable().optional().default(null),
+  latencyFirstUpstreamEventMs: z.number().nullable().optional().default(null),
+  latencyResponseCreateGateWaitMs: z.number().nullable().optional().default(null),
+  latencyBridgeQueueWaitMs: z.number().nullable().optional().default(null),
 });
 
 export const RequestLogsResponseSchema = z.object({
@@ -288,6 +294,9 @@ export const FilterStateSchema = z.object({
   modelOptions: z.array(z.string()),
   statuses: z.array(z.string()),
   conversationId: z.string().nullable().optional().default(null),
+  requestKinds: z.array(z.string()).default([]),
+  transports: z.array(z.string()).default([]),
+  upstreamTransports: z.array(z.string()).default([]),
   limit: z.number().int().positive(),
   offset: z.number().int().nonnegative(),
 });

@@ -229,7 +229,7 @@ class ApiKeysRepository:
             return []
         result = await self._session.execute(
             select(Account)
-            .options(load_only(Account.id, Account.plan_type, Account.status))
+            .options(load_only(Account.id, Account.plan_type, Account.status, Account.pro_legacy_allowance))
             .where(Account.id.in_(account_ids))
             # An account marked for background deletion is already deleted
             # from the operator's point of view: assignment validation must
@@ -248,7 +248,7 @@ class ApiKeysRepository:
     async def list_all_accounts(self) -> list[Account]:
         result = await self._session.execute(
             select(Account)
-            .options(load_only(Account.id, Account.plan_type, Account.status))
+            .options(load_only(Account.id, Account.plan_type, Account.status, Account.pro_legacy_allowance))
             .where(~Account.status.in_((AccountStatus.DEACTIVATED, AccountStatus.PAUSED)))
             # Status alone is not enough: an unfenced pre-upgrade replica can
             # briefly replace a marked account's terminal status during a
@@ -744,11 +744,23 @@ class ApiKeysRepository:
                 )
             )
 
+    async def add_usage_reservation_item(self, reservation_id: str, item: UsageReservationItemData) -> None:
+        self._session.add(
+            ApiKeyUsageReservationItem(
+                reservation_id=reservation_id,
+                limit_id=item.limit_id,
+                limit_type=item.limit_type.value,
+                reserved_delta=item.reserved_delta,
+                expected_reset_at=item.expected_reset_at,
+            )
+        )
+
     async def get_usage_reservation(self, reservation_id: str) -> UsageReservationData | None:
         result = await self._session.execute(
             select(ApiKeyUsageReservation)
             .options(selectinload(ApiKeyUsageReservation.items))
             .where(ApiKeyUsageReservation.id == reservation_id)
+            .execution_options(populate_existing=True)
         )
         row = result.scalar_one_or_none()
         if row is None:
@@ -769,6 +781,54 @@ class ApiKeysRepository:
                 for item in row.items
             ],
         )
+
+    async def get_usage_reservation_for_update(self, reservation_id: str) -> UsageReservationData | None:
+        result = await self._session.execute(
+            select(ApiKeyUsageReservation)
+            .options(selectinload(ApiKeyUsageReservation.items))
+            .where(ApiKeyUsageReservation.id == reservation_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return None
+        return UsageReservationData(
+            reservation_id=row.id,
+            api_key_id=row.api_key_id,
+            model=row.model,
+            status=row.status,
+            items=[
+                UsageReservationItemData(
+                    limit_id=item.limit_id,
+                    limit_type=LimitType(item.limit_type),
+                    reserved_delta=item.reserved_delta,
+                    expected_reset_at=item.expected_reset_at,
+                    actual_delta=item.actual_delta,
+                )
+                for item in row.items
+            ],
+        )
+
+    async def set_usage_reservation_item_reserved_delta(
+        self,
+        reservation_id: str,
+        *,
+        limit_id: int,
+        reserved_delta: int,
+        expected_reset_at: datetime | None = None,
+    ) -> bool:
+        values: dict[str, int | datetime] = {"reserved_delta": reserved_delta}
+        if expected_reset_at is not None:
+            values["expected_reset_at"] = expected_reset_at
+        result = await self._session.execute(
+            update(ApiKeyUsageReservationItem)
+            .where(ApiKeyUsageReservationItem.reservation_id == reservation_id)
+            .where(ApiKeyUsageReservationItem.limit_id == limit_id)
+            .values(**values)
+            .returning(ApiKeyUsageReservationItem.id)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def transition_usage_reservation_status(
         self,
@@ -857,6 +917,7 @@ class ApiKeysRepository:
         output_tokens: int | None,
         cached_input_tokens: int | None,
         cost_microdollars: int | None,
+        cache_write_input_tokens: int | None = None,
     ) -> None:
         # Reservation accounting keeps full commit durability. Settlement
         # (finalize/fail/release) is what puts completed-request usage on the
@@ -874,6 +935,7 @@ class ApiKeysRepository:
                 output_tokens=output_tokens,
                 cached_input_tokens=cached_input_tokens,
                 cost_microdollars=cost_microdollars,
+                cache_write_input_tokens=cache_write_input_tokens,
             )
         )
 

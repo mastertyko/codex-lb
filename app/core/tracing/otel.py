@@ -33,6 +33,9 @@ def _redacted_backend_live_path(path: str) -> str | None:
 
 
 def _redacted_live_trace_path(path: str) -> str | None:
+    for prefix in ("/backend-api/codex/desktop-voice", "/backend-api/codex/v1/desktop-voice"):
+        if path == prefix or path.startswith(prefix + "/"):
+            return prefix + "/<redacted>"
     if path.startswith("/v1/live/"):
         return "/v1/live/<redacted>"
     if redacted_path := _redacted_backend_live_path(path):

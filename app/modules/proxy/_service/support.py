@@ -10,7 +10,8 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, NoReturn, Protocol, cast
+from hashlib import sha256
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, cast
 
 import anyio
 
@@ -51,7 +52,24 @@ from app.modules.proxy.load_balancer import (
 from app.modules.proxy.tool_call_dedupe import ToolCallDedupeKey
 from app.modules.proxy.work_admission import AdmissionLease
 
+if TYPE_CHECKING:
+    from app.modules.proxy._service.websocket.retained import RetainedKey
+
 logger = logging.getLogger(__name__)
+
+
+def _hash_identifier(value: str) -> str:
+    digest = sha256(value.encode("utf-8")).hexdigest()
+    return f"sha256:{digest[:12]}"
+
+
+def _hash_identifier_or_none(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    return _hash_identifier(stripped)
 
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -879,9 +897,11 @@ class _StreamSettlement:
     status: str = "success"
     model: str = ""
     service_tier: str | None = None
+    upstream_transport: Literal["http", "websocket"] | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     cached_input_tokens: int | None = None
+    cache_write_input_tokens: int | None = None
     error_code: str | None = None
     error_message: str | None = None
     error: UpstreamError | None = None
@@ -1003,6 +1023,7 @@ class _WebSocketRequestState:
     reasoning_effort: str | None
     api_key_reservation: ApiKeyUsageReservationData | None
     started_at: float
+    reconnect_conversation_id: str | None = None
     responses_lite_model: str | None = None
     latency_first_token_ms: int | None = None
     ttft_reasoning_deltas: dict[tuple[str | None, int | None, int | None], _TTFTReasoningDeltaState] = field(
@@ -1023,6 +1044,9 @@ class _WebSocketRequestState:
     # send. Retries replace this value so admission wait and prior attempts do
     # not age a fresh send into the eventless owner deadline.
     response_create_sent_at: float | None = None
+    # Steering matching uses transport handoff, not the attempt timestamp or
+    # send completion: upstream can answer while the local send awaits drain.
+    response_create_dispatched: bool = False
     response_create_attempt_count: int = 0
     response_create_attempt: _HTTPBridgeResponseCreateAttempt | None = None
     bridge_queue_wait_started_at: float | None = None
@@ -1065,6 +1089,10 @@ class _WebSocketRequestState:
     request_usage_budget: ApiKeyRequestUsageBudget | None = None
     request_text: str | None = None
     replay_count: int = 0
+    # Diagnostic state follows this request across internal replay, never the session.
+    continuity_first_rejection_at: float | None = None
+    diagnostic_connection_id: str | None = None
+    diagnostic_terminal_recorded: bool = False
     # Counts only the one extra replay permitted after the initial recovery
     # replay when the replacement upstream socket also closes cleanly before
     # producing any response event.
@@ -1089,6 +1117,8 @@ class _WebSocketRequestState:
     # explicit turn-state header guarantees continuity for stale recovery.
     hard_continuity_anchor: bool = False
     proxy_injected_previous_response_id: bool = False
+    proxy_injected_anchor_connection_id: str | None = None
+    proxy_injected_anchor_retains_prior_output: bool = False
     # The durable lookup carried an anchor, but its owner was already stale,
     # ownerless, or lease-expired when this request arrived.  Such a request
     # must not be presented to the client as a retryable upstream timeout.
@@ -1117,6 +1147,8 @@ class _WebSocketRequestState:
     denied_proxy_injected_anchor_fence_request_id: str | None = None
     denied_proxy_injected_anchor_fence_was_already_denied: bool = False
     expose_stale_previous_response_classifier: bool = False
+    # Full HTTP input proven before trimming; rechecked at idle handoff.
+    quota_rebalance_request_text: str | None = None
     fresh_upstream_request_text: str | None = None
     # True only when ``fresh_upstream_request_text`` contains a *safe* pre-
     # injection form of this request that can be replayed as a fresh turn.
@@ -1254,6 +1286,12 @@ class _WebSocketRequestState:
     suppressed_duplicate_tool_call: bool = False
     pending_function_call_ids: list[str] = field(default_factory=list)
     pending_tool_call_types: dict[str, str] = field(default_factory=dict)
+    astra_client_update_efforts: tuple[str, ...] = ()
+    async_tool_call_types: dict[str, str] = field(default_factory=dict)
+    submitted_tool_output_types: dict[str, str] = field(default_factory=dict)
+    steering_parent_response_id: str | None = None
+    steering_continuation_started: bool = False
+    steering_configuration: dict[str, JsonValue] | None = None
     added_tool_call_types: dict[str, str] = field(default_factory=dict)
     tool_call_manifest_invalid: bool = False
     seen_tool_call_keys: dict[ToolCallDedupeKey, None] = field(default_factory=dict)
@@ -1393,6 +1431,7 @@ class _HTTPBridgeSession:
     last_completed_response_account_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
     last_pending_tool_calls: dict[str, str] = field(default_factory=dict)
+    pending_async_tool_calls: dict[str, str] = field(default_factory=dict)
     durable_session_id: str | None = None
     durable_owner_epoch: int | None = None
     upstream_reader: asyncio.Task[None] | None = None
@@ -1553,9 +1592,11 @@ def _http_bridge_session_supports_service_tier(
 class _WebSocketContinuityState:
     last_completed_input_count: int = 0
     last_completed_response_id: str | None = None
+    last_completed_connection_id: str | None = None
     last_completed_input_prefix_fingerprint: str | None = None
     last_pending_function_call_ids: list[str] = field(default_factory=list)
     last_pending_tool_call_types: dict[str, str] = field(default_factory=dict)
+    pending_async_tool_calls: dict[str, str] = field(default_factory=dict)
     responses_lite_model: str | None = None
     responses_lite_response_id: str | None = None
 
@@ -1567,7 +1608,38 @@ class _WebSocketContinuityAnchor:
 
 
 @dataclass(slots=True)
+class _WebSocketSteerSubmission:
+    input: JsonValue
+    wire_bytes: int
+    request_usage_budget: ApiKeyRequestUsageBudget
+    request_service_tier: str | None
+    id: str | None = None
+    acknowledged: bool = False
+
+
+@dataclass(slots=True)
+class _WebSocketSteeringContinuation:
+    parent: _WebSocketRequestState
+    request_state: _WebSocketRequestState
+    submissions: list[_WebSocketSteerSubmission] = field(default_factory=list)
+    required_input: list[JsonValue] | None = None
+    explicit_request_prepared: bool = False
+    queued_input_bytes: int = 0
+
+
+@dataclass(slots=True)
 class _WebSocketUpstreamControl:
+    reconnect_key: RetainedKey | None = None
+    completed_response_delivered: bool = False
+    retaining_for_reconnect: bool = False
+    diagnostic_connection_id: str | None = None
+    diagnostic_opened_at: float | None = None
+    retired_steering_requests: list[_WebSocketRequestState] = field(default_factory=list)
+    steering_continuations: dict[str, _WebSocketSteeringContinuation] = field(default_factory=dict)
+    rejected_steering_parent_ids: set[str] = field(default_factory=set)
+    suppressed_steering_response_ids: set[str] = field(default_factory=set)
+    suppressed_steering_anonymous_terminals: int = 0
+    last_completed_request: _WebSocketRequestState | None = None
     reconnect_requested: bool = False
     retire_after_drain: bool = False
     suppress_downstream_event: bool = False
@@ -2120,3 +2192,54 @@ def configured_upstream_stream_transport(dashboard_settings: Any) -> str:
 def upstream_websocket_transport_recently_failed() -> bool:
     marked_at = _upstream_ws_transport_failure_at
     return marked_at is not None and time.monotonic() - marked_at < UPSTREAM_WS_TRANSPORT_FAILURE_TTL_SECONDS
+
+
+_ASYNC_CALL_TYPES = frozenset({"function_call", "custom_tool_call"})
+_CALL_TYPE_BY_OUTPUT = {
+    "function_call_output": "function_call",
+    "custom_tool_call_output": "custom_tool_call",
+    "apply_patch_call_output": "apply_patch_call",
+}
+
+
+def submitted_tool_output_types(input_items: JsonValue) -> dict[str, str]:
+    """Keep protocol identity when consuming delayed application results."""
+    result: dict[str, str] = {}
+    if not isinstance(input_items, list):
+        return result
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        call_type = _CALL_TYPE_BY_OUTPUT.get(item_type) if isinstance(item_type, str) else None
+        call_id = item.get("call_id")
+        if call_type is not None and isinstance(call_id, str) and call_id and "output" in item:
+            result[call_id] = call_type
+    return result
+
+
+def record_async_tool_call(request_state: _WebSocketRequestState, payload: dict[str, JsonValue] | None) -> None:
+    if payload is None:
+        return
+    items: list[JsonValue] = []
+    if payload.get("type") == "response.output_item.done":
+        items = [payload.get("item")]
+    elif payload.get("type") in {"response.completed", "response.incomplete"}:
+        response = payload.get("response")
+        output = response.get("output") if isinstance(response, dict) else None
+        if isinstance(output, list):
+            items = output
+    for item in items:
+        if not isinstance(item, dict) or item.get("async") is not True:
+            continue
+        item_type = item.get("type")
+        call_id = item.get("call_id")
+        if isinstance(item_type, str) and item_type in _ASYNC_CALL_TYPES and isinstance(call_id, str) and call_id:
+            request_state.async_tool_call_types[call_id] = item_type
+
+
+def update_pending_async_tools(pending: dict[str, str], request_state: _WebSocketRequestState) -> None:
+    for call_id, call_type in request_state.submitted_tool_output_types.items():
+        if pending.get(call_id) == call_type:
+            del pending[call_id]
+    pending.update(request_state.async_tool_call_types)

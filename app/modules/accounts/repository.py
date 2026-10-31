@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth import extract_id_token_claims, resolve_seat_identity
 from app.core.crypto import TokenEncryptor
+from app.core.plan_types import normalize_account_plan_type
 from app.core.upstream_proxy.cache import get_upstream_route_cache
 from app.core.utils.time import utcnow
 from app.db.account_identity_lock import advisory_lock_key, lock_postgresql_account_identities
@@ -188,6 +189,10 @@ class AccountIdentityConflictError(Exception):
         )
 
 
+class ProLegacyAllowancePlanError(Exception):
+    """Legacy allowance can only be selected for a Pro account."""
+
+
 class AccountIdentityRelockError(RuntimeError):
     """Raised after identity membership changes across both bounded lock attempts."""
 
@@ -215,6 +220,20 @@ class AccountsRepository:
             select(Account).where(Account.id == account_id).execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
+
+    async def find_desktop_owners(self, *, user_id: str, workspace_id: str) -> list[Account]:
+        """Load at most two exact, nondeleted seats; never guess among duplicates."""
+        result = await self._session.execute(
+            select(Account)
+            .where(
+                Account.chatgpt_user_id == user_id,
+                Account.chatgpt_account_id == workspace_id,
+                Account.delete_requested_at.is_(None),
+            )
+            .limit(2)
+            .execution_options(populate_existing=True)
+        )
+        return list(result.scalars().all())
 
     async def list_accounts(self, *, refresh_existing: bool = False) -> list[Account]:
         # Accounts marked for background deletion are already deleted from the
@@ -761,7 +780,26 @@ class AccountsRepository:
             return updated_id is not None
 
     async def update_security_work_authorized(self, account_id: str, enabled: bool) -> bool:
+        return await self.update_account_preferences(account_id, security_work_authorized=enabled)
+
+    async def update_account_preferences(
+        self,
+        account_id: str,
+        *,
+        security_work_authorized: bool | None = None,
+        pro_legacy_allowance: bool | None = None,
+    ) -> bool:
         async with sqlite_writer_section():
+            account = await self._session.scalar(select(Account).where(Account.id == account_id).with_for_update())
+            if account is None or account.delete_requested_at is not None:
+                return False
+            if pro_legacy_allowance is True and normalize_account_plan_type(account.plan_type) != "pro":
+                raise ProLegacyAllowancePlanError()
+            values: dict[str, bool] = {}
+            if security_work_authorized is not None:
+                values["security_work_authorized"] = security_work_authorized
+            if pro_legacy_allowance is not None:
+                values["pro_legacy_allowance"] = pro_legacy_allowance
             result = await self._session.execute(
                 update(Account)
                 .where(Account.id == account_id)
@@ -769,7 +807,7 @@ class AccountsRepository:
                 # perspective: ID-based mutations must report not-found, as the
                 # synchronous delete did once the row was removed.
                 .where(Account.delete_requested_at.is_(None))
-                .values(security_work_authorized=enabled)
+                .values(**values)
                 .returning(Account.id)
             )
             await self._session.commit()
@@ -1258,7 +1296,7 @@ class AccountsRepository:
         async with sqlite_writer_section():
             if self._dialect_name() == "postgresql":
                 await self._lock_postgresql_account_identity_membership(account_id, chatgpt_account_id)
-            values: dict[str, bytes | datetime | str] = {
+            values: dict[str, bytes | datetime | str | bool] = {
                 "access_token_encrypted": access_token_encrypted,
                 "refresh_token_encrypted": refresh_token_encrypted,
                 "id_token_encrypted": id_token_encrypted,
@@ -1266,6 +1304,8 @@ class AccountsRepository:
             }
             if plan_type is not None:
                 values["plan_type"] = plan_type
+                if normalize_account_plan_type(plan_type) != "pro":
+                    values["pro_legacy_allowance"] = False
             if email is not None:
                 values["email"] = email
             if chatgpt_account_id is not None:
@@ -1318,9 +1358,11 @@ class AccountsRepository:
         async with sqlite_writer_section():
             if self._dialect_name() == "postgresql":
                 await self._lock_postgresql_account_identity_membership(account_id, chatgpt_account_id)
-            values: dict[str, str | datetime] = {}
+            values: dict[str, str | datetime | bool] = {}
             if plan_type is not None:
                 values["plan_type"] = plan_type
+                if normalize_account_plan_type(plan_type) != "pro":
+                    values["pro_legacy_allowance"] = False
             if email is not None:
                 values["email"] = email
             if chatgpt_account_id is not None:
@@ -1574,6 +1616,8 @@ def _apply_account_updates(target: Account, source: Account) -> None:
         target.seat_type = source.seat_type
     if not target.codex_installation_id:
         target.codex_installation_id = source.codex_installation_id or str(uuid.uuid4())
+    if normalize_account_plan_type(source.plan_type) != "pro":
+        target.pro_legacy_allowance = False
     target.plan_type = source.plan_type
     target.access_token_encrypted = source.access_token_encrypted
     target.refresh_token_encrypted = source.refresh_token_encrypted

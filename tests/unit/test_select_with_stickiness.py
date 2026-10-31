@@ -15,13 +15,21 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from app.core.balancer import AccountState, RoutingCost, RoutingCostsByAccount, RoutingStrategy
+from app.core.balancer import (
+    HEALTH_TIER_DRAINING,
+    HEALTH_TIER_PROBING,
+    AccountState,
+    RoutingCost,
+    RoutingCostsByAccount,
+    RoutingStrategy,
+)
 from app.core.clock import REAL_CLOCK, Clock
 from app.db.models import Account, AccountStatus, StickySessionKind
 from app.modules.proxy._load_balancer.sticky_selection import (
     _STICKY_EXISTING_UNSET,
     _sticky_refresh_write_skippable,
 )
+from app.modules.proxy._load_balancer.types import RuntimeState
 from app.modules.proxy.load_balancer import LoadBalancer
 from tests.simulation.virtual_time import VirtualClock
 
@@ -86,6 +94,9 @@ async def _invoke_stickiness(
     routing_costs_by_account_id: RoutingCostsByAccount | None = None,
     sticky_refresh_skip_deadline: datetime | None = None,
     sticky_existing_account_id: str | None | object = _STICKY_EXISTING_UNSET,
+    initial_preferred_account_id: str | None = None,
+    preserve_existing_mapping_on_fallback: bool = False,
+    overload_backoff_runtime: dict[str, RuntimeState] | None = None,
     clock: Clock = REAL_CLOCK,
 ):
     """Wrapper that calls production LoadBalancer._select_with_stickiness.
@@ -99,6 +110,8 @@ async def _invoke_stickiness(
         yield AsyncMock()
 
     lb = LoadBalancer(mock_repo_factory, clock=clock)
+    if overload_backoff_runtime is not None:
+        lb._runtime.update(overload_backoff_runtime)
     account_map = {s.account_id: cast(Account, AsyncMock()) for s in states}
 
     outcome = await lb._select_with_stickiness(
@@ -119,6 +132,9 @@ async def _invoke_stickiness(
         routing_costs_by_account_id=routing_costs_by_account_id,
         sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
         sticky_existing_account_id=sticky_existing_account_id,
+        initial_preferred_account_id=initial_preferred_account_id,
+        allow_burn_first_reallocation=True,
+        preserve_existing_mapping_on_fallback=preserve_existing_mapping_on_fallback,
     )
     # Mirror the production persist site (run_sticky_selection_path): a pure
     # same-owner freshness rewrite is omitted only after revalidating its
@@ -1143,6 +1159,93 @@ async def test_burn_first_reallocation_only_when_burn_first_is_selectable():
     assert result.account.account_id == "a"
     repo.delete.assert_not_called()
     repo.upsert.assert_called_once_with("key1", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", [StickySessionKind.PROMPT_CACHE, StickySessionKind.STICKY_THREAD])
+@pytest.mark.parametrize("initial_preference", [False, True])
+async def test_burn_first_overrides_soft_preference_without_budget_pressure(kind, initial_preference):
+    states = [_active("a", used_percent=5), _active("b", used_percent=70, routing_policy="burn_first")]
+    repo = _make_sticky_repo(existing_account_id=None if initial_preference else "a")
+
+    result = await _invoke_stickiness(
+        states,
+        "burn-thread",
+        repo,
+        sticky_kind=kind,
+        routing_strategy="quota_first_balanced",
+        initial_preferred_account_id="a" if initial_preference else None,
+    )
+
+    assert result.account.account_id == "b"
+    repo.upsert.assert_called_once_with("burn-thread", "b", kind=kind)
+    repo.delete.assert_not_called()
+
+    # A lower-usage burn-first sibling must not cause another cache-cold move.
+    repo.reset_mock()
+    repo.get_account_id.return_value = "b"
+    states.append(_active("c", used_percent=1, routing_policy="burn_first"))
+    result = await _invoke_stickiness(states, "burn-thread", repo, sticky_kind=kind)
+    assert result.account.account_id == "b"
+    repo.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unavailable", ["quota", "cooldown", "health", "probe"])
+async def test_burn_first_soft_rebind_respects_full_pool_eligibility(unavailable):
+    burn = _active("b", routing_policy="burn_first")
+    if unavailable == "quota":
+        burn.used_percent = 100
+        burn.status = AccountStatus.QUOTA_EXCEEDED
+        burn.reset_at = time.time() + 3600
+        burn.primary_reset_at = int(burn.reset_at)
+    elif unavailable == "cooldown":
+        burn.cooldown_until = time.time() + 3600
+    elif unavailable == "health":
+        burn.health_tier = HEALTH_TIER_DRAINING
+    else:
+        burn.health_tier = HEALTH_TIER_PROBING
+    repo = _make_sticky_repo(existing_account_id="a")
+
+    result = await _invoke_stickiness([_active("a"), burn], "burn-thread", repo)
+
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+    repo.upsert.assert_called_once_with("burn-thread", "a", kind=StickySessionKind.PROMPT_CACHE)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("strategy", ["single_account", "sequential_drain", "reset_drain"])
+async def test_burn_first_does_not_override_drain_strategy_affinity(strategy):
+    repo = _make_sticky_repo(existing_account_id="a")
+    result = await _invoke_stickiness(
+        [_active("a"), _active("b", routing_policy="burn_first")],
+        "burn-thread",
+        repo,
+        routing_strategy=strategy,
+    )
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["ambiguous_owner", "overload", "burst"])
+async def test_burn_first_preserves_ambiguity_and_overload_guards(guard):
+    repo = _make_sticky_repo(existing_account_id="a")
+    burn_runtime = RuntimeState()
+    if guard == "overload":
+        burn_runtime.overload_backoff_until = time.time() + 3600
+    elif guard == "burst":
+        burn_runtime.burst_backoff_until = time.time() + 3600
+    result = await _invoke_stickiness(
+        [_active("a"), _active("b", routing_policy="burn_first")],
+        "burn-thread",
+        repo,
+        preserve_existing_mapping_on_fallback=guard == "ambiguous_owner",
+        overload_backoff_runtime={"b": burn_runtime},
+    )
+    assert result.account.account_id == "a"
+    repo.delete.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

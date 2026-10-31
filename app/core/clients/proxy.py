@@ -25,6 +25,7 @@ from typing import (
     Awaitable,
     Callable,
     Final,
+    Literal,
     Mapping,
     Protocol,
     Sequence,
@@ -48,6 +49,7 @@ from app.core.clients.codex import (
     require_route_or_direct_egress_opt_in,
 )
 from app.core.clients.codex_version import get_codex_version_cache
+from app.core.clients.headers import CODEX_LB_KEY_HEADER
 from app.core.clients.http import acquire_http_client, lease_http_session
 from app.core.clients.native_egress import (
     NativeEgressClient,
@@ -166,6 +168,7 @@ CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE: Final = CodexWireProfile(
 )
 
 IGNORE_INBOUND_HEADERS = {
+    CODEX_LB_KEY_HEADER,
     "authorization",
     "chatgpt-account-id",
     "content-length",
@@ -359,6 +362,7 @@ _TRANSCRIBE_TOTAL_TIMEOUT_OVERRIDE: contextvars.ContextVar[float | None] = conte
 
 @dataclass(slots=True)
 class UpstreamProxyRouteTrace:
+    transport: Literal["http", "websocket"] | None = None
     mode: str | None = None
     pool_id: str | None = None
     endpoint_id: str | None = None
@@ -1068,6 +1072,8 @@ def _build_upstream_transcribe_headers(
         headers["chatgpt-account-id"] = account_id
     for key, value in inbound.items():
         lower = key.lower()
+        if lower == CODEX_LB_KEY_HEADER:
+            continue
         if lower == "user-agent":
             headers[key] = value
         elif lower.startswith(_TRANSCRIBE_FORWARD_HEADER_PREFIXES):
@@ -2918,6 +2924,8 @@ async def _stream_responses_via_websocket(
     owns_codex_client = False
     websocket_context: Any | None = None
     active_codex_client: CodexClient | None = None
+    if route_trace is not None:
+        route_trace.transport = "websocket"
     if route is not None:
         owns_codex_client = codex_client is None
         active_codex_client = codex_client or CodexClient(create_codex_session())
@@ -3888,6 +3896,8 @@ async def _stream_responses_with_session(
     ) -> AsyncGenerator[str, None]:
         nonlocal status_code, last_stream_activity_at, error_code, error_message, seen_terminal
 
+        if route_trace is not None:
+            route_trace.transport = "http"
         if route is not None:
             owns_codex_client = codex_client is None
             active_codex_client = codex_client or CodexClient(

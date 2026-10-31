@@ -110,7 +110,10 @@ from app.modules.proxy.helpers import (
 )
 from app.modules.proxy.http_continuation import http_continuation_signal
 from app.modules.proxy.load_balancer import AccountLease, AccountSelection
-from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
+from app.modules.proxy.replay_safety import (
+    project_responses_input_retaining_prior_output,
+    responses_payload_is_account_neutral_fresh_replay,
+)
 from app.modules.proxy.selection_errors import USAGE_LIMIT_REACHED, selection_failure_response
 
 _REQUEST_TRANSPORT_HTTP = "http"
@@ -136,6 +139,25 @@ _POST_REFRESH_TRANSIENT_EXHAUSTED_ATTR = "_codex_lb_post_refresh_transient_exhau
 # replica-local burst cooldown, never ``record_error``), but every surfaced
 # pre-visible failure is penalized once by construction.
 _STREAM_HEALTH_RECORDED_ATTR = "_codex_lb_stream_health_recorded"
+
+
+def _response_failed_event_from_upstream_error(
+    code: str,
+    error: UpstreamError,
+    *,
+    response_id: str | None,
+) -> Any:
+    """Build a terminal event without dropping the upstream reset timestamp."""
+    message = str(error.get("message") or "Upstream error")
+    resets_at = error.get("resets_at")
+    if isinstance(resets_at, bool) or not isinstance(resets_at, int | float):
+        resets_at = None
+    return response_failed_event(
+        code,
+        message,
+        response_id=response_id,
+        resets_at=resets_at,
+    )
 
 
 def _resolve_http_downstream_transport(policy: str, *, payload: ResponsesRequest, headers: Mapping[str, str]) -> str:
@@ -193,6 +215,23 @@ def _verified_cross_transport_fresh_replay(
     if not responses_payload_is_account_neutral_fresh_replay(fresh_payload.to_replay_safety_payload()):
         return None
     return fresh_payload
+
+
+def _project_unanchored_account_neutral_replay(payload: ResponsesRequest) -> ResponsesRequest | None:
+    """Strip response-owned bookkeeping from an otherwise self-contained request."""
+
+    if payload.previous_response_id not in (None, "") or payload.conversation not in (None, ""):
+        return None
+    input_value = payload.input
+    if not isinstance(input_value, list) or not input_value or extract_input_file_ids(input_value):
+        return None
+    projection = project_responses_input_retaining_prior_output(cast(list[Any], input_value))
+    if projection is None:
+        return None
+    projected = payload.model_copy(update={"input": projection.input_items})
+    if not responses_payload_is_account_neutral_fresh_replay(projected.to_replay_safety_payload()):
+        return None
+    return projected
 
 
 def _effective_http_downstream_transport_policy(
@@ -898,7 +937,7 @@ class _StreamingRetryMixin:
                 reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                 service_tier=payload.service_tier,
                 transport=request_transport,
-                upstream_transport=upstream_stream_transport,
+                upstream_transport=None,
                 useragent=useragent,
                 useragent_group=useragent_group,
                 conversation_id=conversation_id,
@@ -946,6 +985,32 @@ class _StreamingRetryMixin:
             affinity = replace(affinity, reallocate_sticky=True)
             logger.info(
                 "cross_transport_verified_fresh_replay request_id=%s outcome=%s account_id=%s",
+                request_id,
+                outcome,
+                account_id,
+            )
+            return True
+
+        def _move_previsible_quota_rejection_from_soft_owner(*, account_id: str, outcome: str) -> bool:
+            """Make a rejected full resend portable without crossing hard ownership."""
+
+            nonlocal affinity, payload, payload_replay_required_account_id
+            if (
+                payload_replay_required_account_id != account_id
+                or require_preferred_account
+                or file_preferred_account_id is not None
+                or turn_state_owner_account_id is not None
+                or routing_strategy == "single_account"
+            ):
+                return False
+            projected = _project_unanchored_account_neutral_replay(payload)
+            if projected is None:
+                return False
+            payload = projected
+            payload_replay_required_account_id = None
+            affinity = replace(affinity, reallocate_sticky=True)
+            logger.info(
+                "previsible_quota_account_neutral_replay request_id=%s outcome=%s account_id=%s",
                 request_id,
                 outcome,
                 account_id,
@@ -1130,9 +1195,9 @@ class _StreamingRetryMixin:
                         setattr(retry_exc, _POST_REFRESH_TRANSIENT_EXHAUSTED_ATTR, True)
                         raise retry_exc from exc
                     yield format_sse_event(
-                        response_failed_event(
+                        _response_failed_event_from_upstream_error(
                             exc.code,
-                            error_message,
+                            exc.error,
                             response_id=settlement.response_id or request_id,
                         )
                     )
@@ -1200,7 +1265,7 @@ class _StreamingRetryMixin:
             upstream_transport_metric_recorded = True
             _record_upstream_transport_decision(
                 downstream_transport=request_transport,
-                upstream_transport=upstream_stream_transport,
+                upstream_transport=settlement.upstream_transport,
                 policy=upstream_transport_policy_label,
                 sticky=upstream_transport_sticky,
                 status=status,
@@ -1241,7 +1306,7 @@ class _StreamingRetryMixin:
                     error_message=error_message,
                     reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                     transport=request_transport,
-                    upstream_transport=upstream_stream_transport,
+                    upstream_transport=None,
                     service_tier=payload.service_tier,
                     requested_service_tier=payload.service_tier,
                     useragent=useragent,
@@ -1358,7 +1423,7 @@ class _StreamingRetryMixin:
                             error_message=message,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             service_tier=payload.service_tier,
                             requested_service_tier=payload.service_tier,
                             useragent=useragent,
@@ -1399,7 +1464,7 @@ class _StreamingRetryMixin:
                         reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                         service_tier=payload.service_tier,
                         transport=request_transport,
-                        upstream_transport=upstream_stream_transport,
+                        upstream_transport=None,
                         useragent=useragent,
                         useragent_group=useragent_group,
                         conversation_id=conversation_id,
@@ -1459,7 +1524,7 @@ class _StreamingRetryMixin:
                                 reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                                 service_tier=payload.service_tier,
                                 transport=request_transport,
-                                upstream_transport=upstream_stream_transport,
+                                upstream_transport=None,
                                 useragent=useragent,
                                 useragent_group=useragent_group,
                                 conversation_id=conversation_id,
@@ -1657,7 +1722,7 @@ class _StreamingRetryMixin:
                             error_message=no_accounts_msg,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             service_tier=payload.service_tier,
                             requested_service_tier=payload.service_tier,
                             useragent=useragent,
@@ -1698,7 +1763,7 @@ class _StreamingRetryMixin:
                             error_message=no_accounts_msg,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             service_tier=payload.service_tier,
                             requested_service_tier=payload.service_tier,
                             useragent=useragent,
@@ -1737,12 +1802,12 @@ class _StreamingRetryMixin:
                     if propagate_http_errors and last_transient_exc is not None:
                         raise last_transient_exc
                     if last_retryable_stream_error is not None:
-                        error_message = str(last_retryable_stream_error.error.get("message") or "Upstream error")
-                        event = response_failed_event(
+                        event = _response_failed_event_from_upstream_error(
                             last_retryable_stream_error.code,
-                            error_message,
+                            last_retryable_stream_error.error,
                             response_id=request_id,
                         )
+                        error_message = str(last_retryable_stream_error.error.get("message") or "Upstream error")
                         yield format_sse_event(event)
                         await proxy._write_request_log(
                             affinity_observation=affinity_observation,
@@ -1756,7 +1821,7 @@ class _StreamingRetryMixin:
                             error_message=error_message,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             service_tier=payload.service_tier,
                             requested_service_tier=payload.service_tier,
                             useragent=useragent,
@@ -1803,7 +1868,7 @@ class _StreamingRetryMixin:
                             error_message=message,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             service_tier=payload.service_tier,
                             requested_service_tier=payload.service_tier,
                             useragent=useragent,
@@ -1840,7 +1905,7 @@ class _StreamingRetryMixin:
                             error_message=message,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             service_tier=payload.service_tier,
                             requested_service_tier=payload.service_tier,
                             useragent=useragent,
@@ -1872,7 +1937,7 @@ class _StreamingRetryMixin:
                         error_message=no_accounts_msg,
                         reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                         transport=request_transport,
-                        upstream_transport=upstream_stream_transport,
+                        upstream_transport=None,
                         service_tier=payload.service_tier,
                         requested_service_tier=payload.service_tier,
                         useragent=useragent,
@@ -1957,7 +2022,7 @@ class _StreamingRetryMixin:
                             error_message=message,
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             service_tier=payload.service_tier,
                             requested_service_tier=payload.service_tier,
                             useragent=useragent,
@@ -1988,7 +2053,7 @@ class _StreamingRetryMixin:
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             service_tier=payload.service_tier,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             useragent=useragent,
                             useragent_group=useragent_group,
                             conversation_id=conversation_id,
@@ -2014,7 +2079,7 @@ class _StreamingRetryMixin:
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             service_tier=payload.service_tier,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             upstream_proxy_fail_closed_reason=exc.reason,
                             useragent=useragent,
                             useragent_group=useragent_group,
@@ -2116,7 +2181,7 @@ class _StreamingRetryMixin:
                                     reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                                     service_tier=payload.service_tier,
                                     transport=request_transport,
-                                    upstream_transport=upstream_stream_transport,
+                                    upstream_transport=None,
                                     useragent=useragent,
                                     useragent_group=useragent_group,
                                     conversation_id=conversation_id,
@@ -2214,7 +2279,7 @@ class _StreamingRetryMixin:
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             service_tier=payload.service_tier,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             useragent=useragent,
                             useragent_group=useragent_group,
                             conversation_id=conversation_id,
@@ -2251,7 +2316,7 @@ class _StreamingRetryMixin:
                             reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                             service_tier=payload.service_tier,
                             transport=request_transport,
-                            upstream_transport=upstream_stream_transport,
+                            upstream_transport=None,
                             useragent=useragent,
                             useragent_group=useragent_group,
                             conversation_id=conversation_id,
@@ -2427,19 +2492,28 @@ class _StreamingRetryMixin:
                                 transient_upstream_http_status = (
                                     tex.status_code if isinstance(tex, ProxyResponseError) else None
                                 )
-                                if not (
+                                if (
                                     preserve_native_failure_lifecycle
                                     and error_code in SYNTHETIC_TRANSPORT_FAILURE_CODES
+                                    and not (isinstance(tex, ProxyResponseError) and tex.local_pre_dispatch_refusal)
                                 ):
-                                    try:
-                                        yield format_sse_event(event)
-                                    except (asyncio.CancelledError, GeneratorExit):
-                                        await _finalize_terminal_settlement_after_downstream_close(
-                                            settlement,
-                                            account,
-                                            upstream_http_status=transient_upstream_http_status,
-                                        )
-                                        raise
+                                    # The response is already committed and the
+                                    # client has seen upstream bytes. Preserve
+                                    # the transport provenance for the public
+                                    # normalizer; it turns this marker into the
+                                    # one native retryable terminal event. Do
+                                    # not expose this egress code to account
+                                    # health or request-log classification.
+                                    event = synthetic_transport_failure_event(event)
+                                try:
+                                    yield format_sse_event(event)
+                                except (asyncio.CancelledError, GeneratorExit):
+                                    await _finalize_terminal_settlement_after_downstream_close(
+                                        settlement,
+                                        account,
+                                        upstream_http_status=transient_upstream_http_status,
+                                    )
+                                    raise
                                 settled = await _settle_stream_usage_before_pending_penalty(settlement)
                                 if settled and settlement.account_health_error:
                                     await proxy._handle_stream_error(
@@ -2629,6 +2703,15 @@ class _StreamingRetryMixin:
                                     http_status=tex.status_code,
                                 )
                                 if resilience.deterministic_failover_enabled:
+                                    if (
+                                        not settlement.downstream_visible
+                                        and attempt < max_attempts - 1
+                                        and classified["failure_class"] in ("rate_limit", "quota")
+                                    ):
+                                        _move_previsible_quota_rejection_from_soft_owner(
+                                            account_id=account.id,
+                                            outcome="owner_previsible_status_quota_rejection",
+                                        )
                                     action = failover_decision(
                                         failure_class=classified["failure_class"],
                                         downstream_visible=settlement.downstream_visible,
@@ -2719,10 +2802,18 @@ class _StreamingRetryMixin:
                                     await _release_tracked_stream_lease(current_account_lease)
                                     current_account_lease = None
                                     excluded_account_ids.add(account.id)
-                                    _move_verified_fresh_replay_from_owner(
+                                    verified_owner_replay_moved = _move_verified_fresh_replay_from_owner(
                                         account_id=account.id,
                                         outcome="owner_previsible_failure",
                                     )
+                                    if not verified_owner_replay_moved and classified["failure_class"] in (
+                                        "rate_limit",
+                                        "quota",
+                                    ):
+                                        _move_previsible_quota_rejection_from_soft_owner(
+                                            account_id=account.id,
+                                            outcome="owner_previsible_quota_rejection",
+                                        )
                                     break
                                 await proxy._handle_stream_error(
                                     account,
@@ -2872,10 +2963,25 @@ class _StreamingRetryMixin:
                         await _release_tracked_stream_lease(current_account_lease)
                         current_account_lease = None
                         excluded_account_ids.add(account.id)
-                    _move_verified_fresh_replay_from_owner(
+                    failure_class = classify_upstream_failure(
+                        error_code=exc.code,
+                        error=exc.error,
+                        http_status=None,
+                        phase="first_event",
+                    )["failure_class"]
+                    verified_owner_replay_moved = _move_verified_fresh_replay_from_owner(
                         account_id=account.id,
                         outcome="owner_previsible_retryable_failure",
                     )
+                    if (
+                        not verified_owner_replay_moved
+                        and resilience.deterministic_failover_enabled
+                        and failure_class in ("rate_limit", "quota")
+                    ):
+                        _move_previsible_quota_rejection_from_soft_owner(
+                            account_id=account.id,
+                            outcome="owner_previsible_retryable_quota_rejection",
+                        )
                     continue
                 except _TerminalStreamError:
                     if settlement.settlement_order_required:
@@ -2945,7 +3051,7 @@ class _StreamingRetryMixin:
                                 reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                                 service_tier=payload.service_tier,
                                 transport=request_transport,
-                                upstream_transport=upstream_stream_transport,
+                                upstream_transport=None,
                                 useragent=useragent,
                                 useragent_group=useragent_group,
                                 conversation_id=conversation_id,
@@ -3040,7 +3146,7 @@ class _StreamingRetryMixin:
                                         reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                                         service_tier=payload.service_tier,
                                         transport=request_transport,
-                                        upstream_transport=upstream_stream_transport,
+                                        upstream_transport=None,
                                         useragent=useragent,
                                         useragent_group=useragent_group,
                                         conversation_id=conversation_id,
@@ -3113,7 +3219,7 @@ class _StreamingRetryMixin:
                                 reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                                 service_tier=payload.service_tier,
                                 transport=request_transport,
-                                upstream_transport=upstream_stream_transport,
+                                upstream_transport=None,
                                 useragent=useragent,
                                 useragent_group=useragent_group,
                                 conversation_id=conversation_id,
@@ -3148,7 +3254,7 @@ class _StreamingRetryMixin:
                                 reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                                 service_tier=payload.service_tier,
                                 transport=request_transport,
-                                upstream_transport=upstream_stream_transport,
+                                upstream_transport=None,
                                 useragent=useragent,
                                 useragent_group=useragent_group,
                                 conversation_id=conversation_id,
@@ -3440,10 +3546,18 @@ class _StreamingRetryMixin:
                                 last_transient_exc = retry_exc
                                 await _release_tracked_stream_lease(current_account_lease)
                                 current_account_lease = None
-                                _move_verified_fresh_replay_from_owner(
+                                verified_owner_replay_moved = _move_verified_fresh_replay_from_owner(
                                     account_id=account.id,
                                     outcome="owner_post_refresh_failure",
                                 )
+                                if not verified_owner_replay_moved and classified["failure_class"] in (
+                                    "rate_limit",
+                                    "quota",
+                                ):
+                                    _move_previsible_quota_rejection_from_soft_owner(
+                                        account_id=account.id,
+                                        outcome="owner_post_refresh_quota_rejection",
+                                    )
                                 excluded_account_ids.add(account.id)
                                 continue
                             health_write_allowed = await _drain_pending_post_refresh_penalty_on_terminal(settlement)
@@ -3603,19 +3717,19 @@ class _StreamingRetryMixin:
                 yield _render_dispatch_transport_error(last_pre_dispatch_transport_error)
                 return
             if last_retryable_stream_error is not None:
-                retries_exhausted_msg = str(last_retryable_stream_error.error.get("message") or "Upstream error")
-                event = response_failed_event(
+                event = _response_failed_event_from_upstream_error(
                     last_retryable_stream_error.code,
-                    retries_exhausted_msg,
+                    last_retryable_stream_error.error,
                     response_id=request_id,
                 )
+                retries_exhausted_msg = str(last_retryable_stream_error.error.get("message") or "Upstream error")
                 if last_retryable_stream_error.code in SYNTHETIC_TRANSPORT_FAILURE_CODES:
                     event = synthetic_transport_failure_event(event)
-                if not (
-                    preserve_native_failure_lifecycle
-                    and last_retryable_stream_error.code in SYNTHETIC_TRANSPORT_FAILURE_CODES
-                ):
-                    yield format_sse_event(event)
+                # A committed native Responses body must receive a terminal
+                # event even when every account attempt was exhausted before
+                # the first visible frame. The normalizer translates the
+                # internal transport marker to the native retryable code.
+                yield format_sse_event(event)
                 if not any_attempt_logged:
                     await proxy._write_request_log(
                         affinity_observation=affinity_observation,
@@ -3629,7 +3743,7 @@ class _StreamingRetryMixin:
                         error_message=retries_exhausted_msg,
                         reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                         transport=request_transport,
-                        upstream_transport=upstream_stream_transport,
+                        upstream_transport=None,
                         service_tier=payload.service_tier,
                         requested_service_tier=payload.service_tier,
                         useragent=useragent,
@@ -3685,7 +3799,7 @@ class _StreamingRetryMixin:
                     error_message=retries_exhausted_msg,
                     reasoning_effort=payload.reasoning.effort if payload.reasoning else None,
                     transport=request_transport,
-                    upstream_transport=upstream_stream_transport,
+                    upstream_transport=None,
                     service_tier=payload.service_tier,
                     requested_service_tier=payload.service_tier,
                     useragent=useragent,

@@ -326,8 +326,10 @@ class _WarmupMixin:
         input_tokens: int | None = None
         output_tokens: int | None = None
         cached_input_tokens: int | None = None
+        cache_write_input_tokens: int | None = None
         reasoning_tokens: int | None = None
         reservation: ApiKeyUsageReservationData | None = None
+        upstream_transport: str | None = None
         upstream_proxy_route_mode: str | None = None
         upstream_proxy_pool_id: str | None = None
         upstream_proxy_endpoint_id: str | None = None
@@ -358,6 +360,7 @@ class _WarmupMixin:
                 prohibit_fast_mode=prohibit_fast_mode,
                 request_id=request_id,
             )
+            upstream_transport = _REQUEST_TRANSPORT_HTTP
             response = await _call_with_supported_optional_kwargs(
                 _service_core_compact_responses(),
                 payload,
@@ -384,6 +387,9 @@ class _WarmupMixin:
             output_tokens = usage.output_tokens if usage else None
             cached_input_tokens = (
                 usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
+            )
+            cache_write_input_tokens = (
+                usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
             )
             reasoning_tokens = (
                 usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
@@ -458,8 +464,10 @@ class _WarmupMixin:
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_input_tokens=cache_write_input_tokens,
                     reasoning_tokens=reasoning_tokens,
                     transport=_REQUEST_TRANSPORT_HTTP,
+                    upstream_transport=upstream_transport,
                     request_kind="warmup",
                     upstream_proxy_route_mode=upstream_proxy_route_mode,
                     upstream_proxy_pool_id=upstream_proxy_pool_id,

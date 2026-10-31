@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from math import ceil, isfinite
 from typing import Literal
 
-from app.core.usage import PLAN_CAPACITY_CREDITS_SECONDARY
+from app.core.usage import PLAN_CAPACITY_CREDITS_SECONDARY, capacity_for_account
 from app.core.usage.depletion import EWMAState, ewma_update
 from app.core.utils.time import naive_utc_to_epoch
 from app.db.models import Account, AccountStatus, UsageHistory
@@ -107,11 +107,21 @@ def build_weekly_credit_pace(
     forecast_burn_rate_credits_per_hour = 0.0
 
     for summary in account_summaries:
+        account = accounts_by_id.get(summary.account_id)
+        if (
+            account is not None
+            and account.status in PACE_ELIGIBLE_ACCOUNT_STATUSES
+            and capacity_for_account(account, "secondary") is None
+        ):
+            rows = secondary_history.get(summary.account_id, [])
+            if summary.window_minutes_secondary == 10_080 and any(
+                row.recorded_at >= freshness_cutoff and row.window_minutes == 10_080 for row in rows
+            ):
+                return None
         timing = _weekly_timing(summary, now_ms)
         if timing is None:
             continue
 
-        account = accounts_by_id.get(summary.account_id)
         if account is None or account.status not in PACE_ELIGIBLE_ACCOUNT_STATUSES:
             inactive_account_count += 1
             continue

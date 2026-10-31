@@ -270,6 +270,7 @@ class _CodexControlMixin:
         proxy = cast(_CodexControlServiceProtocol, self)
         filtered = filter_inbound_headers(headers)
         normalized_path = path.strip("/")
+        is_web_search = normalized_path == "alpha/search"
         effective_privacy_policy = (
             CodexControlRequestPrivacyPolicy.PRIVATE_REALTIME if normalized_path == "realtime/calls" else privacy_policy
         )
@@ -297,6 +298,7 @@ class _CodexControlMixin:
         route_endpoint_id: str | None = None
         route_fallback_used: bool | None = None
         route_fail_closed_reason: str | None = None
+        upstream_transport: str | None = None
         request_kind = f"codex_control_{normalized_path.replace('/', '_')}"
 
         def _account_id_for_log(account_id: str) -> str:
@@ -356,7 +358,7 @@ class _CodexControlMixin:
             account_id_value = account.id
 
             async def _call_control(target: Account) -> CodexControlResponse:
-                nonlocal route_fallback_used, route_mode, route_pool_id, route_endpoint_id
+                nonlocal route_fallback_used, route_mode, route_pool_id, route_endpoint_id, upstream_transport
                 access_token = proxy._encryptor.decrypt(target.access_token_encrypted)
                 upstream_account_id = _header_account_id(target.chatgpt_account_id)
                 remaining_budget = _remaining_budget_seconds(deadline)
@@ -376,6 +378,8 @@ class _CodexControlMixin:
                     route_endpoint_id = route.endpoint_id
                 route_trace = UpstreamProxyRouteTrace()
                 try:
+                    if is_web_search:
+                        upstream_transport = _REQUEST_TRANSPORT_HTTP
                     return await _service_core_codex_control_request()(
                         path,
                         method=method,
@@ -590,6 +594,8 @@ class _CodexControlMixin:
                 error_code=None if sensitive_realtime_request else log_error_code,
                 error_message=None if sensitive_realtime_request else log_error_message,
                 transport=_REQUEST_TRANSPORT_HTTP,
+                upstream_transport=upstream_transport,
+                request_kind=request_kind if is_web_search else "normal",
                 failure_phase=None if sensitive_realtime_request else failure_metadata.failure_phase,
                 failure_detail=None if sensitive_realtime_request else failure_metadata.failure_detail,
                 failure_exception_type=(

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
 
 from app.core.usage import (
     SIBLING_FETCH_MARGIN_SECONDS,
     _should_prefer_primary_row,
+    capacity_for_account,
     capacity_for_plan,
     normalize_rate_limit_windows,
     normalize_usage_window,
     normalize_weekly_only_rows,
     should_use_weekly_primary,
     summarize_usage_window,
+    usage_multiplier_for_account,
     used_credits_from_percent,
 )
 from app.core.usage.models import UsageWindow
@@ -45,8 +47,8 @@ def test_normalize_usage_window_defaults():
 def test_capacity_for_plan():
     assert capacity_for_plan("plus", "5h") is not None
     assert capacity_for_plan("plus", "7d") is not None
-    assert capacity_for_plan("prolite", "5h") == pytest.approx(1125.0)
-    assert capacity_for_plan("prolite", "7d") == pytest.approx(37800.0)
+    assert capacity_for_plan("prolite", "5h") == pytest.approx(2250.0)
+    assert capacity_for_plan("prolite", "7d") == pytest.approx(75600.0)
     assert capacity_for_plan("unknown", "5h") is None
 
 
@@ -71,9 +73,82 @@ def test_summarize_usage_window_includes_prolite_capacity():
 
     summary = summarize_usage_window([row], {account.id: account}, "primary")
 
-    assert summary.capacity_credits == pytest.approx(1125.0)
-    assert summary.used_credits == pytest.approx(281.25)
+    assert summary.capacity_credits == pytest.approx(2250.0)
+    assert summary.used_credits == pytest.approx(562.5)
     assert summary.used_percent == pytest.approx(25.0)
+
+
+def test_summarize_mixed_weekly_usage_includes_max_estimate():
+    accounts = {
+        plan: Account(id=plan, plan_type=plan, status=AccountStatus.ACTIVE) for plan in ("pro", "plus", "promax")
+    }
+    rows = [
+        UsageWindowRow(account_id=plan, used_percent=used, window_minutes=10080, reset_at=1800000000)
+        for plan, used in (("pro", 40.0), ("plus", 50.0), ("promax", 20.0))
+    ]
+
+    summary = summarize_usage_window(rows, accounts, "secondary")
+    assert summary.capacity_credits == 536760
+    assert summary.capacity_credits - summary.used_credits == 396900
+    assert summary.unquantified_account_count == 0
+    assert normalize_usage_window(summary).unquantified_account_count == 0
+    assert (
+        summarize_usage_window(
+            [UsageWindowRow(account_id="promax", used_percent=0.0)],
+            accounts,
+            "primary",
+        ).unquantified_account_count
+        == 0
+    )
+
+
+@pytest.mark.parametrize("used_percent", [0.0, 20.0])
+def test_recorded_unsupported_usage_without_optional_metadata_remains_unquantified(used_percent):
+    account = Account(id="unknown", plan_type="unsupported_plan", status=AccountStatus.ACTIVE)
+    row = UsageWindowRow(account_id=account.id, used_percent=used_percent, recorded_at=utcnow())
+
+    summary = summarize_usage_window([row], {account.id: account}, "secondary")
+
+    assert summary.unquantified_account_count == 1
+    assert summary.capacity_credits == 0.0
+    assert summary.used_percent is None
+
+
+@pytest.mark.parametrize(
+    ("plan", "legacy", "instant", "multiplier", "weekly"),
+    [
+        ("plus", False, "2026-10-29T23:59:59+00:00", 1, 7560),
+        ("prolite", True, "2026-10-29T23:59:59+00:00", 10, 75600),
+        ("pro", False, "2026-10-29T23:59:59+00:00", 20, 151200),
+        (" PRO ", True, "2026-10-29T23:59:59+00:00", 20, 151200),
+        ("pro", True, "2026-10-30T00:00:00+00:00", 20, 151200),
+        ("promax", True, "2026-10-29T23:59:59+00:00", 50, 378000),
+        ("unsupported_plan", True, "2026-10-29T23:59:59+00:00", None, None),
+        ("free", False, "2026-10-29T23:59:59+00:00", None, 1134),
+        ("business", False, "2026-10-29T23:59:59+00:00", None, 7560),
+        ("team", False, "2026-10-29T23:59:59+00:00", None, 7560),
+        ("edu", False, "2026-10-29T23:59:59+00:00", None, 7560),
+        ("enterprise", False, "2026-10-29T23:59:59+00:00", None, 50400),
+    ],
+)
+def test_account_capacity_ignores_former_cohort_cutoff(plan, legacy, instant, multiplier, weekly, monkeypatch):
+    account = Account(id="cohort", plan_type=plan, pro_legacy_allowance=legacy)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromisoformat(instant)
+
+    monkeypatch.setattr("app.core.usage.datetime", FrozenDatetime)
+
+    assert usage_multiplier_for_account(account) == multiplier
+    assert capacity_for_account(account, "secondary") == weekly
+    assert capacity_for_account(account, "monthly") == (1134 if plan == "free" else None)
+
+
+def test_account_capacity_retains_explicit_zero():
+    account = Account(id="free", plan_type="free", pro_legacy_allowance=True)
+    assert capacity_for_account(account, "primary") == 0
 
 
 def test_normalize_weekly_only_rows_prefers_newer_primary_over_stale_secondary():

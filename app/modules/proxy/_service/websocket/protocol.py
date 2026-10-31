@@ -3,9 +3,11 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from app.core.clock import Clock, Scheduler
+from app.modules.proxy._service.websocket.retained import RetainedWebSockets
 
 
 class _WebSocketServiceProtocol(Protocol):
+    _websocket_retained: RetainedWebSockets
     _capability_router: Any
     _background_cleanup_tasks: Any
     _clock: Clock
@@ -51,6 +53,8 @@ class _WebSocketServiceProtocol(Protocol):
     _remember_websocket_previous_response_owner: Any
     _remember_websocket_previous_response_owner_miss: Any
     _repo_factory: Any
+    _reduce_websocket_api_key_usage: Any
+    _extend_websocket_api_key_usage: Any
     _reserve_websocket_api_key_usage: Any
     _resolve_file_account_for_responses: Any
     _resolve_compact_turn_state_owner: Any

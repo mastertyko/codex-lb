@@ -6,6 +6,9 @@ import { BrowserRouter } from "react-router-dom";
 import { afterEach, describe, expect, it } from "vitest";
 
 import App from "@/App";
+import i18n from "@/i18n";
+import { buildWeeklyCreditPace } from "@/features/dashboard/utils";
+import { formatSlug } from "@/utils/formatters";
 import {
   createAccountSummary,
   createDashboardOverview,
@@ -35,6 +38,91 @@ afterEach(() => {
 });
 
 describe("dashboard flow integration", () => {
+  it.each([false, true])("shows unsupported quotas with retained forecasts (mixed pool: %s)", async (mixed) => {
+    const known = createAccountSummary({
+      accountId: "known",
+      resetAtSecondary: "2026-10-04T00:00:00Z",
+    });
+    const max = createAccountSummary({
+      accountId: "max",
+      planType: "future_plan",
+      displayName: "Unknown plan",
+      windowMinutesPrimary: null,
+      resetAtPrimary: null,
+      capacityCreditsPrimary: null,
+      remainingCreditsPrimary: null,
+      capacityCreditsSecondary: null,
+      remainingCreditsSecondary: null,
+      usage: { primaryRemainingPercent: null, secondaryRemainingPercent: 83 },
+    });
+    const overview = createDashboardOverview({ accounts: mixed ? [known, max] : [max] });
+    if (!overview.summary.secondaryWindow || !overview.windows.secondary) {
+      throw new Error("Missing weekly fixture");
+    }
+    overview.summary.secondaryWindow.unquantifiedAccountCount = 1;
+    overview.summary.primaryWindow.capacityCredits = mixed ? 225 : 0;
+    overview.summary.secondaryWindow.capacityCredits = mixed ? 7560 : 0;
+    overview.summary.secondaryWindow.remainingCredits = mixed ? known.remainingCreditsSecondary ?? 0 : 0;
+    overview.windows.primary.accounts = overview.windows.primary.accounts.filter((entry) => entry.accountId !== "max");
+    overview.windows.secondary.accounts = overview.windows.secondary.accounts.map((entry) =>
+      entry.accountId === "max"
+        ? { ...entry, capacityKnown: false, capacityCredits: 0, remainingCredits: 0 }
+        : entry,
+    );
+    const retainedPace = buildWeeklyCreditPace([known], new Date("2026-09-30T00:00:00Z"));
+    if (!retainedPace) throw new Error("Missing retained forecast fixture");
+    queryClient.setQueryData(["dashboard", "projections"], createDashboardProjections({
+      weeklyCreditPace: { ...retainedPace, paceGapSmoothingMinutes: 30 },
+    }));
+    server.use(
+      http.get("/api/dashboard/overview", () => HttpResponse.json(overview)),
+      http.get("/api/dashboard/projections", () => HttpResponse.json(
+        { error: { code: "unavailable", message: "Projections unavailable" } },
+        { status: 503 },
+      )),
+    );
+
+    window.history.pushState({}, "", "/dashboard");
+    render(<QueryClientProvider client={queryClient}><BrowserRouter><App /></BrowserRouter></QueryClientProvider>);
+
+    expect(await screen.findByTestId("weekly-allowance-incomplete")).toHaveTextContent(
+      i18n.t("dashboard.usage.forecastUnavailable", { count: 1 }),
+    );
+    expect(screen.getByText(formatSlug("future_plan"))).toBeInTheDocument();
+    expect(screen.getByText("83%")).toBeInTheDocument();
+    expect(screen.queryByText(i18n.t("dashboard.weeklyPace.title"))).not.toBeInTheDocument();
+    expect(await screen.findByText(i18n.t("dashboard.usage.excludedAccounts", { count: 1 }))).toBeInTheDocument();
+    expect(screen.queryByTestId("usage-allowance-unknown") !== null).toBe(!mixed);
+  });
+
+  it("includes the Max subscription estimate separately from purchased credits", async () => {
+    const max = createAccountSummary({
+      accountId: "max",
+      planType: "promax",
+      displayName: "Max account",
+      usageMultiplier: 25,
+      capacityCreditsEstimated: true,
+      usage: { primaryRemainingPercent: null, secondaryRemainingPercent: 80 },
+      windowMinutesPrimary: null,
+      windowMinutesSecondary: 10080,
+      capacityCreditsPrimary: null,
+      capacityCreditsSecondary: 378000,
+      remainingCreditsPrimary: null,
+      remainingCreditsSecondary: 302400,
+      creditsBalance: 250,
+      creditsUnlimited: false,
+    });
+    const overview = createDashboardOverview({ accounts: [max] });
+    server.use(http.get("/api/dashboard/overview", () => HttpResponse.json(overview)));
+    window.history.pushState({}, "", "/dashboard");
+    renderWithProviders(<App />);
+
+    expect(await screen.findByText("302400.00")).toBeInTheDocument();
+    expect(screen.getByText("250.00")).toBeInTheDocument();
+    expect(screen.getByText("80%")).toBeInTheDocument();
+    expect(screen.queryByTestId("weekly-allowance-incomplete")).not.toBeInTheDocument();
+  });
+
   it("loads dashboard, refetches overview on overview-timeframe changes, and keeps request-log refetches isolated", async () => {
     const user = userEvent.setup({ delay: null });
     const logs = createDefaultRequestLogs();

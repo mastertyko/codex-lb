@@ -14,6 +14,7 @@ from app.core.clock import clock_for, scheduler_for
 from app.core.errors import openai_error
 from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
 from app.core.openai.models import CompactResponsePayload
+from app.core.usage.pricing import subscription_pricing_tier
 from app.core.utils.request_id import get_request_id
 from app.core.utils.shared_future import wait_on_shared_future
 from app.db.models import Account
@@ -148,6 +149,63 @@ class _ApiKeyUsageMixin:
                     raise ProxyRateLimitError(message) from exc
                 except ApiKeyInvalidError as exc:
                     raise ProxyAuthError(str(exc)) from exc
+
+    async def _extend_websocket_api_key_usage(
+        self,
+        reservation: ApiKeyUsageReservationData | None,
+        *,
+        request_service_tier: str | None,
+        request_usage_budget: ApiKeyRequestUsageBudget | None,
+        successor_usage_budget: ApiKeyRequestUsageBudget | None = None,
+    ) -> bool:
+        if reservation is None:
+            return True
+        proxy = cast(_ApiKeyUsageServiceProtocol, self)
+        with anyio.CancelScope(shield=True):
+            async with proxy._repo_factory() as repos:
+                service = _service_api_keys_service()(repos.api_keys)
+                try:
+                    return await service.extend_usage_reservation(
+                        reservation.reservation_id,
+                        request_service_tier=request_service_tier,
+                        request_usage_budget=request_usage_budget,
+                        successor_usage_budget=successor_usage_budget,
+                    )
+                except ApiKeyInvalidError as exc:
+                    raise ProxyAuthError(str(exc)) from exc
+                except ApiKeyRateLimitExceededError as exc:
+                    message = f"{exc}. Usage resets at {exc.reset_at.isoformat()}Z."
+                    raise ProxyRateLimitError(message) from exc
+        raise RuntimeError("unreachable")
+
+    async def _reduce_websocket_api_key_usage(
+        self,
+        reservation: ApiKeyUsageReservationData | None,
+        *,
+        request_service_tier: str | None,
+        request_usage_budget: ApiKeyRequestUsageBudget | None,
+    ) -> bool:
+        if reservation is None:
+            return True
+        proxy = cast(_ApiKeyUsageServiceProtocol, self)
+        with anyio.CancelScope(shield=True):
+            try:
+                async with proxy._repo_factory() as repos:
+                    service = _service_api_keys_service()(repos.api_keys)
+                    return await service.reduce_usage_reservation(
+                        reservation.reservation_id,
+                        request_service_tier=request_service_tier,
+                        request_usage_budget=request_usage_budget,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to reduce websocket API key reservation reservation_id=%s request_id=%s",
+                    reservation.reservation_id,
+                    get_request_id(),
+                    exc_info=True,
+                )
+                return False
+        raise RuntimeError("unreachable")
 
     async def _release_websocket_reservation(
         self,
@@ -407,15 +465,12 @@ class _ApiKeyUsageMixin:
         input_tokens = usage.input_tokens if usage else None
         output_tokens = usage.output_tokens if usage else None
         cached_input_tokens = usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else 0
+        cache_write_input_tokens = (
+            usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else 0
+        )
         model_name = api_key_reservation.model or (getattr(response, "model", None) or "")
         response_service_tier = _service_tier_from_response(response)
-        service_tier = (
-            response_service_tier
-            if isinstance(response_service_tier, str)
-            else request_service_tier
-            if isinstance(request_service_tier, str)
-            else None
-        )
+        service_tier = subscription_pricing_tier(model_name, request_service_tier, response_service_tier)
 
         proxy = cast(_ApiKeyUsageServiceProtocol, self)
         reservation_released = False
@@ -430,6 +485,7 @@ class _ApiKeyUsageMixin:
                             input_tokens=input_tokens,
                             output_tokens=output_tokens,
                             cached_input_tokens=cached_input_tokens or 0,
+                            cache_write_input_tokens=cache_write_input_tokens or 0,
                             service_tier=service_tier,
                         )
                     else:
@@ -550,6 +606,7 @@ class _ApiKeyUsageMixin:
                             input_tokens=settlement.input_tokens,
                             output_tokens=settlement.output_tokens,
                             cached_input_tokens=settlement.cached_input_tokens or 0,
+                            cache_write_input_tokens=settlement.cache_write_input_tokens or 0,
                             service_tier=settlement.service_tier,
                         )
                     else:

@@ -63,6 +63,7 @@ from app.core.clients.proxy_websocket import (
     filter_inbound_websocket_headers,
     is_account_neutral_websocket_error_code,
 )
+from app.core.clients.websocket_dispatch import websocket_send_context
 from app.core.clock import Clock, Scheduler, clock_for, scheduler_for
 from app.core.errors import (
     PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
@@ -92,6 +93,8 @@ from app.core.resilience.network_recovery import (
 from app.core.resilience.toggles import bind_resilience_toggles
 from app.core.types import JsonValue
 from app.core.upstream_proxy import UpstreamProxyRouteError
+from app.core.usage.logs import CANCELLED_STATUS, CONTROLLED_INTERRUPTION_ERROR_CODE
+from app.core.usage.pricing import subscription_pricing_tier
 from app.core.utils.request_id import get_request_id, reset_request_id, set_request_id
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event
@@ -311,7 +314,13 @@ from app.modules.proxy._service.observability import (
 from app.modules.proxy._service.observability import (
     _maybe_log_proxy_service_tier_trace as _maybe_log_proxy_service_tier_trace,
 )
-from app.modules.proxy._service.observability import _observe_terminal_stream_error_frame
+from app.modules.proxy._service.observability import (
+    _observe_terminal_stream_error_frame,
+    _record_websocket_connection_closed,
+    _record_websocket_connection_opened,
+    _record_websocket_request_terminal,
+    _WebSocketCloseOutcome,
+)
 from app.modules.proxy._service.observability import (
     _record_continuity_fail_closed as _record_continuity_fail_closed,
 )
@@ -355,10 +364,12 @@ from app.modules.proxy._service.support import (
     _WebSocketContinuityState,
     _WebSocketReceiveTimeout,
     _WebSocketRequestState,
+    _WebSocketSteeringContinuation,
     _WebSocketTransientRefreshFailover,
     _WebSocketUpstreamControl,
     clear_upstream_websocket_transport_failure,
     mark_upstream_websocket_transport_failure,
+    record_async_tool_call,
     websocket_connect_transport_failure_code,
 )
 from app.modules.proxy._service.support import (
@@ -399,7 +410,6 @@ from app.modules.proxy._service.warmup import (
 )
 from app.modules.proxy._service.websocket.helpers import (
     _app_error_to_websocket_event,
-    _assign_websocket_response_id,
     _bind_websocket_request_dispatch_owner,
     _find_websocket_request_state_by_response_id,
     _forget_websocket_stale_previous_response,
@@ -414,13 +424,16 @@ from app.modules.proxy._service.websocket.helpers import (
     _pop_matching_websocket_request_states,
     _pop_replayable_precreated_websocket_request_state,
     _pop_terminal_websocket_request_state,
+    _prepare_websocket_reconnect_full_resend,
     _prepare_websocket_request_state_for_account_switch,
     _prepare_websocket_request_state_for_auth_replay,
     _record_or_defer_websocket_accepted_replay_health,
     _record_websocket_continuity_completion,
     _record_websocket_responses_lite_acceptance,
+    _record_websocket_stale_anchor_diagnostics,
     _record_websocket_stale_anchor_failure,
     _release_websocket_response_create_gate,
+    _retire_websocket_continuity_anchor,
     _rewrite_websocket_continuity_corruption_event,
     _rewrite_websocket_downstream_response_id,
     _rewrite_websocket_previous_response_owner_unavailable_event,
@@ -447,7 +460,9 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_event_error_param,
     _websocket_event_error_type,
     _websocket_event_incomplete_reason,
+    _websocket_event_upstream_error,
     _websocket_full_resend_conflicts_with_visible_pending,
+    _websocket_full_resend_retains_prior_output,
     _websocket_input_items_are_self_contained_fresh_replay,
     _websocket_owner_switch_has_other_pending_requests,
     _websocket_precreated_auth_error_code,
@@ -458,6 +473,25 @@ from app.modules.proxy._service.websocket.helpers import (
     _wrapped_websocket_error_event,
 )
 from app.modules.proxy._service.websocket.protocol import _WebSocketServiceProtocol
+from app.modules.proxy._service.websocket.quota_rebalance import prepare_quota_rebalance
+from app.modules.proxy._service.websocket.retained import RetainedWebSocket
+from app.modules.proxy._service.websocket.steering import (
+    anonymous_websocket_request_candidates,
+    assign_websocket_created_request_state,
+    completed_steering_required_input,
+    consume_suppressed_steering_anonymous_terminal,
+    forget_suppressed_steering_response,
+    process_websocket_steering_event,
+    public_steering_app_error,
+    release_completed_steering_payload,
+    release_steering_request,
+    required_steering_input_is_present,
+    retire_steering_history_if_full,
+    steering_error,
+    steering_failure_payload,
+    submit_websocket_steering,
+)
+from app.modules.proxy.account_cache import is_account_routing_unavailable
 from app.modules.proxy.affinity import (
     _AffinityPolicy,
     _is_synthesized_turn_state,
@@ -467,6 +501,7 @@ from app.modules.proxy.affinity import (
     _sticky_key_for_responses_request,
     _sticky_key_from_session_header,  # noqa: F401
     _sticky_key_from_turn_state_header,
+    _thread_id_from_headers,
     _websocket_continuity_aliases_from_headers,
 )
 from app.modules.proxy.affinity_observation import AffinityObservation
@@ -499,6 +534,7 @@ from app.modules.proxy.http_bridge_forwarding import (
     OwnerForwardRelayFailure as OwnerForwardRelayFailure,
 )
 from app.modules.proxy.load_balancer import AccountLease, effective_account_concurrency_caps
+from app.modules.proxy.quota_first import enforce_quota_first_admission
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_enforced_service_tier_model_fallback,
@@ -508,6 +544,8 @@ from app.modules.proxy.request_policy import (
     openai_invalid_payload_error,
     openai_validation_error,
     responses_source_route_excluded,
+    validate_astra_request,
+    validate_configuration_update_policy,
     validate_model_access,
     validate_top_level_compaction_trigger_input_shape,
 )
@@ -671,6 +709,30 @@ async def _close_downstream_after_sequenced_replay_refusal(
             "Failed to close downstream websocket after sequenced replay refusal",
             exc_info=True,
         )
+
+
+@contextmanager
+def _websocket_response_create_dispatch_context(
+    request_state: _WebSocketRequestState | None,
+    control: _WebSocketUpstreamControl | None = None,
+) -> Iterator[None]:
+    if request_state is None:
+        yield
+        return
+
+    if request_state.steering_parent_response_id is None and (
+        control is None
+        or request_state.previous_response_id not in control.rejected_steering_parent_ids
+        and request_state.previous_response_id not in control.steering_continuations
+    ):
+        yield
+        return
+
+    def record_dispatch() -> None:
+        request_state.response_create_dispatched = True
+
+    with websocket_send_context(record_dispatch):
+        yield
 
 
 @contextmanager
@@ -1033,6 +1095,26 @@ async def _release_websocket_response_create_ownership_for_cleanup(
             response_create_gate.release()
 
 
+async def _retire_drained_websocket_upstream(
+    upstream: UpstreamWebSocket,
+    *,
+    upstream_control: _WebSocketUpstreamControl,
+    pending_requests: deque[_WebSocketRequestState],
+    pending_lock: anyio.Lock,
+) -> bool:
+    if not (upstream_control.reconnect_requested or upstream_control.retire_after_drain):
+        return False
+    async with pending_lock:
+        if upstream_control.replay_request_state is None and pending_requests:
+            return False
+        upstream_control.reconnect_requested = True
+    try:
+        await upstream.close()
+    except Exception:
+        _facade().logger.debug("Failed to close upstream websocket for reconnect", exc_info=True)
+    return True
+
+
 async def _process_and_forward_upstream_websocket_text(
     proxy: _WebSocketServiceProtocol,
     websocket: WebSocket,
@@ -1160,21 +1242,19 @@ async def _process_and_forward_upstream_websocket_text(
                     exc_info=True,
                 )
             return True
-    if upstream_control.reconnect_requested:
-        should_reconnect = upstream_control.replay_request_state is not None
-        if not should_reconnect:
-            async with pending_lock:
-                should_reconnect = not pending_requests
-        if should_reconnect:
-            try:
-                await upstream.close()
-            except Exception:
-                _facade().logger.debug(
-                    "Failed to close upstream websocket for reconnect",
-                    exc_info=True,
-                )
-            return True
-    return False
+    if (
+        not suppress_downstream_event
+        and parsed_frame.event_type == "response.completed"
+        and upstream_control.reconnect_key is not None
+        and upstream_control.reconnect_key[3] == parsed_frame.response_id
+    ):
+        upstream_control.completed_response_delivered = True
+    return await _retire_drained_websocket_upstream(
+        upstream,
+        upstream_control=upstream_control,
+        pending_requests=pending_requests,
+        pending_lock=pending_lock,
+    )
 
 
 async def _websocket_has_active_drain_work(
@@ -1265,6 +1345,8 @@ async def _process_upstream_websocket_transport_end(
     upstream_control: _WebSocketUpstreamControl,
     response_create_gate: asyncio.Semaphore,
     downstream_activity: _DownstreamWebSocketActivity,
+    continuity_state: _WebSocketContinuityState | None = None,
+    codex_session_affinity: bool = False,
 ) -> bool:
     """Finalize only requests that crossed this transport's send boundary."""
 
@@ -1282,6 +1364,37 @@ async def _process_upstream_websocket_transport_end(
         pending_requests,
         pending_lock=pending_lock,
     )
+    async with pending_lock:
+        idle_codex_loss = (
+            codex_session_affinity
+            and not reader_owned
+            and not pending_requests
+            and upstream_control.replay_request_state is None
+            and upstream_control.completed_response_delivered
+        )
+    if idle_codex_loss:
+        # The client must not keep its connection-local delta cache after the
+        # physical upstream ends. A new socket cannot inherit that context.
+        if (
+            continuity_state is not None
+            and upstream_control.diagnostic_connection_id is not None
+            and continuity_state.last_completed_connection_id == upstream_control.diagnostic_connection_id
+        ):
+            _retire_websocket_continuity_anchor(continuity_state)
+        _facade().logger.info(
+            "websocket_idle_upstream_lost connection_id=%s action=reconnect",
+            upstream_control.diagnostic_connection_id,
+        )
+        async with client_send_lock:
+            if not downstream_activity.disconnected:
+                try:
+                    await websocket.close(code=1012, reason="Upstream connection lost; reconnect with full context")
+                except Exception:
+                    _facade().logger.debug("Downstream already closed after idle upstream loss", exc_info=True)
+                finally:
+                    downstream_activity.mark_disconnected()
+        await upstream.close()
+        return True
     replay_refusal_reasons: list[str] = []
     replay_request_state = None
     message_error_code = getattr(message, "error_code", None)
@@ -1355,6 +1468,13 @@ async def _process_upstream_websocket_transport_end(
 
 
 class _WebSocketMixin:
+    async def _close_retained_websocket(self, upstream: UpstreamWebSocket) -> None:
+        await _close_websocket_upstream_for_cleanup(
+            cast(_WebSocketServiceProtocol, self),
+            upstream,
+            timeout_seconds=_WEBSOCKET_UPSTREAM_CLOSE_CLEANUP_TIMEOUT_SECONDS,
+        )
+
     async def _touch_active_websocket_thread_affinity(
         self,
         request_state: _WebSocketRequestState,
@@ -1470,6 +1590,7 @@ class _WebSocketMixin:
         prohibit_fast_mode = bool(getattr(settings, "prohibit_fast_mode", False))
         routing_strategy = _facade()._routing_strategy(settings)
         pending_requests: deque[_WebSocketRequestState] = deque()
+        retired_steering_requests: list[_WebSocketRequestState] = []
         pending_lock = anyio.Lock()
         client_send_lock = anyio.Lock()
         response_create_gate = asyncio.Semaphore(1)
@@ -1626,6 +1747,8 @@ class _WebSocketMixin:
                 request_state_registered = False
                 request_affinity = _AffinityPolicy()
                 payload: dict[str, JsonValue] | None = None
+                pending_steering_continuation: _WebSocketSteeringContinuation | None = None
+                steering_placeholder: _WebSocketRequestState | None = None
 
                 if replay_request_state is not None:
                     request_state = replay_request_state
@@ -1634,6 +1757,7 @@ class _WebSocketMixin:
                     # next reader may classify a close as post-send replayable
                     # only after this attempt reaches its own send boundary.
                     request_state.response_create_sent_at = None
+                    request_state.response_create_dispatched = False
                     request_state.request_stage = "reattach"
                     request_affinity = request_state.affinity_policy
                     text_data = request_state.request_text
@@ -1785,6 +1909,44 @@ class _WebSocketMixin:
                                     )
                                 )
                             continue
+                        if payload.get("type") == "response.steer":
+                            try:
+                                if shutdown_state.is_draining():
+                                    raise steering_error("service_unavailable", "Server is draining.")
+                                if upstream is None or upstream_control is None or account is None:
+                                    raise steering_error(
+                                        "response_not_found", "Steering requires an active connection."
+                                    )
+                                await submit_websocket_steering(
+                                    proxy,
+                                    payload,
+                                    headers=headers,
+                                    account=account,
+                                    upstream=upstream,
+                                    control=upstream_control,
+                                    pending_requests=pending_requests,
+                                    pending_lock=pending_lock,
+                                    api_key=api_key,
+                                    prohibit_fast_mode=prohibit_fast_mode,
+                                )
+                            except (
+                                ProxyResponseError,
+                                AppError,
+                                ClientPayloadError,
+                                ValidationError,
+                                ValueError,
+                            ) as exc:
+                                if isinstance(exc, ProxyResponseError):
+                                    error = exc
+                                elif isinstance(exc, AppError):
+                                    error = public_steering_app_error(exc) or steering_error(
+                                        "invalid_input", "Invalid steering request."
+                                    )
+                                else:
+                                    error = steering_error("invalid_input", "Invalid steering request.")
+                                async with client_send_lock:
+                                    await websocket.send_text(json.dumps(steering_failure_payload(payload, error)))
+                            continue
                         if _is_websocket_response_create(payload):
                             if shutdown_state.is_draining():
                                 async with client_send_lock:
@@ -1801,6 +1963,52 @@ class _WebSocketMixin:
                                     )
                                 continue
                             try:
+                                steering_continuation = None
+                                parent_id = payload.get("previous_response_id")
+                                if upstream_control is not None and isinstance(parent_id, str):
+                                    steering_continuation = upstream_control.steering_continuations.get(
+                                        parent_id.strip()
+                                    )
+                                if (
+                                    upstream_control is not None
+                                    and upstream_control.retire_after_drain
+                                    and not upstream_control.reconnect_requested
+                                    and steering_continuation is None
+                                ):
+                                    async with pending_lock:
+                                        has_pending = bool(pending_requests)
+                                    if has_pending:
+                                        # Do not wait in the sender: a later tool
+                                        # output may be needed to finish the drain.
+                                        raise ProxyResponseError(
+                                            503,
+                                            openai_error(
+                                                "service_unavailable",
+                                                "This connection is draining; retry after pending responses.",
+                                            ),
+                                        )
+                                    if upstream_reader is not None:
+                                        await upstream_reader
+                                if steering_continuation is not None:
+                                    if steering_continuation.explicit_request_prepared:
+                                        raise steering_error(
+                                            "invalid_input", "A steering continuation is already in progress."
+                                        )
+                                    if (
+                                        steering_continuation.required_input is None
+                                        or not required_steering_input_is_present(
+                                            steering_continuation.required_input, payload.get("input")
+                                        )
+                                    ):
+                                        raise steering_error(
+                                            "invalid_input", "Return every required steering input before continuing."
+                                        )
+                                    original_settings = steering_continuation.parent.steering_configuration or {}
+                                    if payload.get("stream_id") != original_settings.get("stream_id"):
+                                        raise steering_error(
+                                            "invalid_input",
+                                            "Steering continuation requires the original WebSocket lane.",
+                                        )
                                 prepared_request = await proxy._prepare_websocket_response_create_request(
                                     payload,
                                     headers=headers,
@@ -1860,18 +2068,30 @@ class _WebSocketMixin:
                                         capability_header_values=capability_header_values,
                                     )
                                 request_state = prepared_request.request_state
+                                if steering_continuation is not None:
+                                    pending_steering_continuation = steering_continuation
+                                    steering_placeholder = steering_continuation.request_state
+                                    request_state.steering_parent_response_id = request_state.previous_response_id
+                                    request_state.fresh_upstream_request_text = None
+                                    request_state.fresh_upstream_request_is_retry_safe = False
+                                    request_state.preferred_account_id = account.id if account is not None else None
+                                    request_state.replay_required_account_id = request_state.preferred_account_id
                                 request_affinity = prepared_request.affinity_policy
                                 text_data = prepared_request.text_data
                                 if request_state.previous_response_id is not None:
-                                    request_state.previous_response_owner_account_id = (
-                                        await proxy._resolve_websocket_previous_response_owner(
-                                            previous_response_id=request_state.previous_response_id,
-                                            api_key=request_state.api_key or api_key,
-                                            session_id=request_state.session_id,
-                                            surface="websocket_source_route",
-                                            request_state=request_state,
+                                    if (
+                                        request_state.previous_response_owner_account_id is None
+                                        and request_state.previous_response_owner_lookup_outcome is None
+                                    ):
+                                        request_state.previous_response_owner_account_id = (
+                                            await proxy._resolve_websocket_previous_response_owner(
+                                                previous_response_id=request_state.previous_response_id,
+                                                api_key=request_state.api_key or api_key,
+                                                session_id=request_state.session_id,
+                                                surface="websocket_source_route",
+                                                request_state=request_state,
+                                            )
                                         )
-                                    )
                                     request_state.preferred_account_id = resolve_required_account_id(
                                         ("existing bridge or file", request_state.preferred_account_id),
                                         (
@@ -2178,6 +2398,53 @@ class _WebSocketMixin:
                         payload = None
                         continue
 
+                if (
+                    upstream is None
+                    and codex_session_affinity
+                    and request_state is not None
+                    and request_state.api_key is not None
+                    and request_state.session_id
+                    and request_state.previous_response_id
+                    and request_state.preferred_account_id
+                    and not shutdown_state.is_draining()
+                ):
+                    retained = proxy._websocket_retained.take(
+                        (
+                            request_state.api_key.id,
+                            request_state.session_id,
+                            request_state.reconnect_conversation_id,
+                            request_state.previous_response_id,
+                        ),
+                        request_state.preferred_account_id,
+                    )
+                    if retained is not None:
+                        installed = False
+                        try:
+                            validated, _, _ = await proxy._revalidate_open_websocket_account(
+                                retained.account, request_state=request_state, api_key=request_state.api_key
+                            )
+                            if validated is not None and validated.id == retained.account.id:
+                                account = validated
+                                upstream = retained.upstream
+                                account_lease = retained.lease
+                                upstream_control = retained.control
+                                upstream_control.retaining_for_reconnect = False
+                                upstream_account_id = account.id
+                                upstream_requires_security_work_authorized = retained.security_work_authorized
+                                installed = True
+                                _facade().logger.info(
+                                    "websocket_retained event=resumed connection_id=%s",
+                                    upstream_control.diagnostic_connection_id,
+                                )
+                        except (Exception, asyncio.CancelledError):
+                            # Validation can fail before queue registration. Give
+                            # the shielded scope cleanup ownership of its reservation.
+                            request_state_to_fail = request_state
+                            raise
+                        finally:
+                            if not installed:
+                                await proxy._websocket_retained.close(retained)
+
                 if request_state is not None and await _websocket_full_resend_conflicts_with_visible_pending(
                     request_state,
                     pending_requests,
@@ -2203,6 +2470,46 @@ class _WebSocketMixin:
                     text_data = None
                     payload = None
                     continue
+
+                if (
+                    routing_strategy == "quota_first_balanced"
+                    and request_state is not None
+                    and upstream is not None
+                    and account is not None
+                    and upstream_control is not None
+                    and continuity_state.last_completed_response_id is not None
+                    and continuity_state.last_completed_connection_id == upstream_control.diagnostic_connection_id
+                    and client_turn_state_header is None
+                    and not continuity_state.last_pending_function_call_ids
+                    and not continuity_state.last_pending_tool_call_types
+                    and not continuity_state.pending_async_tool_calls
+                ):
+                    async with pending_lock:
+                        quota_switch_blocked = bool(pending_requests)
+                    if not quota_switch_blocked:
+                        # Until queue registration, scope cleanup must own any
+                        # cancellation or unexpected preflight failure.
+                        request_state_to_fail = request_state
+                        rebalance_text = await prepare_quota_rebalance(
+                            proxy._load_balancer,
+                            request_state,
+                            account_id=account.id,
+                            continuity=continuity_state,
+                            client_input=payload.get("input") if payload is not None else None,
+                        )
+                        if rebalance_text is not None:
+                            text_data = rebalance_text
+                            # Admission must use the same refreshed key policy as preflight.
+                            api_key = request_state.api_key
+                            request_affinity = request_state.affinity_policy
+                            await retire_current_upstream()
+                            upstream_turn_state = None
+                            filtered_headers = {
+                                key: value
+                                for key, value in filtered_headers.items()
+                                if key.lower() != "x-codex-turn-state"
+                            }
+                        request_state_to_fail = None
 
                 if (
                     request_state is not None
@@ -2413,6 +2720,20 @@ class _WebSocketMixin:
                             response_create_gate=response_create_gate,
                         )
                         async with pending_lock:
+                            if pending_steering_continuation is not None and (
+                                upstream_control is None
+                                or upstream_control.steering_continuations.get(
+                                    response_create_request_state.previous_response_id
+                                )
+                                is not pending_steering_continuation
+                                or steering_placeholder is None
+                                or pending_steering_continuation.request_state is not steering_placeholder
+                                or steering_placeholder not in pending_requests
+                                or steering_placeholder.response_id is not None
+                            ):
+                                raise steering_error(
+                                    "response_not_found", "The steering continuation is no longer available."
+                                )
                             pending_requests.append(response_create_request_state)
                             if shutdown_state.is_draining():
                                 # Register-first makes this barrier fail-closed
@@ -2422,7 +2743,27 @@ class _WebSocketMixin:
                                 # already visible as active when drain began.
                                 pending_requests.remove(response_create_request_state)
                             else:
+                                if pending_steering_continuation is not None and steering_placeholder is not None:
+                                    pending_requests.remove(steering_placeholder)
+                                    # Transfer cleanup ownership before release can yield.
+                                    retired_steering_requests.append(steering_placeholder)
+                                    pending_steering_continuation.request_state = response_create_request_state
+                                    pending_steering_continuation.explicit_request_prepared = True
                                 request_state_registered = True
+                        if (
+                            request_state_registered
+                            and pending_steering_continuation is not None
+                            and steering_placeholder is not None
+                        ):
+                            try:
+                                await release_steering_request(proxy, steering_placeholder)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to release steering placeholder reservation request_id=%s",
+                                    steering_placeholder.request_id,
+                                )
+                            else:
+                                retired_steering_requests.remove(steering_placeholder)
                         if not request_state_registered:
                             await proxy._release_websocket_request_state_reservation(response_create_request_state)
                             await proxy._emit_websocket_terminal_error(
@@ -2623,7 +2964,15 @@ class _WebSocketMixin:
                     upstream_account_id = account.id
                     upstream_requires_security_work_authorized = request_state.require_security_work_authorized
                     upstream_turn_state = _facade()._upstream_turn_state_from_socket(upstream) or upstream_turn_state
-                    upstream_control = _WebSocketUpstreamControl()
+                    upstream_control = _WebSocketUpstreamControl(retired_steering_requests=retired_steering_requests)
+                    _record_websocket_connection_opened(upstream_control, request_state, now=clock.monotonic())
+
+                if (
+                    upstream_reader is None
+                    and upstream is not None
+                    and account is not None
+                    and upstream_control is not None
+                ):
                     upstream_reader = scheduler_for(proxy).create_task(
                         proxy._relay_upstream_websocket_messages(
                             websocket,
@@ -2647,7 +2996,9 @@ class _WebSocketMixin:
                         )
                     )
 
+                unavailable_account_rejection = False
                 try:
+                    current_settings = settings
                     if (
                         text_data is not None
                         and request_state is not None
@@ -2770,7 +3121,48 @@ class _WebSocketMixin:
                         continue
                     if text_data is not None:
                         archive_request_id = None if request_state is None else request_state.archive_request_id
+                        dispatch_state = None
                         if request_state is not None and payload is not None and _is_websocket_response_create(payload):
+                            # Admission may have waited while the account was paused.
+                            # Reject only this unsent frame; keep the socket and its
+                            # context available for draining and later reactivation.
+                            if account is not None and is_account_routing_unavailable(account.id):
+                                unavailable_account_rejection = True
+                                raise ProxyResponseError(
+                                    503,
+                                    openai_error(
+                                        "previous_response_owner_unavailable"
+                                        if request_state.previous_response_id is not None
+                                        else "preferred_account_unavailable",
+                                        "The socket account is unavailable; retry after it is reactivated.",
+                                        error_type="server_error",
+                                    ),
+                                )
+                            if account is not None:
+                                try:
+                                    await enforce_quota_first_admission(
+                                        proxy._load_balancer,
+                                        routing_strategy=current_settings.routing_strategy,
+                                        account_id=account.id,
+                                        model=request_state.model,
+                                        service_tier=request_state.requested_service_tier,
+                                        api_key=request_state.api_key or api_key,
+                                        require_security_work_authorized=request_state.require_security_work_authorized,
+                                    )
+                                except ProxyResponseError:
+                                    unavailable_account_rejection = True
+                                    raise
+                                reconnect_text = _prepare_websocket_reconnect_full_resend(
+                                    request_state,
+                                    connection_id=(
+                                        upstream_control.diagnostic_connection_id
+                                        if upstream_control is not None
+                                        else None
+                                    ),
+                                    account_id=account.id,
+                                )
+                                if reconnect_text is not None:
+                                    text_data = reconnect_text
                             if account is None or not _bind_websocket_request_dispatch_owner(
                                 request_state,
                                 account_id=account.id,
@@ -2784,8 +3176,19 @@ class _WebSocketMixin:
                                         error_type="server_error",
                                     ),
                                 )
+                            request_state.diagnostic_connection_id = (
+                                upstream_control.diagnostic_connection_id if upstream_control is not None else None
+                            )
+                            if upstream_control is not None:
+                                upstream_control.completed_response_delivered = False
+                                upstream_control.reconnect_key = None
                             request_state.response_create_sent_at = clock.monotonic()
-                        with _websocket_archive_request_context(archive_request_id):
+                            request_state.response_create_dispatched = False
+                            dispatch_state = request_state
+                        with (
+                            _websocket_archive_request_context(archive_request_id),
+                            _websocket_response_create_dispatch_context(dispatch_state, upstream_control),
+                        ):
                             await upstream.send_text(text_data)
                 except ProxyResponseError as exc:
                     error = _parse_openai_error(exc.payload)
@@ -2793,6 +3196,22 @@ class _WebSocketMixin:
                     error_message = error.message if error and error.message else "Upstream error"
                     error_type = error.type if error and error.type else "server_error"
                     if request_state is not None:
+                        if (
+                            request_state_registered
+                            and upstream_control is not None
+                            and (
+                                request_state.response_create_sent_at is None or error_code == "steering_not_supported"
+                            )
+                        ):
+                            async with pending_lock:
+                                continuation = upstream_control.steering_continuations.get(
+                                    request_state.steering_parent_response_id
+                                )
+                                if continuation is not None and continuation.request_state is request_state:
+                                    upstream_control.steering_continuations.pop(
+                                        request_state.steering_parent_response_id, None
+                                    )
+                                    request_state.steering_parent_response_id = None
                         await proxy._release_websocket_request_state_reservation(request_state)
                         if request_state_registered:
                             async with pending_lock:
@@ -2802,6 +3221,14 @@ class _WebSocketMixin:
                                 request_state,
                                 response_create_gate,
                                 scheduler=scheduler_for(proxy),
+                            )
+                        if unavailable_account_rejection:
+                            await proxy._write_websocket_connect_failure(
+                                account_id=account.id if account is not None else None,
+                                api_key=request_state.api_key or api_key,
+                                request_state=request_state,
+                                error_code=error_code,
+                                error_message=error_message,
                             )
                         await proxy._emit_websocket_terminal_error(
                             websocket,
@@ -2964,14 +3391,28 @@ class _WebSocketMixin:
                 nonlocal request_state_failure_task
                 nonlocal request_state_to_fail
                 nonlocal retired_create_lease_release_task
-                nonlocal upstream_reader
+                nonlocal upstream_reader, upstream, upstream_control, account_lease
                 reader_to_await = upstream_reader
+                reader_stopped = False
+                retain_candidate = bool(
+                    codex_session_affinity
+                    and downstream_activity.disconnected
+                    and not scope_cancelled
+                    and not shutdown_state.is_draining()
+                    and upstream is not None
+                    and account is not None
+                    and upstream_control is not None
+                    and reader_to_await is not None
+                    and not reader_to_await.done()
+                )
+                if retain_candidate and upstream_control is not None:
+                    upstream_control.retaining_for_reconnect = True
                 if reader_to_await is not None and not upstream_reader_cancel_requested:
                     # Cancel exactly once before close. Some transports defer
                     # cancellation while receive() unwinds and need close() to
                     # release that wait.
                     reader_to_await.cancel()
-                if upstream is not None:
+                if upstream is not None and not retain_candidate:
                     cleanup_phase = "upstream_close"
                     await _close_websocket_upstream_for_cleanup(
                         proxy,
@@ -2981,7 +3422,7 @@ class _WebSocketMixin:
                 if reader_to_await is not None:
                     try:
                         cleanup_phase = "upstream_reader"
-                        await _facade()._await_cancelled_task(
+                        reader_stopped = await _facade()._await_cancelled_task(
                             reader_to_await,
                             label="proxy websocket upstream reader",
                             cancel=False,
@@ -2996,6 +3437,50 @@ class _WebSocketMixin:
                             exc_info=True,
                         )
                     upstream_reader = None
+                if retain_candidate and upstream is not None and account is not None and upstream_control is not None:
+                    retainable = (
+                        reader_stopped
+                        and upstream_control.completed_response_delivered
+                        and upstream_control.reconnect_key is not None
+                        and not upstream_control.reconnect_requested
+                        and not upstream_control.retire_after_drain
+                        and not pending_requests
+                        and not upstream_control.steering_continuations
+                        and not upstream_control.last_completed_request
+                        and not retired_steering_requests
+                        and upstream_control.replay_request_state is None
+                        and replay_request_state is None
+                        and request_state_to_fail is None
+                        and not continuity_state.last_pending_function_call_ids
+                        and not continuity_state.last_pending_tool_call_types
+                        and not continuity_state.pending_async_tool_calls
+                        and not shutdown_state.is_draining()
+                    )
+                    if (
+                        retainable
+                        and upstream_control.reconnect_key is not None
+                        and proxy._websocket_retained.retain(
+                            RetainedWebSocket(
+                                upstream_control.reconnect_key,
+                                account,
+                                upstream,
+                                upstream_control,
+                                account_lease,
+                                security_work_authorized=bool(upstream_requires_security_work_authorized),
+                            )
+                        )
+                    ):
+                        upstream = None
+                        upstream_control = None
+                        account_lease = None
+                    else:
+                        upstream_control.retaining_for_reconnect = False
+                        _record_websocket_connection_closed(
+                            upstream_control, now=clock.monotonic(), outcome="client_disconnected"
+                        )
+                        await _close_websocket_upstream_for_cleanup(
+                            proxy, upstream, timeout_seconds=current_cleanup_timeout()
+                        )
                 if retired_create_lease_release_task is not None:
                     try:
                         cleanup_phase = "retired_create_lease"
@@ -3068,6 +3553,18 @@ class _WebSocketMixin:
                         status="cancelled",
                         penalize_account=False,
                     )
+                cleanup_phase = "retired_steering_requests"
+                for retired_request in retired_steering_requests:
+                    try:
+                        await release_steering_request(proxy, retired_request)
+                    except Exception:
+                        # Retry once within the owned scope, not an unbounded
+                        # task per failed refund. Other cleanup must still run.
+                        _facade().logger.warning(
+                            "Failed to release retired steering reservation during socket cleanup request_id=%s",
+                            retired_request.request_id,
+                            exc_info=True,
+                        )
                 client_disconnected = downstream_activity.disconnected
                 cleanup_phase = "pending_requests"
                 await proxy._fail_pending_websocket_requests(
@@ -3248,6 +3745,15 @@ class _WebSocketMixin:
                     previous_response_input_items
                 )
                 responses_payload = responses_payload.model_copy(update={"input": trimmed_input_items})
+        source_owned = False
+        if not source_route_excluded and responses_payload.model.strip().lower() == "gpt-6-astra":
+            source_owned = await responses_model_is_source_owned(
+                responses_payload.model,
+                refreshed_api_key,
+                raw_model=raw_source_model,
+            )
+        if not source_owned:
+            validate_astra_request(responses_payload, refreshed_api_key)
         full_resend_client_metadata = client_metadata
         if client_full_resend_retry_safe and client_full_resend_input_items is not None:
             if trusted_incremental_responses_lite and client_metadata is not None:
@@ -3283,6 +3789,8 @@ class _WebSocketMixin:
         goal_restart_full_resend = _request_allows_unavailable_legacy_owner_abandonment(responses_payload)
         restart_affinity_payload = responses_payload
         session_anchor = None
+        session_anchor_connection_id = None
+        session_anchor_retains_prior_output = False
         if not goal_restart_full_resend:
             session_anchor = _websocket_continuity_anchor_for_payload(
                 continuity_state,
@@ -3295,6 +3803,13 @@ class _WebSocketMixin:
             original_input_item_count = len(original_input_items)
             original_input_fingerprint = _facade()._fingerprint_input_items(original_input_items)
             original_full_resend_payload = responses_payload
+            if continuity_state is not None:
+                session_anchor_connection_id = continuity_state.last_completed_connection_id
+                session_anchor_retains_prior_output = _websocket_full_resend_retains_prior_output(
+                    continuity_state,
+                    original_input_items,
+                    stored_count=session_anchor.stored_input_item_count,
+                )
             responses_payload = responses_payload.model_copy(
                 update={
                     "previous_response_id": session_anchor.previous_response_id,
@@ -3311,7 +3826,11 @@ class _WebSocketMixin:
             input_items = cast(list[JsonValue], responses_payload.input)
             missing_call_ids = _facade()._missing_function_call_outputs_for_previous_response(
                 input_items,
-                pending_call_ids=continuity_state.last_pending_function_call_ids,
+                pending_call_ids=[
+                    call_id
+                    for call_id in continuity_state.last_pending_function_call_ids
+                    if call_id not in continuity_state.pending_async_tool_calls
+                ],
             )
             if missing_call_ids:
                 responses_payload = responses_payload.model_copy(
@@ -3332,6 +3851,29 @@ class _WebSocketMixin:
             headers,
             synthesized_turn_state=synthesized_turn_state,
         )
+        previous_response_owner_account_id = None
+        if source_owned:
+            # A recorded subscription anchor overrides the model source, as on
+            # HTTP. Resolve after anchor injection, before schema selection and
+            # reservation, while invalid client-plane updates are still intact.
+            if responses_payload.previous_response_id is not None:
+                previous_response_owner_account_id = await proxy._resolve_websocket_previous_response_owner(
+                    previous_response_id=responses_payload.previous_response_id,
+                    api_key=refreshed_api_key,
+                    session_id=session_id,
+                    surface="websocket_source_route",
+                )
+                source_owned = previous_response_owner_account_id is None
+            if source_owned:
+                validate_configuration_update_policy(responses_payload, refreshed_api_key, subscription=False)
+            else:
+                validate_astra_request(responses_payload, refreshed_api_key)
+                if original_full_resend_payload is not None:
+                    # The selected anchor body contains only the suffix. Its
+                    # stale-anchor fallback can resend the preserved prefix,
+                    # so that exact replay body must satisfy the same schema
+                    # and refreshed key policy before it is retained.
+                    validate_astra_request(original_full_resend_payload, refreshed_api_key)
         capability_route = await proxy._capability_router.route(
             capability_intent,
             api_key_id=refreshed_api_key.id if refreshed_api_key is not None else None,
@@ -3362,15 +3904,24 @@ class _WebSocketMixin:
                 client_metadata=client_metadata,
                 headers=headers,
                 session_id=session_id,
+                apply_astra_subscription_schema=not source_owned,
             )
-        except ProxyResponseError:
+        except (ProxyResponseError, AppError):
             await proxy._release_websocket_reservation(reservation)
             raise
         request_state.useragent = useragent
         request_state.useragent_group = useragent_group
         request_state.conversation_id = conversation_id
+        request_state.reconnect_conversation_id = _thread_id_from_headers(headers) or conversation_id
         request_state.client_ip = client_ip
         request_state.raw_source_model = raw_source_model
+        request_state.previous_response_owner_account_id = previous_response_owner_account_id
+        if source_owned and responses_payload.previous_response_id is not None:
+            # Schema selection already resolved this anchor without an owner.
+            # Reuse that miss for this request: a later publication must not
+            # route source-schema bytes to a subscription account. The next
+            # request resolves its owner again during preparation.
+            request_state.previous_response_owner_lookup_outcome = "miss"
         request_state.source_route_excluded = source_route_excluded
         request_state.responses_lite_model = next_responses_lite_model
         request_state.expose_stale_previous_response_classifier = codex_session_affinity
@@ -3379,6 +3930,7 @@ class _WebSocketMixin:
         original_full_resend_input: JsonValue | None = None
         if session_anchor is not None:
             request_state.proxy_injected_previous_response_id = True
+            request_state.proxy_injected_anchor_connection_id = session_anchor_connection_id
             request_state.input_item_count = original_input_item_count or request_state.input_item_count
             request_state.input_full_fingerprint = original_input_fingerprint
             if original_full_resend_payload is not None:
@@ -3403,6 +3955,11 @@ class _WebSocketMixin:
             )
             if not request_state.fresh_upstream_request_is_retry_safe:
                 request_state.fresh_upstream_request_text = None
+            request_state.proxy_injected_anchor_retains_prior_output = bool(
+                session_anchor_retains_prior_output
+                and request_state.fresh_upstream_request_text is not None
+                and json.loads(request_state.fresh_upstream_request_text).get("input") == original_full_resend_input
+            )
             request_state.fresh_upstream_request_responses_lite_model = (
                 responses_payload.model if body_uses_responses_lite else None
             )
@@ -3948,6 +4505,7 @@ class _WebSocketMixin:
                     sticky_seed_key=request_state.affinity_policy.seed_selection_key,
                     sticky_seed_kind=request_state.affinity_policy.seed_selection_kind,
                     spill_bare_session_on_account_cap=request_state.affinity_policy.spill_on_account_cap,
+                    allow_burn_first_reallocation=request_state.affinity_policy.allow_burn_first_reallocation,
                     abandon_unavailable_legacy_owner=(request_state.affinity_policy.abandon_unavailable_legacy_owner),
                     require_unambiguous_account=request_state.affinity_policy.require_unambiguous_account,
                     sticky_max_age_seconds=sticky_max_age_seconds,
@@ -4041,6 +4599,7 @@ class _WebSocketMixin:
                 reason="owner_account_unavailable",
                 previous_response_id=request_state.previous_response_id,
                 session_id=request_state.session_id,
+                request_state=request_state,
                 upstream_error_code="previous_response_owner_unavailable",
             )
             await proxy._emit_websocket_connect_failure(
@@ -4119,6 +4678,7 @@ class _WebSocketMixin:
                 reason="owner_account_unavailable",
                 previous_response_id=request_state.previous_response_id,
                 session_id=request_state.session_id,
+                request_state=request_state,
                 upstream_error_code=error_code,
             )
             await proxy._emit_websocket_connect_failure(
@@ -4998,6 +5558,7 @@ class _WebSocketMixin:
                 reason="owner_lookup_failed",
                 previous_response_id=response_id,
                 session_id=session_id_value,
+                request_state=request_state,
             )
             _facade().logger.warning("Previous response owner lookup failed; failing closed", exc_info=True)
             raise ProxyResponseError(
@@ -5085,8 +5646,16 @@ class _WebSocketMixin:
         proxy = cast(_WebSocketServiceProtocol, self)
         clock = clock_for(proxy)
         scheduler = scheduler_for(proxy)
+        close_outcome: _WebSocketCloseOutcome = "unknown"
         try:
             while True:
+                if upstream_control.retire_after_drain and await _retire_drained_websocket_upstream(
+                    upstream,
+                    upstream_control=upstream_control,
+                    pending_requests=pending_requests,
+                    pending_lock=pending_lock,
+                ):
+                    break
                 receive_timeout = await proxy._next_websocket_receive_timeout(
                     pending_requests,
                     pending_lock=pending_lock,
@@ -5096,6 +5665,7 @@ class _WebSocketMixin:
                 receive_deadline = (
                     None if receive_timeout is None else clock.monotonic() + receive_timeout.timeout_seconds
                 )
+                retirement_poll = False
                 try:
                     while True:
                         wait_timeout = None if receive_deadline is None else receive_deadline - clock.monotonic()
@@ -5106,11 +5676,32 @@ class _WebSocketMixin:
                             wait_timeout = (
                                 keepalive_interval if wait_timeout is None else min(wait_timeout, keepalive_interval)
                             )
-                        message = await scheduler.wait_for(
-                            upstream.receive(),
-                            timeout=wait_timeout,
-                        )
+                        elif upstream_control.retire_after_drain:
+                            # Sender-side cleanup can empty the queue while
+                            # receive is blocked. Keep retirement observable
+                            # even when downstream keepalives are disabled.
+                            wait_timeout = 1.0 if wait_timeout is None else min(wait_timeout, 1.0)
+                            retirement_poll = True
+                        try:
+                            message = await scheduler.wait_for(
+                                upstream.receive(),
+                                timeout=wait_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            if retirement_poll and (receive_deadline is None or clock.monotonic() < receive_deadline):
+                                if await _retire_drained_websocket_upstream(
+                                    upstream,
+                                    upstream_control=upstream_control,
+                                    pending_requests=pending_requests,
+                                    pending_lock=pending_lock,
+                                ):
+                                    return
+                                # Keep the original request/idle deadline while
+                                # polling for local cleanup; do not restart it.
+                                continue
+                            raise
                         if message.kind not in {"text", "binary"}:
+                            close_outcome = "transport_error" if message.kind == "error" else "closed"
                             # A transport-end frame makes this socket
                             # ineligible for another turn immediately. Set the
                             # latch before the drain-owned transport child can
@@ -5165,6 +5756,7 @@ class _WebSocketMixin:
                         continue
                     if receive_timeout is None:
                         raise
+                    close_outcome = "timeout"
                     if receive_timeout.fail_all_pending:
                         await proxy._fail_pending_websocket_requests(
                             account=account,
@@ -5195,6 +5787,7 @@ class _WebSocketMixin:
                         websocket=websocket,
                         client_send_lock=client_send_lock,
                         response_create_gate=response_create_gate,
+                        upstream_control=upstream_control,
                     )
                     continue
                 if message.kind == "text" and message.text is not None:
@@ -5293,6 +5886,8 @@ class _WebSocketMixin:
                         upstream_control=upstream_control,
                         response_create_gate=response_create_gate,
                         downstream_activity=downstream_activity,
+                        continuity_state=continuity_state,
+                        codex_session_affinity=codex_session_affinity,
                     ),
                     name=f"proxy-websocket-transport-end-{account_id_value}",
                 )
@@ -5318,8 +5913,10 @@ class _WebSocketMixin:
                 if should_stop_reader:
                     break
         except asyncio.CancelledError:
+            close_outcome = "reconnect" if upstream_control.reconnect_requested else "cancelled"
             raise
         except _CapabilityLineagePropagationError as exc:
+            close_outcome = "reader_error"
             error = _parse_openai_error(exc.error.payload)
             error_code = _normalize_error_code(
                 error.code if error else None,
@@ -5349,6 +5946,7 @@ class _WebSocketMixin:
                     exc_info=True,
                 )
         except _WebSocketReplaySequenceRegression as exc:
+            close_outcome = "reader_error"
             _facade().logger.warning(
                 "Refusing websocket replay after non-advancing sequence account_id=%s detail=%s",
                 account_id_value,
@@ -5377,6 +5975,7 @@ class _WebSocketMixin:
                     exc_info=True,
                 )
         except Exception:
+            close_outcome = "reader_error"
             _facade().logger.warning(
                 "Upstream websocket reader crashed account_id=%s",
                 account_id_value,
@@ -5396,6 +5995,12 @@ class _WebSocketMixin:
                 downstream_activity=downstream_activity,
             )
         finally:
+            if downstream_activity.disconnected:
+                close_outcome = "client_disconnected"
+            elif close_outcome == "unknown" and upstream_control.reconnect_requested:
+                close_outcome = "reconnect"
+            if not upstream_control.retaining_for_reconnect:
+                _record_websocket_connection_closed(upstream_control, now=clock.monotonic(), outcome=close_outcome)
             async with pending_lock:
                 has_pending_requests = bool(pending_requests)
             if not upstream_control.reconnect_requested and has_pending_requests:
@@ -5420,6 +6025,12 @@ class _WebSocketMixin:
         parsed_frame: _ParsedUpstreamWebSocketFrame | None = None,
         clock: Clock | None = None,
     ) -> str:
+        """Apply one upstream frame and return the text to forward downstream.
+
+        Pending-request matching and replay guards retain account ownership.
+        Eligible retries carry the original health evidence and signal frame
+        suppression through upstream_control while a replay is staged.
+        """
         proxy = cast(_WebSocketServiceProtocol, self)
         # The reader loop resolves the owner clock once per connection and
         # passes it per frame; the fallback only serves direct callers (tests).
@@ -5430,7 +6041,25 @@ class _WebSocketMixin:
         payload = parsed_frame.payload
         event_type = parsed_frame.event_type
         event = parsed_frame.event
+        if payload is not None and event_type in {
+            "response.steer.accepted",
+            "response.steer.pending",
+            "response.steer.failed",
+        }:
+            await process_websocket_steering_event(
+                proxy, payload, control=upstream_control, pending_requests=pending_requests, pending_lock=pending_lock
+            )
+            if event_type == "response.steer.failed" and isinstance(payload, dict):
+                public_payload = _sanitize_public_websocket_event_payload(payload, event_type=event_type)
+                if public_payload is not payload:
+                    return json.dumps(public_payload, ensure_ascii=True, separators=(",", ":"))
+            return text
         response_id = parsed_frame.response_id
+        if response_id is not None and response_id in upstream_control.suppressed_steering_response_ids:
+            upstream_control.suppress_downstream_event = True
+            if event_type in {"response.completed", "response.failed", "response.incomplete", "error"}:
+                forget_suppressed_steering_response(upstream_control, response_id)
+            return text
         error_message = _websocket_event_error_message(event_type, payload)
         is_typeless_error_event = (
             isinstance(payload, dict)
@@ -5485,7 +6114,15 @@ class _WebSocketMixin:
             has_other_pending_requests = False
             grouped_previous_response_request_states: list[_WebSocketRequestState] = []
             if event_type == "response.created":
-                request_state = _assign_websocket_response_id(pending_requests, response_id)
+                request_state = assign_websocket_created_request_state(
+                    payload,
+                    response_id=response_id,
+                    control=upstream_control,
+                    pending_requests=pending_requests,
+                )
+                if response_id is not None and response_id in upstream_control.suppressed_steering_response_ids:
+                    upstream_control.suppress_downstream_event = True
+                    return text
                 created_request_state = request_state
                 release_create_gate = request_state is not None
             elif response_id is not None:
@@ -5493,7 +6130,7 @@ class _WebSocketMixin:
                 release_create_gate = False
             elif response_id is None:
                 request_state = _match_websocket_request_state_for_anonymous_event(
-                    pending_requests,
+                    anonymous_websocket_request_candidates(pending_requests, upstream_control),
                     prefer_previous_response_not_found=is_previous_response_not_found_matching_event
                     or is_missing_tool_output_event,
                     previous_response_id_hint=previous_response_id_hint,
@@ -5501,6 +6138,16 @@ class _WebSocketMixin:
                     allow_unanchored_previous_response_error=is_previous_response_not_found_matching_event,
                     event_type=event_type,
                 )
+                if (
+                    request_state is None
+                    and (
+                        event_type in {"response.completed", "response.failed", "response.incomplete", "error"}
+                        or is_typeless_error_event
+                    )
+                    and consume_suppressed_steering_anonymous_terminal(upstream_control)
+                ):
+                    upstream_control.suppress_downstream_event = True
+                    return text
                 release_create_gate = False
             else:
                 release_create_gate = False
@@ -5538,7 +6185,10 @@ class _WebSocketMixin:
                 actual_service_tier = _facade()._service_tier_from_event_payload(payload)
                 if actual_service_tier is not None:
                     request_state.actual_service_tier = actual_service_tier
-                    request_state.service_tier = actual_service_tier
+                    request_state.service_tier = subscription_pricing_tier(
+                        request_state.model, request_state.requested_service_tier, actual_service_tier
+                    )
+                record_async_tool_call(request_state, payload)
                 completed_tool_call = _facade()._response_output_item_done_tool_call(payload)
                 if completed_tool_call is not None:
                     completed_call_id, completed_call_type = completed_tool_call
@@ -5718,6 +6368,12 @@ class _WebSocketMixin:
                 upstream_control.reconnect_requested = True
             downstream_texts: list[str] = []
             for grouped_request_state in grouped_previous_response_request_states:
+                if (
+                    grouped_request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET
+                    and is_previous_response_not_found_matching_event
+                    and grouped_request_state.continuity_first_rejection_at is None
+                ):
+                    grouped_request_state.continuity_first_rejection_at = clock.monotonic()
                 if grouped_error_reason == PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON:
                     grouped_request_state.previous_response_not_found_recovery_blocked = True
                     _record_continuity_fail_closed(
@@ -5725,6 +6381,7 @@ class _WebSocketMixin:
                         reason=PREVIOUS_RESPONSE_MALFORMED_PARAM_REASON,
                         previous_response_id=grouped_request_state.previous_response_id,
                         session_id=grouped_request_state.session_id,
+                        request_state=grouped_request_state,
                         upstream_error_code=PREVIOUS_RESPONSE_NOT_FOUND_CODE,
                     )
                 if grouped_error_reason == "previous_response_not_found":
@@ -5827,6 +6484,16 @@ class _WebSocketMixin:
                     pending_requests,
                 )
 
+        if (
+            request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET
+            and is_previous_response_not_found_matching_event
+            and request_state.continuity_first_rejection_at is None
+        ):
+            request_state.continuity_first_rejection_at = (
+                request_state.upstream_terminal_at
+                if request_state.upstream_terminal_at is not None
+                else clock.monotonic()
+            )
         retry_is_previous_response_not_found = is_previous_response_not_found_event
         retry_error_code = _websocket_precreated_retry_error_code(
             request_state,
@@ -5856,6 +6523,18 @@ class _WebSocketMixin:
             and retry_error_code is not None
         )
         if retry_safe_previous_response_not_found:
+            if request_state.transport == _REQUEST_TRANSPORT_WEBSOCKET:
+                # This attempt remains eligible for replay; preserve the existing fail-closed counter.
+                _record_websocket_stale_anchor_diagnostics(
+                    request_state,
+                    surface="websocket_stream",
+                    upstream_error_code=_normalize_error_code(
+                        _websocket_event_error_code(event_type, payload),
+                        _websocket_event_error_type(event_type, payload),
+                    )
+                    or "unknown",
+                    count_failure=False,
+                )
             downstream_text = text
         else:
             event, payload, event_type, downstream_text = _maybe_rewrite_websocket_previous_response_not_found_event(
@@ -5908,7 +6587,7 @@ class _WebSocketMixin:
         ):
             await proxy._handle_stream_error(
                 account,
-                {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
+                _websocket_event_upstream_error(event_type, payload),
                 retry_error_code,
             )
             event, payload, event_type, downstream_text = _rewrite_websocket_previous_response_owner_unavailable_event(
@@ -5920,7 +6599,7 @@ class _WebSocketMixin:
             if safe_request_text is None:
                 await proxy._handle_stream_error(
                     account,
-                    {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
+                    _websocket_event_upstream_error(event_type, payload),
                     retry_error_code,
                 )
                 event, payload, event_type, downstream_text = (
@@ -6060,13 +6739,13 @@ class _WebSocketMixin:
                         proxy,
                         request_state,
                         account=account,
-                        error_message=_websocket_event_error_message(event_type, payload),
+                        error=_websocket_event_upstream_error(event_type, payload),
                         error_code=retry_error_code,
                     )
                 else:
                     await proxy._handle_stream_error(
                         account,
-                        {"message": _websocket_event_error_message(event_type, payload) or "Upstream error"},
+                        _websocket_event_upstream_error(event_type, payload),
                         retry_error_code,
                     )
             if retry_error_code is not None:
@@ -6086,7 +6765,18 @@ class _WebSocketMixin:
             and completed_usage is not None
             and completed_usage.output_tokens == 0
         )
-        if event_type == "response.completed" and continuity_state is not None and not completed_empty_prewarm:
+        successful_boundary = event_type == "response.completed" or (
+            event_type == "response.incomplete" and _websocket_event_incomplete_reason(event_type, payload) == "steered"
+        )
+        if successful_boundary and not completed_empty_prewarm:
+            if request_state.model == "gpt-6-astra":
+                release_completed_steering_payload(request_state)
+            upstream_control.last_completed_request = request_state if request_state.model == "gpt-6-astra" else None
+            if event_type == "response.completed" and response_id is not None:
+                queued_steering = upstream_control.steering_continuations.get(response_id)
+                if queued_steering is not None:
+                    queued_steering.required_input = completed_steering_required_input(payload)
+        if successful_boundary and continuity_state is not None and not completed_empty_prewarm:
             _record_websocket_continuity_completion(
                 continuity_state,
                 request_state=request_state,
@@ -6170,6 +6860,21 @@ class _WebSocketMixin:
             response_create_gate=response_create_gate,
             isolate_account_health_failure=True,
         )
+        if (
+            event_type == "response.completed"
+            and not completed_empty_prewarm
+            and request_state.request_kind != "prewarm"
+            and request_state.api_key is not None
+            and request_state.session_id
+            and response_id is not None
+            and request_state.replay_count == 0
+        ):
+            upstream_control.reconnect_key = (
+                request_state.api_key.id,
+                request_state.session_id,
+                request_state.reconnect_conversation_id,
+                response_id,
+            )
         return downstream_text
 
     async def _handle_precreated_websocket_auth_failure(
@@ -6341,6 +7046,7 @@ class _WebSocketMixin:
         websocket: WebSocket | None = None,
         client_send_lock: anyio.Lock | None = None,
         response_create_gate: asyncio.Semaphore | None = None,
+        upstream_control: _WebSocketUpstreamControl | None = None,
     ) -> None:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
@@ -6353,6 +7059,15 @@ class _WebSocketMixin:
             ]
             for request_state in expired_requests:
                 pending_requests.remove(request_state)
+                parent_id = request_state.steering_parent_response_id
+                if upstream_control is not None and parent_id is not None:
+                    continuation = upstream_control.steering_continuations.get(parent_id)
+                    if continuation is not None and continuation.request_state is request_state:
+                        # Keep only bounded correlation for late successors.
+                        # Expiry remains the sole owner of request finalization.
+                        upstream_control.steering_continuations.pop(parent_id)
+                        upstream_control.rejected_steering_parent_ids.add(parent_id)
+                        retire_steering_history_if_full(upstream_control)
         if not expired_requests:
             return
         await proxy._fail_pending_websocket_requests(
@@ -6444,6 +7159,12 @@ class _WebSocketMixin:
             if incomplete_reason is not None:
                 error_code = incomplete_reason
                 error_message = incomplete_reason
+                if incomplete_reason == CONTROLLED_INTERRUPTION_ERROR_CODE:
+                    status = CANCELLED_STATUS
+            if incomplete_reason == "steered":
+                status = "success"
+                error_code = None
+                error_message = None
             if event_type == "response.failed":
                 error_payload = _upstream_error_from_openai(error)
             usage = event.response.usage if event and event.response else None
@@ -6454,6 +7175,15 @@ class _WebSocketMixin:
             if event and event.response and event.response.id:
                 response_id = event.response.id
 
+        _record_websocket_request_terminal(
+            request_state,
+            status=status
+            if event_type in {"response.completed", "response.failed", "response.incomplete", "error"}
+            else "unknown",
+            now=upstream_terminal_at,
+            response_id=event.response.id if event and event.response else None,
+        )
+
         _refine_websocket_request_kind_from_completion(
             request_state,
             event_type=event_type,
@@ -6463,7 +7193,10 @@ class _WebSocketMixin:
         actual_service_tier = _facade()._service_tier_from_event_payload(payload)
         if actual_service_tier is not None:
             request_state.actual_service_tier = actual_service_tier
-            response_service_tier = actual_service_tier
+            response_service_tier = subscription_pricing_tier(
+                request_state.model, request_state.requested_service_tier, actual_service_tier
+            )
+            request_state.service_tier = response_service_tier
 
         settlement = _StreamSettlement(
             status=status,
@@ -6473,6 +7206,9 @@ class _WebSocketMixin:
             output_tokens=usage.output_tokens if usage else None,
             cached_input_tokens=(
                 usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
+            ),
+            cache_write_input_tokens=(
+                usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
             ),
             error_code=error_code,
             error_message=error_message,
@@ -6555,6 +7291,9 @@ class _WebSocketMixin:
                     await proxy._drain_deferred_keyed_stream_health(request_state)
         latency_ms = int((clock_for(proxy).monotonic() - request_state.started_at) * 1000)
         cached_input_tokens = usage.input_tokens_details.cached_tokens if usage and usage.input_tokens_details else None
+        cache_write_input_tokens = (
+            usage.input_tokens_details.cache_write_tokens if usage and usage.input_tokens_details else None
+        )
         reasoning_tokens = (
             usage.output_tokens_details.reasoning_tokens if usage and usage.output_tokens_details else None
         )
@@ -6581,6 +7320,7 @@ class _WebSocketMixin:
                     input_tokens=usage.input_tokens if usage else None,
                     output_tokens=usage.output_tokens if usage else None,
                     cached_input_tokens=cached_input_tokens,
+                    cache_write_input_tokens=cache_write_input_tokens,
                     reasoning_tokens=reasoning_tokens,
                     reasoning_effort=request_state.reasoning_effort,
                     transport=request_state.transport,
@@ -6728,6 +7468,7 @@ class _WebSocketMixin:
     ) -> None:
         proxy = cast(_WebSocketServiceProtocol, self)
         _ = proxy
+        _record_websocket_request_terminal(request_state, status=status, now=clock_for(proxy).monotonic())
         if request_state.skip_request_log:
             return
         await proxy._write_request_log(
@@ -7016,6 +7757,7 @@ class _WebSocketMixin:
                 error_type=request_error_type,
                 error_param=request_error_param,
             )
+            _record_websocket_request_terminal(request_state, status=status, now=clock_for(proxy).monotonic())
             if index == last_index:
                 try:
                     _facade()._maybe_dump_oversized_response_create_request(
@@ -7223,6 +7965,7 @@ class _WebSocketMixin:
             error_type=error_type,
             error_param=error_param,
         )
+        _record_websocket_request_terminal(request_state, status="error", now=clock_for(proxy).monotonic())
         event = response_failed_event(
             error_code,
             error_message,

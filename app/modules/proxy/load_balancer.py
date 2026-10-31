@@ -59,7 +59,7 @@ from app.core.resilience.circuit_breaker import are_all_account_circuit_breakers
 from app.core.resilience.degradation import get_status as get_degradation_status
 from app.core.resilience.degradation import set_degraded, set_normal
 from app.core.resilience.toggles import resolve_resilience_toggles
-from app.core.usage.quota import apply_usage_quota
+from app.core.usage.quota import _has_usable_credits, apply_usage_quota
 from app.core.usage.refresh_policy import usage_freshness_horizon_seconds
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
@@ -99,12 +99,11 @@ from app.modules.proxy._load_balancer.opportunistic_admission import (
     detached_runtime_snapshot,
     run_opportunistic_admission,
 )
+from app.modules.proxy._load_balancer.quota_first import QuotaFirstStickySelectionMixin, filter_funding_inputs
 from app.modules.proxy._load_balancer.sticky_selection import (
-    _STICKY_EXISTING_UNSET,
     SelectionInputsProtocol,
     StickySelectionRequest,
     _clone_account,
-    _StickySelectionOutcome,
     prepare_selection_states,
     run_sticky_selection_path,
 )
@@ -127,7 +126,6 @@ from app.modules.proxy._load_balancer.sticky_selection import (
 from app.modules.proxy._load_balancer.sticky_selection import (
     _select_account_preferring_budget_safe as _select_account_preferring_budget_safe,
 )
-from app.modules.proxy._load_balancer.sticky_selection import _select_with_stickiness as _run_select_with_stickiness
 from app.modules.proxy._load_balancer.sticky_selection import (
     _state_above_budget_threshold as _state_above_budget_threshold,
 )
@@ -178,7 +176,7 @@ from app.modules.usage.mappers import usage_history_to_window_row
 
 if TYPE_CHECKING:
     from app.modules.accounts.repository import AccountsRepository
-    from app.modules.proxy.sticky_repository import StickyOwnerLookup, StickySessionsRepository
+    from app.modules.proxy.sticky_repository import StickyOwnerLookup
 
 logger = logging.getLogger(__name__)
 
@@ -298,7 +296,7 @@ def _required_continuity_owner_failure(
 SelectionInputs = _SelectionInputs
 
 
-class LoadBalancer:
+class LoadBalancer(QuotaFirstStickySelectionMixin):
     def __init__(
         self,
         repo_factory: ProxyRepoFactory,
@@ -311,6 +309,8 @@ class LoadBalancer:
         self._clock = clock
         self._runtime: dict[str, RuntimeState] = {}
         self._runtime_lock = asyncio.Lock()
+        self._quota_first_lock = asyncio.Lock()
+        self._fresh_thread_allocations: dict[str, int] = {}
         self._account_locks: dict[str, asyncio.Lock] = {}
         self._account_locks_registry_lock = asyncio.Lock()
         self._selection_inputs_cache = get_account_selection_cache()
@@ -579,6 +579,7 @@ class LoadBalancer:
         sticky_seed_key: str | None = None,
         sticky_seed_kind: StickySessionKind | None = None,
         spill_bare_session_on_account_cap: bool = False,
+        allow_burn_first_reallocation: bool = False,
         abandon_unavailable_legacy_owner: bool = False,
         require_unambiguous_account: bool = False,
         sticky_max_age_seconds: int | None = None,
@@ -615,6 +616,13 @@ class LoadBalancer:
             raise ValueError("required account ownership flags require required_account_id")
         # C2-2 routing/overload: resolved once, threaded through every lock section below.
         tunables = self._resolve_routing_tunables(routing_tunables)
+
+        if routing_strategy == "quota_first_balanced":
+            # Thread ownership still applies; process preference must not seed siblings.
+            sticky_seed_key = None
+            sticky_seed_kind = None
+            budget_threshold_pct = 100.0
+            secondary_budget_threshold_pct = 100.0
 
         excluded_ids = set(exclude_account_ids or ())
         scoped_account_ids = None if account_ids is None else set(account_ids)
@@ -689,6 +697,10 @@ class LoadBalancer:
                     quota_admitted_catalog_omission_account_ids=(
                         selection_inputs.quota_admitted_catalog_omission_account_ids
                     ),
+                )
+            if routing_strategy == "quota_first_balanced":
+                selection_inputs = filter_funding_inputs(
+                    selection_inputs, now=self._clock.time(), build_states=_build_states
                 )
             if excluded_ids and selection_inputs.accounts:
                 filtered_accounts = [account for account in selection_inputs.accounts if account.id not in excluded_ids]
@@ -953,6 +965,7 @@ class LoadBalancer:
                     sticky_seed_kind=sticky_seed_kind,
                     sticky_seed_account_id=sticky_seed_account_id,
                     spill_bare_session_on_account_cap=spill_bare_session_on_account_cap,
+                    allow_burn_first_reallocation=allow_burn_first_reallocation,
                     abandon_unavailable_legacy_owner=abandon_unavailable_legacy_owner,
                     require_unambiguous_account=require_unambiguous_account,
                     sticky_max_age_seconds=sticky_max_age_seconds,
@@ -1647,65 +1660,6 @@ class LoadBalancer:
                 self._account_locks[account_id] = lock
             return lock
 
-    async def _select_with_stickiness(
-        self,
-        *,
-        states: list[AccountState],
-        account_map: dict[str, Account],
-        sticky_key: str | None,
-        sticky_kind: StickySessionKind | None,
-        reallocate_sticky: bool,
-        sticky_max_age_seconds: int | None,
-        budget_threshold_pct: float = 95.0,
-        secondary_budget_threshold_pct: float = 100.0,
-        prefer_earlier_reset_accounts: bool,
-        prefer_earlier_reset_window: ResetPreferenceWindow,
-        routing_strategy: RoutingStrategy,
-        relative_availability_power: float = 2.0,
-        relative_availability_top_k: int = 5,
-        sticky_repo: StickySessionsRepository | None,
-        routing_costs_by_account_id: RoutingCostsByAccount | None = None,
-        sticky_existing_account_id: str | None | object = _STICKY_EXISTING_UNSET,
-        initial_preferred_account_id: str | None = None,
-        preserve_existing_mapping_on_fallback: bool = False,
-        preserve_reason_request_local: bool = False,
-        traffic_class: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
-        ignore_standard_quota: bool = False,
-        allow_usage_exhaustion_error: bool = True,
-        usage_exhaustion_states: Iterable[AccountState] | None = None,
-        sticky_refresh_skip_deadline: datetime | None = None,
-        redact_sensitive_details: bool = False,
-    ) -> _StickySelectionOutcome:
-        return await _run_select_with_stickiness(
-            states=states,
-            account_map=account_map,
-            sticky_key=sticky_key,
-            sticky_kind=sticky_kind,
-            reallocate_sticky=reallocate_sticky,
-            sticky_max_age_seconds=sticky_max_age_seconds,
-            budget_threshold_pct=budget_threshold_pct,
-            secondary_budget_threshold_pct=secondary_budget_threshold_pct,
-            prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
-            prefer_earlier_reset_window=prefer_earlier_reset_window,
-            routing_strategy=routing_strategy,
-            relative_availability_power=relative_availability_power,
-            relative_availability_top_k=relative_availability_top_k,
-            sticky_repo=sticky_repo,
-            routing_costs_by_account_id=routing_costs_by_account_id,
-            sticky_existing_account_id=sticky_existing_account_id,
-            initial_preferred_account_id=initial_preferred_account_id,
-            preserve_existing_mapping_on_fallback=preserve_existing_mapping_on_fallback,
-            preserve_reason_request_local=preserve_reason_request_local,
-            traffic_class=traffic_class,
-            ignore_standard_quota=ignore_standard_quota,
-            allow_usage_exhaustion_error=allow_usage_exhaustion_error,
-            usage_exhaustion_states=usage_exhaustion_states,
-            sticky_refresh_skip_deadline=sticky_refresh_skip_deadline,
-            overload_backoff_runtime=self._runtime,
-            clock=self._clock,
-            redact_sensitive_details=redact_sensitive_details,
-        )
-
     _persist_sticky_mutation = staticmethod(_persist_sticky_mutation)
     _restore_sticky_mutation = staticmethod(_restore_sticky_mutation)
 
@@ -1953,7 +1907,7 @@ class LoadBalancer:
             error_count=runtime.error_count,
             deactivation_reason=account.deactivation_reason,
             plan_type=account.plan_type,
-            capacity_credits=usage_core.capacity_for_plan(account.plan_type, "secondary"),
+            capacity_credits=usage_core.capacity_for_account(account, "secondary"),
             routing_policy=routing_policy,
             ignore_standard_quota=False,
         )
@@ -2348,7 +2302,7 @@ def _state_from_account(
             if _usage_entry_recorded_after_block(early_freshness_entry, effective_blocked_at):
                 rate_limited_cooldown_deadline = None
 
-    if usage_core.capacity_for_plan(account.plan_type, "primary") == 0.0 and (
+    if usage_core.capacity_for_account(account, "primary") == 0.0 and (
         account.status != AccountStatus.RATE_LIMITED
         or (
             rate_limited_cooldown_deadline is None
@@ -2551,7 +2505,9 @@ def _state_from_account(
     long_window_key = "secondary"
     if effective_secondary_entry is not None and effective_secondary_entry.window == "monthly":
         long_window_key = "monthly"
-    capacity_credits = usage_core.capacity_for_plan(account.plan_type, long_window_key) or 0.0
+    capacity_credits = usage_core.capacity_for_account(account, long_window_key)
+    if capacity_credits is None:
+        capacity_credits = 0.0
     if capacity_credits > 0.0 and runtime.leased_tokens > 0:
         leased_token_pressure_pct = runtime.leased_tokens * tunables.lease_token_weight / capacity_credits * 100.0
     pressure_pct = inflight_pressure_pct + leased_token_pressure_pct
@@ -2584,6 +2540,10 @@ def _state_from_account(
         inflight_streams=runtime.inflight_streams,
         leased_tokens=runtime.leased_tokens,
         routing_policy=routing_policy,
+        subscription_exhausted=any(value is not None and value >= 100.0 for value in (primary_used, secondary_used)),
+        has_usable_credits=_has_usable_credits(
+            credits_has=credits_has, credits_unlimited=credits_unlimited, credits_balance=credits_balance
+        ),
         selection_weight_multiplier=error_rate_weight_multiplier(
             runtime, now, policy=ErrorRateWeightingPolicy(enabled=tunables.error_rate_weighting_enabled)
         ),
@@ -2605,7 +2565,7 @@ def _normalize_usage_inputs(
     if (
         effective_secondary_entry is not None
         and effective_secondary_entry.window == "monthly"
-        and usage_core.capacity_for_plan(account.plan_type, "monthly") is None
+        and usage_core.capacity_for_account(account, "monthly") is None
     ):
         effective_secondary_entry = None
     primary_row = usage_history_to_window_row(primary_entry) if primary_entry is not None else None
@@ -2802,7 +2762,7 @@ def _select_long_window_entry(
     monthly_entry: UsageHistory | None,
     secondary_entry: UsageHistory | AdditionalUsageHistory | None,
 ) -> UsageHistory | AdditionalUsageHistory | None:
-    if monthly_entry is not None and usage_core.capacity_for_plan(account.plan_type, "monthly") is not None:
+    if monthly_entry is not None and usage_core.capacity_for_account(account, "monthly") is not None:
         return monthly_entry
     return secondary_entry
 
@@ -2823,7 +2783,7 @@ def _rate_limited_freshness_entry(
     if (
         long_window_entry is not None
         and long_window_entry.window == "monthly"
-        and usage_core.capacity_for_plan(account.plan_type, "monthly") is None
+        and usage_core.capacity_for_account(account, "monthly") is None
     ):
         long_window_entry = None
     # Freshness cannot prove recovery while an applicable long window is

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import List
 
-from pydantic import Field, PrivateAttr, field_validator
+from pydantic import Field, PrivateAttr, StrictBool, field_validator
 
 from app.modules.shared.schemas import DashboardModel
 
@@ -89,6 +89,9 @@ class AccountSummary(DashboardModel):
     workspace_label: str | None = None
     seat_type: str | None = None
     plan_type: str
+    pro_legacy_allowance: bool = False
+    usage_multiplier: float | None = None
+    capacity_credits_estimated: bool = True
     routing_policy: str = Field(default="normal", pattern=r"^(normal|burn_first|preserve)$")
     status: str
     security_work_authorized: bool = False
@@ -165,6 +168,7 @@ class AccountOpenCodeAuthExportAccount(DashboardModel):
 
 class AccountUpdateRequest(DashboardModel):
     security_work_authorized: bool | None = None
+    pro_legacy_allowance: StrictBool | None = None
 
 
 class AccountUpdateResponse(DashboardModel):

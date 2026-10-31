@@ -48,6 +48,7 @@ from app.core.openai.parsing import (
 from app.core.types import JsonValue
 from app.core.usage.live_hub import publish_live_usage
 from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text
+from app.core.usage.pricing import subscription_pricing_tier
 from app.core.utils.request_id import reset_request_id, set_request_id
 from app.core.utils.shared_future import wait_on_shared_future
 from app.core.utils.sse import format_sse_event, format_sse_event_from_text, parse_sse_data_json_text
@@ -134,6 +135,7 @@ from app.modules.proxy._service.http_bridge.service_stubs import (
     _websocket_event_error_message,
     _websocket_event_error_param,
     _websocket_event_error_type,
+    _websocket_event_upstream_error,
     _websocket_owner_pinned_quota_error_code,
     _websocket_precreated_auth_error_code,
     _websocket_precreated_retry_error_code,
@@ -179,6 +181,8 @@ from app.modules.proxy._service.support import (
     _websocket_should_defer_reasoning_prelude,
     _WebSocketReceiveTimeout,
     _WebSocketRequestState,
+    record_async_tool_call,
+    update_pending_async_tools,
 )
 from app.modules.proxy._service.support import (
     _websocket_route_log_kwargs as _websocket_route_log_kwargs,
@@ -979,6 +983,13 @@ def _durable_pending_tool_call_manifest(
         return None
     if terminal_calls and terminal_calls != request_state.pending_tool_call_types:
         return None
+    sync_calls = {
+        call_id: call_type
+        for call_id, call_type in request_state.pending_tool_call_types.items()
+        if call_id not in request_state.async_tool_call_types
+    }
+    if request_state.async_tool_call_types:
+        return sync_calls or None
     return dict(request_state.pending_tool_call_types)
 
 
@@ -1610,6 +1621,7 @@ async def _invalidate_denied_http_bridge_anchor(
                         session.last_completed_input_count = 0
                         session.last_completed_input_prefix_fingerprint = None
                         session.last_pending_tool_calls.clear()
+                        session.pending_async_tool_calls.clear()
                     if owner_matches_for_cleanup and (cleared or no_durable_owner) and unregister_succeeded:
                         session.denied_proxy_injected_anchor_ids.discard(denied_response_id)
                         session.denied_proxy_injected_anchor_cleanup_pending.discard(denied_response_id)
@@ -2648,6 +2660,12 @@ class _HTTPBridgeUpstreamEventsMixin:
         scheduler: Scheduler,
         clock: Clock,
     ) -> None:
+        """Dispatch a parsed upstream frame to its pending HTTP bridge request.
+
+        Match request ownership before retry or terminal handling. Retry health
+        retains the upstream error evidence, including reset fields, through
+        the existing deferred settlement path for API-key reservations.
+        """
         original_text = text
         error_message = _websocket_event_error_message(event_type, payload)
         is_typeless_error_event = (
@@ -2737,12 +2755,15 @@ class _HTTPBridgeUpstreamEventsMixin:
                 actual_service_tier = _service_tier_from_event_payload(payload)
                 if actual_service_tier is not None:
                     matched_request_state.actual_service_tier = actual_service_tier
-                    matched_request_state.service_tier = actual_service_tier
+                    matched_request_state.service_tier = subscription_pricing_tier(
+                        matched_request_state.model, matched_request_state.requested_service_tier, actual_service_tier
+                    )
                 _record_http_bridge_tool_call_lifecycle(
                     matched_request_state,
                     event_type=event_type,
                     payload=payload,
                 )
+                record_async_tool_call(matched_request_state, payload)
                 completed_tool_call = _response_output_item_done_tool_call(payload)
                 if completed_tool_call is not None:
                     completed_call_id, completed_call_type = completed_tool_call
@@ -3477,7 +3498,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             await self._handle_or_defer_precreated_stream_health(
                 status_request_state,
                 session.account,
-                {"message": retry_error_message or "Upstream error"},
+                _websocket_event_upstream_error(event_type, payload),
                 retry_error_code,
             )
             retry_consumer_attached = (
@@ -3545,7 +3566,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             await self._handle_or_defer_precreated_stream_health(
                 status_request_state,
                 session.account,
-                {"message": retry_error_message or "Upstream error"},
+                _websocket_event_upstream_error(event_type, payload),
                 owner_pinned_quota_error,
             )
             if (
@@ -3670,7 +3691,7 @@ class _HTTPBridgeUpstreamEventsMixin:
             await self._handle_or_defer_precreated_stream_health(
                 status_request_state,
                 session.account,
-                {"message": retry_error_message or "Upstream error"},
+                _websocket_event_upstream_error(event_type, payload),
                 retry_error_code,
             )
             # Pre-created anchored requests belong to the owner-pinned branch
@@ -3699,16 +3720,31 @@ class _HTTPBridgeUpstreamEventsMixin:
                         session.pending_requests.remove(status_request_state)
                         session.queued_request_count = max(0, session.queued_request_count - 1)
                 if staged:
-                    # A busy create gate forwards the upstream terminal as-is;
-                    # only a replay that was attempted and failed is rewritten.
-                    status_request_state.error_http_status_override = 502
-                    (
-                        _downstream_text,
-                        event_block,
-                        event,
-                        payload,
-                        event_type,
-                    ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
+                    # A failed retry must not hide an upstream quota response
+                    # (including its reset metadata) behind a synthetic 502.
+                    # Other replay failures remain fail-closed as
+                    # ``stream_incomplete`` because their original terminal is
+                    # not a status-bearing quota response.
+                    preserve_upstream_rate_limit = _http_error_status_from_payload(
+                        payload
+                    ) == 429 and retry_error_code in {
+                        "rate_limit_exceeded",
+                        "usage_limit_reached",
+                        "insufficient_quota",
+                        "usage_not_included",
+                        "quota_exceeded",
+                    }
+                    if preserve_upstream_rate_limit:
+                        _clear_websocket_request_error_overrides(status_request_state)
+                    else:
+                        status_request_state.error_http_status_override = 502
+                        (
+                            _downstream_text,
+                            event_block,
+                            event,
+                            payload,
+                            event_type,
+                        ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
 
         completed_usage = (
             event.response.usage if event_type == "response.completed" and event and event.response else None
@@ -4064,6 +4100,9 @@ class _HTTPBridgeUpstreamEventsMixin:
             # input_item_count, e.g. string inputs) can still reuse this
             # anchor for continuity lookups.
             if response_id is not None:
+                if terminal_request_state.previous_response_id != session.last_completed_response_id:
+                    session.pending_async_tool_calls.clear()
+                update_pending_async_tools(session.pending_async_tool_calls, terminal_request_state)
                 session.last_completed_response_id = response_id
                 # This response was completed on the session's current account, so
                 # that account owns the anchor. Record it so the anchor is only

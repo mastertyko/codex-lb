@@ -44,6 +44,7 @@ from app.core.auth.dependencies import (
     validate_required_proxy_api_key_authorization,
     validate_usage_api_key,
 )
+from app.core.auth.desktop_oauth import get_desktop_oauth
 from app.core.auth.refresh import RefreshError
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, bump_cache_invalidation_local
 from app.core.clients.files import FileProxyError
@@ -87,11 +88,13 @@ from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
 from app.core.errors import (
     HTTP_BRIDGE_EVENTLESS_TIMEOUT_CODE,
+    NATIVE_GIVEUP_RETRYABLE_CODE,
     PREVIOUS_RESPONSE_STREAM_INCOMPLETE_MESSAGE,
     SYNTHETIC_TRANSPORT_FAILURE_MARKER,
     OpenAIErrorEnvelope,
     OpenAIErrorParam,
     is_previous_response_not_found_public_shape,
+    native_giveup_retryable_message,
     normalize_public_error_param,
     openai_error,
     response_failed_event,
@@ -100,8 +103,10 @@ from app.core.errors import (
 )
 from app.core.exceptions import (
     ProxyAuthError,
+    ProxyInvalidRequestError,
     ProxyModelNotAllowed,
     ProxyRateLimitError,
+    ProxyReasoningEffortNotAllowed,
     ProxyUpstreamError,
 )
 from app.core.metrics.prometheus import (
@@ -255,6 +260,7 @@ from app.modules.model_sources.selection import (
 from app.modules.proxy import affinity as proxy_affinity_module
 from app.modules.proxy import images_service as images_service_module
 from app.modules.proxy import service as proxy_service_module
+from app.modules.proxy._service.http_bridge.helpers import _trim_http_bridge_previous_response_input_items
 from app.modules.proxy._service.observability import record_http_bridge_routing
 from app.modules.proxy._service.support import (
     _bind_propagated_capacity_startup_ready,
@@ -276,6 +282,7 @@ from app.modules.proxy._service.support import (
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
 from app.modules.proxy.capability_routing import required_capability_metadata_values
+from app.modules.proxy.desktop_predictions import prediction_http_response, prediction_lane, route_desktop_websocket
 from app.modules.proxy.downstream_delivery import DeliveryTracedStreamingResponse
 from app.modules.proxy.helpers import _openai_error_param, _parse_openai_error, _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import (
@@ -295,6 +302,7 @@ from app.modules.proxy.request_policy import (
     apply_prohibit_fast_mode,
     enforce_strict_function_tools_format,
     enforce_strict_text_format,
+    has_astra_configuration_updates,
     model_alias_requests_fast_mode,
     normalize_responses_request_payload,
     normalize_source_reasoning_aliases,
@@ -306,6 +314,8 @@ from app.modules.proxy.request_policy import (
     restore_source_reasoning_effort,
     sanitize_source_chat_payload,
     strip_terminal_compaction_trigger_input,
+    validate_astra_request,
+    validate_configuration_update_policy,
     validate_model_access,
     validate_top_level_compaction_trigger_input_shape,
 )
@@ -1165,6 +1175,11 @@ async def responses(
         return _logged_error_json_response(request, 400, error)
 
     backend_non_streaming_requested = responses_payload.stream is False
+    native = get_desktop_oauth(request)
+    if native is not None:
+        prediction = await prediction_http_response(request, responses_payload.to_payload(), context.service, native)
+        if prediction is not None:
+            return prediction
     raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
     (
         prohibit_fast_mode,
@@ -1306,7 +1321,7 @@ async def responses_websocket(
     # and codex-rs treats the downgrade as session-scoped, so the client never
     # comes back. Keep capability handshakes on the websocket and let the
     # ordinary capability path surface real upstream failures.
-    if not capability_header_values:
+    if not capability_header_values and get_desktop_oauth(websocket) is None:
         transport_denial = await _websocket_upstream_transport_denial()
         if transport_denial is not None:
             await websocket.send_denial_response(transport_denial)
@@ -1317,6 +1332,19 @@ async def responses_websocket(
     forwarded_headers = dict(websocket.headers)
     if client_turn_state is None and CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE.synthesized_turn_state_header:
         forwarded_headers["x-codex-turn-state"] = turn_state
+    native = get_desktop_oauth(websocket)
+    if native is not None:
+        await route_desktop_websocket(
+            websocket,
+            forwarded_headers,
+            context.service,
+            native,
+            codex_session_affinity=True,
+            client_ip=resolve_request_client_host(websocket),
+            synthesized_turn_state=turn_state if client_turn_state is None else None,
+            capability_header_values=capability_header_values,
+        )
+        return
     await context.service.proxy_responses_websocket(
         websocket,
         forwarded_headers,
@@ -1370,6 +1398,11 @@ async def v1_responses(
     except ValidationError as exc:
         error = openai_validation_error(exc)
         return _logged_error_json_response(request, 400, error)
+    native = get_desktop_oauth(request)
+    if native is not None:
+        prediction = await prediction_http_response(request, responses_payload.to_payload(), context.service, native)
+        if prediction is not None:
+            return prediction
     raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
     (
         prohibit_fast_mode,
@@ -1678,7 +1711,7 @@ async def v1_responses_websocket(
     # and codex-rs treats the downgrade as session-scoped, so the client never
     # comes back. Keep capability handshakes on the websocket and let the
     # ordinary capability path surface real upstream failures.
-    if not capability_header_values:
+    if not capability_header_values and get_desktop_oauth(websocket) is None:
         transport_denial = await _websocket_upstream_transport_denial()
         if transport_denial is not None:
             await websocket.send_denial_response(transport_denial)
@@ -1689,6 +1722,19 @@ async def v1_responses_websocket(
     forwarded_headers = dict(websocket.headers)
     if client_turn_state is None and CODEX_0150_RESPONSES_WEBSOCKET_WIRE_PROFILE.synthesized_turn_state_header:
         forwarded_headers["x-codex-turn-state"] = turn_state
+    native = get_desktop_oauth(websocket)
+    if native is not None:
+        await route_desktop_websocket(
+            websocket,
+            forwarded_headers,
+            context.service,
+            native,
+            codex_session_affinity=False,
+            client_ip=resolve_request_client_host(websocket),
+            synthesized_turn_state=turn_state if client_turn_state is None else None,
+            capability_header_values=capability_header_values,
+        )
+        return
     await context.service.proxy_responses_websocket(
         websocket,
         forwarded_headers,
@@ -1733,8 +1779,16 @@ async def v1_usage(
     async with get_background_session() as session:
         service = ApiKeysService(ApiKeysRepository(session), usage_repository=UsageRepository(session))
         usage = await service.get_key_usage_summary_for_self(api_key.id)
-        aggregate_limits = await _build_aggregate_credit_limits(session) if "upstream_limits" in usage_sections else {}
         hide_upstream_limits = await _hide_upstream_quota_for_api_key_clients(api_key)
+        aggregate_limits, unquantified_windows = (
+            await _build_aggregate_credit_limits(
+                session,
+                assigned_account_ids=api_key.assigned_account_ids,
+                account_assignment_scope_enabled=api_key.account_assignment_scope_enabled,
+            )
+            if "upstream_limits" in usage_sections and not hide_upstream_limits
+            else ({}, [])
+        )
         account_pool_usage = (
             await _build_account_pool_usage(
                 session,
@@ -1758,6 +1812,7 @@ async def v1_usage(
         total_cost_usd=usage.total_cost_usd,
         limits=own_limits or upstream_limits,
         upstream_limits=upstream_limits,
+        upstream_limits_unquantified_windows=unquantified_windows,
         account_pool_usage=account_pool_usage,
     )
 
@@ -2181,6 +2236,8 @@ async def _build_account_pool_usage(
     return AccountPoolUsageResponse(
         primary=data.remaining_percent_primary,
         secondary=data.remaining_percent_secondary,
+        unquantified_account_count_primary=data.unquantified_account_count_primary,
+        unquantified_account_count_secondary=data.unquantified_account_count_secondary,
     )
 
 
@@ -2469,11 +2526,19 @@ def _attach_codex_usage_reset_credits(
     return replace(payload, rate_limit_reset_credits=reset_credits)
 
 
-async def _build_aggregate_credit_limits(session: AsyncSession) -> dict[str, V1UsageLimitResponse]:
+async def _build_aggregate_credit_limits(
+    session: AsyncSession,
+    *,
+    assigned_account_ids: list[str],
+    account_assignment_scope_enabled: bool,
+) -> tuple[dict[str, V1UsageLimitResponse], list[str]]:
+    if account_assignment_scope_enabled and not assigned_account_ids:
+        return {}, []
     usage_repository = UsageRepository(session)
-    primary_latest = await usage_repository.latest_by_account(window="primary")
-    secondary_latest = await usage_repository.latest_by_account(window="secondary")
-    monthly_latest = await usage_repository.latest_by_account(window="monthly")
+    scoped_ids = assigned_account_ids if account_assignment_scope_enabled else None
+    primary_latest = await usage_repository.latest_by_account(window="primary", account_ids=scoped_ids)
+    secondary_latest = await usage_repository.latest_by_account(window="secondary", account_ids=scoped_ids)
+    monthly_latest = await usage_repository.latest_by_account(window="monthly", account_ids=scoped_ids)
 
     primary_rows = [usage_history_to_window_row(entry) for entry in primary_latest.values()]
     secondary_rows = [usage_history_to_window_row(entry) for entry in secondary_latest.values()]
@@ -2486,17 +2551,18 @@ async def _build_aggregate_credit_limits(session: AsyncSession) -> dict[str, V1U
         | {row.account_id for row in monthly_rows}
     )
     if not account_ids:
-        return {}
+        return {}, []
 
     account_map = {account.id: account for account in await _load_accounts_by_id(session, account_ids)}
     if not account_map:
-        return {}
+        return {}, []
 
     active_account_ids = set(account_map)
     primary_rows = [row for row in primary_rows if row.account_id in active_account_ids]
     secondary_rows = [row for row in secondary_rows if row.account_id in active_account_ids]
     monthly_rows = [row for row in monthly_rows if row.account_id in active_account_ids]
     limits: dict[str, V1UsageLimitResponse] = {}
+    unquantified_windows: list[str] = []
 
     for window_key, rows, label in (
         ("primary", primary_rows, "5h"),
@@ -2506,6 +2572,8 @@ async def _build_aggregate_credit_limits(session: AsyncSession) -> dict[str, V1U
         if not rows:
             continue
         summary = usage_core.summarize_usage_window(rows, account_map, window_key)
+        if summary.unquantified_account_count:
+            unquantified_windows.append("30d" if window_key == "monthly" else label)
         max_value = max(0, int(round(summary.capacity_credits or 0.0)))
         if max_value <= 0:
             continue
@@ -2523,7 +2591,7 @@ async def _build_aggregate_credit_limits(session: AsyncSession) -> dict[str, V1U
             source="aggregate",
         )
 
-    return limits
+    return limits, unquantified_windows
 
 
 async def _load_accounts_by_id(session: AsyncSession, account_ids: set[str]) -> list[Account]:
@@ -4494,6 +4562,7 @@ async def v1_chat_completions(
         if disabled_denial is not None:
             return disabled_denial
     if source is None:
+        validate_astra_request(responses_payload, api_key)
         apply_enforced_service_tier_model_fallback(
             responses_payload,
             service_tier_was_enforced=service_tier_was_enforced,
@@ -5154,10 +5223,11 @@ async def _source_responses_response(
             headers={**rate_limit_headers, "Retry-After": "1"},
         )
     try:
-        # Inside the route-helper latch: the budget serializer can raise
-        # (a lone surrogate in the body) and a claimed slot must never outlive
-        # the request that claimed it.
-        admission_budget = estimate_api_key_request_usage(payload)
+        # Policy validation, body shaping and serialization can raise; keep them
+        # inside the admission latch so an unowned claim is always released.
+        validate_configuration_update_policy(payload, api_key)
+        source_payload = _shape_source_responses_payload(payload, source, api_key=api_key)
+        admission_budget = estimate_api_key_request_usage(payload, upstream_payload=source_payload)
         reservation = await _enforce_request_limits(
             api_key,
             request_model=payload.model,
@@ -5184,7 +5254,6 @@ async def _source_responses_response(
         claims.release_if_unowned()
         raise
     try:
-        source_payload = _shape_source_responses_payload(payload, source, api_key=api_key)
         if payload.stream:
             await open_with_disconnect_watch(request, owner, _open_owned_source_stream(owner, source_payload))
             stream = owner.stream
@@ -6341,9 +6410,17 @@ async def _stream_responses(
             service_tier_was_enforced=service_tier_was_enforced,
         )
     apply_prohibit_fast_mode(payload, prohibit_fast_mode=prohibit_fast_mode)
+    untrimmed_payload = payload
+    if payload.model.strip().lower() == "gpt-6-astra":
+        # Validation can prepend a reset for either anchor. Preserve the client
+        # input on the original object for bridge completion bookkeeping.
+        payload = payload.model_copy()
+        if payload.previous_response_id is not None and isinstance(payload.input, list):
+            payload.input = _trim_http_bridge_previous_response_input_items(payload.input)
+    validate_astra_request(payload, api_key)
     validate_model_access(api_key, payload.model)
     compact_payload: ResponsesCompactRequest | None = None
-    if codex_session_affinity:
+    if codex_session_affinity and not has_astra_configuration_updates(payload):
         try:
             compact_trigger_input = strip_terminal_compaction_trigger_input(payload)
             if compact_trigger_input is not None:
@@ -6426,6 +6503,9 @@ async def _stream_responses(
         preferred=prefer_http_bridge,
         policy_already_applied=forwarded_request,
     )
+    if bridge_active:
+        # The bridge must see the original history to preserve its stored prefix.
+        payload = untrimmed_payload
     client_ip = forwarded_client_ip if forwarded_request else resolve_request_client_host(request)
     downstream_turn_state = (
         forwarded_downstream_turn_state
@@ -6799,6 +6879,14 @@ async def _collect_responses(
         payload,
         service_tier_was_enforced=service_tier_was_enforced,
     )
+    untrimmed_payload = payload
+    if payload.model.strip().lower() == "gpt-6-astra":
+        # Validation can prepend a reset for either anchor. Preserve the client
+        # input on the original object for bridge completion bookkeeping.
+        payload = payload.model_copy()
+        if payload.previous_response_id is not None and isinstance(payload.input, list):
+            payload.input = _trim_http_bridge_previous_response_input_items(payload.input)
+    validate_astra_request(payload, api_key)
     validate_model_access(api_key, payload.model)
     admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=payload.model)
     if admission_denial is not None:
@@ -6831,6 +6919,9 @@ async def _collect_responses(
         api_key,
         preferred=prefer_http_bridge,
     )
+    if bridge_active:
+        # The bridge must see the original history to preserve its stored prefix.
+        payload = untrimmed_payload
     downstream_turn_state = (
         proxy_affinity_module.ensure_http_downstream_turn_state(request.headers) if bridge_active else None
     )
@@ -7015,6 +7106,11 @@ async def _compact_responses(
     openai_cache_affinity: bool = False,
     prohibit_fast_mode: bool = False,
 ) -> JSONResponse:
+    if get_desktop_oauth(request) is not None and prediction_lane(payload.to_payload()):
+        return JSONResponse(
+            status_code=400,
+            content=openai_error("desktop_prediction_denied", "Predictions require the Responses route"),
+        )
     # The replaced effort is discarded: this path is subscription-only, so the
     # rewrite that works around the backend hang must stick.
     service_tier_was_enforced = apply_api_key_enforcement(
@@ -7026,6 +7122,7 @@ async def _compact_responses(
         payload,
         service_tier_was_enforced=service_tier_was_enforced,
     )
+    validate_astra_request(payload, api_key)
     validate_model_access(api_key, payload.model)
     try:
         request_usage_budget = estimate_api_key_request_usage(payload)
@@ -8204,6 +8301,15 @@ async def _stream_proxy_errors_as_response_failed(
         yield line
 
 
+def _stream_policy_response_error(
+    exc: ProxyInvalidRequestError | ProxyReasoningEffortNotAllowed,
+) -> ProxyResponseError:
+    envelope = openai_error(exc.code, exc.message, error_type=exc.error_type)
+    if exc.param is not None:
+        envelope["error"]["param"] = exc.param
+    return ProxyResponseError(exc.status_code, envelope)
+
+
 async def _stream_response_error_events(
     stream: AsyncIterator[str],
     *,
@@ -8236,7 +8342,8 @@ async def _stream_response_error_events(
     try:
         async for line in stream:
             yield line
-    except ProxyResponseError as exc:
+    except (ProxyResponseError, ProxyInvalidRequestError, ProxyReasoningEffortNotAllowed) as stream_exc:
+        exc = stream_exc if isinstance(stream_exc, ProxyResponseError) else _stream_policy_response_error(stream_exc)
         error_code = exc.payload.get("error", {}).get("code") if isinstance(exc.payload, dict) else None
         # A refusal the proxy raised before any upstream frame was sent shares
         # its public code with the upstream transport failures below, but it is
@@ -8244,18 +8351,6 @@ async def _stream_response_error_events(
         # left with a committed body that ends without one (issue #2364).
         local_refusal = exc.local_pre_dispatch_refusal
         await release_owned_reservation()
-        if (
-            preserve_native_failure_lifecycle
-            and not local_refusal
-            and error_code
-            in {
-                "stream_incomplete",
-                "stream_idle_timeout",
-                "upstream_request_timeout",
-                "upstream_unavailable",
-            }
-        ):
-            raise
         response_id = None
         if isinstance(exc.payload, dict):
             response_id = _response_id_from_event_payload(cast(dict[str, JsonValue], exc.payload))
@@ -8267,6 +8362,40 @@ async def _stream_response_error_events(
             default_status=exc.status_code,
         )
         error = envelope.error
+        if (
+            preserve_native_failure_lifecycle
+            and not local_refusal
+            and error_code
+            in {
+                "stream_incomplete",
+                "stream_idle_timeout",
+                "upstream_request_timeout",
+                "upstream_unavailable",
+            }
+        ):
+            # codex-lb has already given up (internal retries/replays are
+            # exhausted). Starlette already sent the 200, so the only way to
+            # tell a native Codex client anything is a terminal SSE event on
+            # the open stream — a bare re-raise here used to close the
+            # stream with zero bytes, which the client reported as "Stream
+            # disconnected before completion" and retried blind. Emit a
+            # named, retryable error instead: Codex's own reconnect logic
+            # only retries on ``rate_limit_exceeded`` (overload codes are
+            # terminal to it) and only that code's message is scanned for a
+            # "try again in Ns" delay.
+            retryable_message = native_giveup_retryable_message(
+                exc.upstream_error_code or error_code,
+                error.message if error and error.message else None,
+                exc.retry_after_seconds,
+            )
+            giveup_event = response_failed_event(
+                NATIVE_GIVEUP_RETRYABLE_CODE,
+                retryable_message,
+                "server_error",
+                response_id=response_id,
+            )
+            yield format_sse_event(giveup_event)
+            return
         retry_hint = ""
         if exc.retry_after_seconds is not None and exc.retry_after_seconds > 0:
             # Preserve the HTTP Retry-After signal when a streaming response
@@ -8293,6 +8422,12 @@ async def _stream_response_error_events(
             # a marked terminal straight back into a terminated stream.
             failed_event = synthetic_transport_failure_event(failed_event)
         yield retry_hint + format_sse_event(failed_event)
+    finally:
+        # The native Responses path may stop consuming this wrapper after the
+        # terminal event. Close the inner lease-holding generator explicitly;
+        # async-generator ``aclose()`` does not cascade through a suspended
+        # ``async for`` by itself.
+        await _close_responses_stream_best_effort(stream, action="response error events")
 
 
 def _stream_startup_error_response(
@@ -8445,7 +8580,10 @@ async def _validate_proxy_websocket_request(
         return None, denial
     capability_header_values = _required_capability_values(websocket.headers)
     try:
-        if require_api_key or capability_header_values:
+        native = get_desktop_oauth(websocket)
+        if native is not None:
+            api_key = native.api_key
+        elif require_api_key or capability_header_values:
             api_key = await validate_required_proxy_api_key_authorization(websocket.headers.get("authorization"))
         else:
             api_key = await _validate_proxy_api_key_authorization_for_connection(
@@ -9012,7 +9150,32 @@ async def _normalize_public_responses_stream(
     forward_unparseable_data: bool = False,
     preserve_native_failure_lifecycle: bool = False,
 ) -> AsyncIterator[str]:
-    stream = _normalize_reasoning_summary_stream(stream)
+    reasoning_stream = _normalize_reasoning_summary_stream(stream)
+    normalized = _normalize_public_responses_events(
+        reasoning_stream,
+        enforce_openai_sdk_contract=enforce_openai_sdk_contract,
+        forward_unparseable_data=forward_unparseable_data,
+        preserve_native_failure_lifecycle=preserve_native_failure_lifecycle,
+    )
+    try:
+        async for event_block in normalized:
+            yield event_block
+    finally:
+        try:
+            await _aclose_stream(normalized)
+        finally:
+            # Await the owned stage here: its GC finalizer must not race the
+            # caller's explicit close of the underlying source stream.
+            await _aclose_stream(reasoning_stream)
+
+
+async def _normalize_public_responses_events(
+    stream: AsyncIterator[str],
+    *,
+    enforce_openai_sdk_contract: bool,
+    forward_unparseable_data: bool,
+    preserve_native_failure_lifecycle: bool,
+) -> AsyncIterator[str]:
     """Normalize the upstream SSE event stream for the public /v1 surface.
 
     Args:
@@ -9139,11 +9302,32 @@ async def _normalize_public_responses_stream(
             payload = dict(payload)
             payload.pop(SYNTHETIC_TRANSPORT_FAILURE_MARKER, None)
             if preserve_native_failure_lifecycle:
-                raise ProxyResponseError(
-                    502,
-                    openai_error("stream_incomplete", "Native upstream transport ended before a terminal event"),
-                    failure_phase="upstream",
+                # Second give-up gate: codex-lb marked this event as a
+                # synthetic transport failure upstream of us (the account
+                # path's own retry/replay is exhausted) instead of raising
+                # ``ProxyResponseError`` directly. Raising here would still
+                # close the stream with no bytes sent to a native Codex
+                # client (the 200 is already on the wire), so emit the same
+                # terminal, retryable ``response.failed`` this module's other
+                # give-up gate emits and end the stream.
+                response_obj = payload.get("response")
+                nested_error = response_obj.get("error") if is_json_mapping(response_obj) else None
+                upstream_code = nested_error.get("code") if is_json_mapping(nested_error) else None
+                upstream_message = nested_error.get("message") if is_json_mapping(nested_error) else None
+                response_id = _response_id_from_event_payload(payload)
+                retryable_message = native_giveup_retryable_message(
+                    upstream_code if isinstance(upstream_code, str) else "stream_incomplete",
+                    upstream_message if isinstance(upstream_message, str) else None,
+                    None,
                 )
+                giveup_event = response_failed_event(
+                    NATIVE_GIVEUP_RETRYABLE_CODE,
+                    retryable_message,
+                    "server_error",
+                    response_id=response_id,
+                )
+                yield format_sse_event(giveup_event)
+                return
         raw_event_type = payload.get("type")
         if (
             enforce_openai_sdk_contract
@@ -9940,68 +10124,74 @@ async def _normalize_reasoning_summary_stream(stream: AsyncIterator[str]) -> Asy
         normalized["delta"] = cleaned
         return [format_sse_event(normalized)]
 
-    async for event_block in stream:
-        payload = _parse_sse_payload(event_block)
-        if payload is None:
-            yield event_block
-            continue
-        # Error frames can omit the discriminator and carry only ``error``;
-        # classify those as terminal so a pending reasoning candidate flushes
-        # before the frame is forwarded.
-        event_type = classify_event_type(payload)
-        event_key = _reasoning_summary_delta_key(payload)
-        if (
-            pending
-            and not _is_reasoning_summary_interleavable_event(event_type)
-            and not (
-                event_type in _REASONING_SUMMARY_DELTA_TYPES | _REASONING_SUMMARY_DONE_TYPES and event_key in pending
-            )
-        ):
-            for pending_key in tuple(pending):
-                for buffered in flush(pending_key):
-                    yield buffered
-        if event_type in _REASONING_SUMMARY_DELTA_TYPES:
-            delta = payload.get("delta")
-            if not isinstance(delta, str):
+    try:
+        async for event_block in stream:
+            payload = _parse_sse_payload(event_block)
+            if payload is None:
                 yield event_block
                 continue
-            key = event_key
-            if key in pending:
-                pending[key].append((payload, event_block))
-                buffered_text = "".join(cast(str, item.get("delta")) for item, _ in pending[key])
-                if _strip_blank_html_comment_lines(buffered_text) != buffered_text:
+            # Error frames can omit the discriminator and carry only ``error``;
+            # classify those as terminal so a pending reasoning candidate flushes
+            # before the frame is forwarded.
+            event_type = classify_event_type(payload)
+            event_key = _reasoning_summary_delta_key(payload)
+            if (
+                pending
+                and not _is_reasoning_summary_interleavable_event(event_type)
+                and not (
+                    event_type in _REASONING_SUMMARY_DELTA_TYPES | _REASONING_SUMMARY_DONE_TYPES
+                    and event_key in pending
+                )
+            ):
+                for pending_key in tuple(pending):
+                    for buffered in flush(pending_key):
+                        yield buffered
+            if event_type in _REASONING_SUMMARY_DELTA_TYPES:
+                delta = payload.get("delta")
+                if not isinstance(delta, str):
+                    yield event_block
+                    continue
+                key = event_key
+                if key in pending:
+                    pending[key].append((payload, event_block))
+                    buffered_text = "".join(cast(str, item.get("delta")) for item, _ in pending[key])
+                    if _strip_blank_html_comment_lines(buffered_text) != buffered_text:
+                        for buffered in flush(key):
+                            yield buffered
+                        continue
+                    if _could_be_blank_html_comment_line(buffered_text):
+                        continue
                     for buffered in flush(key):
                         yield buffered
                     continue
-                if _could_be_blank_html_comment_line(buffered_text):
+                cleaned_delta = _strip_blank_html_comment_lines(delta)
+                if cleaned_delta != delta:
+                    normalized_payload = dict(payload)
+                    normalized_payload["delta"] = cleaned_delta
+                    yield format_sse_event(normalized_payload)
                     continue
+                if _could_be_blank_html_comment_line(delta):
+                    pending[key] = [(payload, event_block)]
+                    continue
+                yield event_block
+                continue
+            if event_type in _REASONING_SUMMARY_DONE_TYPES:
+                key = event_key
                 for buffered in flush(key):
                     yield buffered
-                continue
-            cleaned_delta = _strip_blank_html_comment_lines(delta)
-            if cleaned_delta != delta:
-                normalized_payload = dict(payload)
-                normalized_payload["delta"] = cleaned_delta
-                yield format_sse_event(normalized_payload)
-                continue
-            if _could_be_blank_html_comment_line(delta):
-                pending[key] = [(payload, event_block)]
-                continue
+            elif event_type in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES:
+                for key in tuple(pending):
+                    for buffered in flush(key):
+                        yield buffered
             yield event_block
-            continue
-        if event_type in _REASONING_SUMMARY_DONE_TYPES:
-            key = event_key
+
+        for key in tuple(pending):
             for buffered in flush(key):
                 yield buffered
-        elif event_type in _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES:
-            for key in tuple(pending):
-                for buffered in flush(key):
-                    yield buffered
-        yield event_block
-
-    for key in tuple(pending):
-        for buffered in flush(key):
-            yield buffered
+    finally:
+        # Close the normalizer below this wrapper so a downstream early return
+        # reaches the retry generator and releases its account leases.
+        await _close_responses_stream_best_effort(stream, action="reasoning summary")
 
 
 def _is_public_passthrough_output_item_type(item_type: str) -> bool:
