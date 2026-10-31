@@ -200,6 +200,16 @@ const RequestLogCostBreakdownSchema = z.object({
   totalUsd: z.number().nullable().optional().default(null),
 });
 
+const RequestPricingBasisSchema = z.object({
+  schemaVersion: z.literal(1),
+  priceVersion: z.string(),
+  model: z.string(),
+  inputPer1M: z.number().nonnegative(),
+  cachedInputPer1M: z.number().nonnegative(),
+  cacheWriteInputPer1M: z.number().nonnegative(),
+  outputPer1M: z.number().nonnegative(),
+});
+
 export const RequestLogSchema = z.object({
   requestedAt: z.iso.datetime({ offset: true }),
   accountId: z.string().nullable(),
@@ -246,6 +256,7 @@ export const RequestLogSchema = z.object({
   reasoningEffort: z.string().nullable(),
   costUsd: z.number().nullable(),
   costBreakdown: RequestLogCostBreakdownSchema.nullable().optional().default(null),
+  pricingBasis: RequestPricingBasisSchema.nullable().optional().default(null),
   latencyMs: z.number().nullable(),
   latencyFirstTokenMs: z.number().nullable().optional().default(null),
   latencyQueueMs: z.number().nullable().optional().default(null),

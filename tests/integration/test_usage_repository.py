@@ -1219,8 +1219,7 @@ async def test_trends_by_bucket_sqlite_avoids_window_function_for_latest_metadat
 
 @pytest.mark.asyncio
 async def test_bulk_history_since_per_account_cutoffs_parity(db_setup):
-    """Per-account cutoffs bound the PostgreSQL fetch without changing what
-    callers keep after their own trimming; SQLite keeps the shared floor."""
+    """Per-account cutoffs bound results on both databases without mutating the shared cache."""
     now = utcnow()
     async with SessionLocal() as session:
         accounts_repo = AccountsRepository(session)
@@ -1248,12 +1247,7 @@ async def test_bulk_history_since_per_account_cutoffs_parity(db_setup):
         )
         unbounded = await repo.bulk_history_since(["acc-short", "acc-wide"], "primary", shared_floor)
 
-    dialect = "postgresql" if str(engine.url).startswith("postgresql") else "sqlite"
-    if dialect == "postgresql":
-        assert [snapshot.used_percent for snapshot in bounded["acc-short"]] == [20.0]
-    else:
-        # SQLite keeps the shared floor; callers trim per account.
-        assert [snapshot.used_percent for snapshot in bounded["acc-short"]] == [10.0, 20.0]
+    assert [snapshot.used_percent for snapshot in bounded["acc-short"]] == [20.0]
     assert [snapshot.used_percent for snapshot in bounded["acc-wide"]] == [30.0, 40.0]
 
     # Parity with the shared-floor fetch after per-account trimming.

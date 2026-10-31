@@ -66,7 +66,10 @@ pytestmark = pytest.mark.unit
 def _share_proxy_dashboard_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     class _SettingsCache:
         async def get(self) -> object:
-            return proxy_service.get_settings()
+            settings = proxy_service.get_settings()
+            if isinstance(settings, SimpleNamespace) and not hasattr(settings, "routing_strategy"):
+                return SimpleNamespace(**vars(settings), routing_strategy="usage_weighted")
+            return settings
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache())
 
@@ -4781,6 +4784,7 @@ async def _run_turn_state_forward_failure_stream(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,

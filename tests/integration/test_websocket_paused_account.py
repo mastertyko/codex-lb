@@ -78,6 +78,7 @@ def test_open_socket_blocks_paused_account_and_resumes_same_context(
 
     monkeypatch.setattr(proxy_module.ProxyService, "_acquire_account_response_create_lease_or_overload", acquire)
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         try:
             with client.websocket_connect(path, headers=fixture.headers()) as websocket:
@@ -118,6 +119,7 @@ def test_pause_rejects_new_frame_without_interrupting_streaming_response(app_ins
     upstream = _SequencedUpstreamWebSocket([], deferred_message_batches=[first_batch])
     fixture = _RetainedSocketFixture(monkeypatch, [upstream], limited=True)
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         try:
             with client.websocket_connect("/backend-api/codex/responses", headers=fixture.headers()) as websocket:

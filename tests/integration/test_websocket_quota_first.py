@@ -91,6 +91,7 @@ def test_credit_gate_on_open_socket_preserves_context_and_reservations(app_insta
         service._load_balancer._selection_inputs_cache.invalidate()
 
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         with client.websocket_connect(path, headers=fixture.headers()) as websocket:
             _complete(websocket, _create([_FIRST]), _PARENT)

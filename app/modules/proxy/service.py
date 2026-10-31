@@ -947,7 +947,7 @@ class ProxyService(
         self._encryptor = TokenEncryptor()
         self._load_balancer = LoadBalancer(repo_factory, encryptor=self._encryptor, clock=clock)
         self._websocket_retained = RetainedWebSockets(
-            self._load_balancer.release_account_lease, self._close_retained_websocket
+            self._load_balancer.release_account_lease, self._close_retained_websocket, clock=clock, scheduler=scheduler
         )
         self._capability_router = CapabilityRouter(repo_factory)
         self._live_websocket_connector = live_websocket_connector
@@ -2442,10 +2442,11 @@ def _should_failover_previsible_unary_proxy_error(exc: ProxyResponseError) -> bo
         return False
     error = _parse_openai_error(exc.payload)
     error_code = _normalize_error_code(error.code if error else None, error.type if error else None)
-    error_message = error.message if error else None
-    return error_code == "upstream_unavailable" and _should_retry_transient_stream_error(
-        "upstream_unavailable",
-        error_message,
+    # Typed transport provenance takes precedence over sanitized message text.
+    return error_code == "upstream_unavailable" and (
+        exc.retryable_same_contract
+        if exc.failure_detail == "transport_error"
+        else _should_retry_transient_stream_error("upstream_unavailable", error.message if error else None)
     )
 
 

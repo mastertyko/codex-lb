@@ -463,3 +463,8 @@ removed setting(s) ignored: CODEX_LB_LOG_UPSTREAM_REQUEST_PAYLOAD — values are
 and the equivalent incident-debugging behavior is re-enabled interactively
 with `CODEX_LB_TRACE=upstream_payload`. Startup never fails because of a
 removed setting, and the fixed built-in value is used.
+# Committed source build receipts
+
+`scripts/build_runtime_image.py` exports a clean Git commit instead of sending the developer's working directory to Docker. It labels the image with its full revision and a digest of the frozen build inputs, then checks those labels and the platform against `docker image inspect` before producing a portable receipt. Existing receipts are rejected to avoid confusing an earlier successful build with a failed new attempt.
+
+For example, an ignored local environment file is absent from the exported context; an untracked source change rejects the build before Docker starts. The receipt identifies the local image content ID, not a registry manifest or running deployment. Mutable base tags and OS packages mean the receipt proves source provenance, not bit-for-bit reproducibility. Publishing and production cutover remain separate authorized operations.

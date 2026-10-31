@@ -114,8 +114,8 @@ def build_weekly_credit_pace(
             and capacity_for_account(account, "secondary") is None
         ):
             rows = secondary_history.get(summary.account_id, [])
-            if summary.window_minutes_secondary == 10_080 and any(
-                row.recorded_at >= freshness_cutoff and row.window_minutes == 10_080 for row in rows
+            if summary.window_minutes_secondary in (None, 0, 10_080) and any(
+                row.recorded_at >= freshness_cutoff and row.window_minutes in (None, 0, 10_080) for row in rows
             ):
                 return None
         timing = _weekly_timing(summary, now_ms)

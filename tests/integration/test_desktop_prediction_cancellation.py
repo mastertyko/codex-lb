@@ -10,6 +10,7 @@ import anyio
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from app.core.auth import desktop_oauth
 from app.core.auth.desktop_identity import DesktopIdentityPrincipal
@@ -154,6 +155,7 @@ async def test_prediction_cancellation_returns_postgres_checkout_before_stopping
         assert cancellations == [True]
         assert completed == []
         assert lease_calls == []
+        assert isinstance(engine.pool, AsyncAdaptedQueuePool)
         assert engine.pool.checkedout() == 0
         assert not any("non-checked-in" in str(item.message) for item in caught)
         assert not any("Exception terminating connection" in record.message for record in caplog.records)

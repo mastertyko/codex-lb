@@ -148,9 +148,9 @@ async def test_existing_strategy_can_still_select_credit_owner():
 
 @pytest.mark.asyncio
 async def test_http_bridge_submit_rejects_credit_without_retiring_context(monkeypatch):
-    from contextlib import nullcontext
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
+    from typing import cast
+    from unittest.mock import AsyncMock, Mock
 
     from app.core.clients.proxy import ProxyResponseError
     from app.modules.proxy import service as proxy_service
@@ -158,14 +158,14 @@ async def test_http_bridge_submit_rejects_credit_without_retiring_context(monkey
     from tests.unit.test_http_bridge_idle_leases import _make_bridge_session, _make_lease
 
     balancer, credit, _, _ = funding_pool()
-    service = proxy_service.ProxyService(nullcontext())
+    service = proxy_service.ProxyService(Mock())
     service._load_balancer = balancer
     session = _make_bridge_session()
     session.account = credit
     session.account_lease = _make_lease("held")
     service._maybe_prewarm_http_bridge_session = AsyncMock()
     service._acquire_request_state_response_create_admission = AsyncMock()
-    service._http_bridge_text_with_account_installation_id = lambda s, r, t: t
+    monkeypatch.setattr(service, "_http_bridge_text_with_account_installation_id", lambda s, r, t: t)
     settings = SimpleNamespace(routing_strategy="quota_first_balanced")
     monkeypatch.setattr(
         request_submit, "_service_get_settings_cache", lambda: SimpleNamespace(cached_row=lambda: settings)
@@ -188,4 +188,4 @@ async def test_http_bridge_submit_rejects_credit_without_retiring_context(monkey
     assert session.pending_requests == [] or len(session.pending_requests) == 0
     assert session.queued_request_count == 0
     assert session.admission_waiter_count == 0
-    session.upstream.close.assert_not_awaited()
+    cast(AsyncMock, session.upstream.close).assert_not_awaited()

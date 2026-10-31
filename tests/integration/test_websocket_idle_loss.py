@@ -42,6 +42,7 @@ def test_idle_upstream_loss_signals_reconnect_and_preserves_full_context(app_ins
 
     monkeypatch.setattr(WebSocket, "close", close)
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         with client.websocket_connect("/backend-api/codex/responses", headers=fixture.headers()) as downstream:
             _complete(downstream, _create([_FIRST]), _PARENT)

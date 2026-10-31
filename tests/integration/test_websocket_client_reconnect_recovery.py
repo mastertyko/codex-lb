@@ -14,6 +14,9 @@ from tests.integration.test_proxy_websocket_responses import (
     _TwoAccountWebSocketFailover,
     _ws_event,
 )
+from tests.integration.test_proxy_websocket_responses import (
+    _stub_inert_account_availability as _stub_inert_account_availability,
+)
 
 pytestmark = [pytest.mark.integration, pytest.mark.timeout(20)]
 

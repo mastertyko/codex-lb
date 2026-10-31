@@ -27,6 +27,7 @@ from app.core.auth.desktop_oauth import (
 from app.core.clients.desktop_predictions import PREDICTION_BASE_URL, stream_prediction
 from app.core.clients.proxy import ProxyResponseError
 from app.core.clients.proxy_websocket import UpstreamWebSocket, connect_responses_websocket
+from app.core.clock import Scheduler, clock_for, scheduler_for
 from app.core.config.settings import get_settings
 from app.core.errors import openai_error
 from app.core.exceptions import AppError
@@ -171,7 +172,7 @@ async def _owner(service: ProxyService, admission: DesktopOAuthAdmission) -> Asy
     # A cancelled pool pre-ping can lose the checkout before AsyncSession owns
     # it. Finish checkout/query/teardown in one owned operation, then cancel
     # before acquiring capacity or dispatching upstream work.
-    account, cancellation = await _await_result_deferring_cancellation(lookup())
+    account, cancellation = await _await_result_deferring_cancellation(lookup(), scheduler=scheduler_for(service))
     if cancellation is not None:
         raise cancellation
     account_id = account.id
@@ -187,7 +188,7 @@ async def _owner(service: ProxyService, admission: DesktopOAuthAdmission) -> Asy
         emit("owner_ready")
         yield _Owner(account_id, route)
     finally:
-        task = asyncio.create_task(service._load_balancer.release_account_lease(lease))
+        task = scheduler_for(service).create_task(service._load_balancer.release_account_lease(lease))
         _, cancellation = await _await_task_deferring_cancellation(task)
         if cancellation is not None:
             raise cancellation
@@ -207,7 +208,7 @@ async def _recheck_owner(service: ProxyService, admission: DesktopOAuthAdmission
         parse_desktop_identity_principal(admission.credentials.access_token, admission.principal.workspace_id)
         return key
 
-    key, cancellation = await _await_result_deferring_cancellation(recheck())
+    key, cancellation = await _await_result_deferring_cancellation(recheck(), scheduler=scheduler_for(service))
     if cancellation is not None:
         raise cancellation
     return key
@@ -279,7 +280,7 @@ async def _reservation(
         yield settlement
     finally:
         with anyio.CancelScope(shield=True):
-            task = asyncio.create_task(
+            task = scheduler_for(service).create_task(
                 service._settle_stream_api_key_usage(
                     admission.api_key,
                     reservation,
@@ -354,8 +355,8 @@ async def prediction_http_response(
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
-async def _frame(websocket: WebSocket) -> dict[str, JsonValue]:
-    text = await asyncio.wait_for(
+async def _frame(websocket: WebSocket, *, scheduler: Scheduler) -> dict[str, JsonValue]:
+    text = await scheduler.wait_for(
         websocket.receive_text(), timeout=get_settings().proxy_downstream_websocket_idle_timeout_seconds
     )
     payload = _object(text, limit=MAX_DECOMPRESSED_RESPONSES_BODY_BYTES)
@@ -400,21 +401,21 @@ async def _caller_websocket(
                         )
                         emit("upstream_connected", status=101)
                         await _recheck_dispatch(service, fresh, owner.account_id, body)
-                    loop = asyncio.get_running_loop()
-                    deadline = loop.time() + get_settings().proxy_request_budget_seconds
+                    clock = clock_for(service)
+                    deadline = clock.monotonic() + get_settings().proxy_request_budget_seconds
                     emit("upstream_start")
-                    await asyncio.wait_for(
+                    await scheduler_for(service).wait_for(
                         upstream.send_text(json.dumps({**body.to_payload(), "type": "response.create"})),
-                        timeout=max(0.0, deadline - loop.time()),
+                        timeout=max(0.0, deadline - clock.monotonic()),
                     )
-                    downstream = asyncio.create_task(websocket.receive())
+                    downstream = scheduler_for(service).create_task(websocket.receive())
                     upstream_task = None
                     try:
                         while True:
-                            upstream_task = asyncio.create_task(upstream.receive())
-                            done, _ = await asyncio.wait(
+                            upstream_task = scheduler_for(service).create_task(upstream.receive())
+                            done, _ = await scheduler_for(service).wait(
                                 {downstream, upstream_task},
-                                timeout=max(0.0, deadline - loop.time()),
+                                timeout=max(0.0, deadline - clock.monotonic()),
                                 return_when=asyncio.FIRST_COMPLETED,
                             )
                             if downstream in done:
@@ -437,8 +438,8 @@ async def _caller_websocket(
                             if terminal:
                                 terminal_text = event_message.text
                                 break
-                            await asyncio.wait_for(
-                                websocket.send_text(event_message.text), timeout=max(0.0, deadline - loop.time())
+                            await scheduler_for(service).wait_for(
+                                websocket.send_text(event_message.text), timeout=max(0.0, deadline - clock.monotonic())
                             )
                     finally:
                         tasks = [downstream, *([upstream_task] if upstream_task is not None else [])]
@@ -447,8 +448,10 @@ async def _caller_websocket(
                                 task.cancel()
                         with anyio.CancelScope(shield=True):
                             await asyncio.gather(*tasks, return_exceptions=True)
-                await asyncio.wait_for(websocket.send_text(terminal_text), timeout=max(0.0, deadline - loop.time()))
-                payload = await _frame(websocket)
+                await scheduler_for(service).wait_for(
+                    websocket.send_text(terminal_text), timeout=max(0.0, deadline - clock.monotonic())
+                )
+                payload = await _frame(websocket, scheduler=scheduler_for(service))
         except WebSocketDisconnect:
             emit("disconnected")
             return
@@ -462,7 +465,7 @@ async def _caller_websocket(
             if upstream is not None:
                 with anyio.CancelScope(shield=True):
                     try:
-                        await asyncio.wait_for(upstream.close(), timeout=_CLOSE_TIMEOUT_SECONDS)
+                        await scheduler_for(service).wait_for(upstream.close(), timeout=_CLOSE_TIMEOUT_SECONDS)
                     except Exception:
                         raise _error("Prediction cleanup failed", status=502) from None
 
@@ -479,7 +482,7 @@ async def route_desktop_websocket(
     capability_header_values: tuple[str, ...],
 ) -> None:
     try:
-        first = await _frame(websocket)
+        first = await _frame(websocket, scheduler=scheduler_for(service))
         caller = prediction_lane(first)
         if (trace := current_trace()) is not None:
             trace.classify(caller)
@@ -522,7 +525,7 @@ async def route_desktop_websocket(
         async def guarded_receive() -> Message:
             nonlocal receive_task
             if receive_task is None:
-                receive_task = asyncio.create_task(receive_and_validate())
+                receive_task = scheduler_for(service).create_task(receive_and_validate())
             task = receive_task
             try:
                 # The pool polls receive() with a short timeout. Preserve a
@@ -566,10 +569,10 @@ async def route_desktop_websocket(
         if websocket.client_state == WebSocketState.DISCONNECTED:
             return
         if websocket.application_state == WebSocketState.CONNECTED:
-            await asyncio.wait_for(
+            await scheduler_for(service).wait_for(
                 websocket.send_json(
                     {"type": "error", **openai_error("desktop_prediction_denied", "Desktop request denied")}
                 ),
                 timeout=2,
             )
-            await asyncio.wait_for(websocket.close(code=1008), timeout=2)
+            await scheduler_for(service).wait_for(websocket.close(code=1008), timeout=2)

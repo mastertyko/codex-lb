@@ -27,7 +27,6 @@ async def test_ultrafast_quota_catchup_and_sticky_owner_on_real_route(async_clie
         await session.execute(update(Account).where(Account.id.in_(ids)).values(plan_type="promax"))
         await session.commit()
         settings = await SettingsRepository(session).get_or_create()
-    settings.http_responses_session_bridge_enabled = False
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(settings))
     await install_catalog(monkeypatch, ids)
     service = get_proxy_service_for_app(async_client._transport.app)

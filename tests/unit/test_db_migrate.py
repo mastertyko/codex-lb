@@ -41,7 +41,7 @@ from app.db.migrate import (
     wait_for_head,
 )
 from app.db.migration_url import to_sync_database_url
-from app.db.models import COMPAT_ADMIN_USER_ID, COMPAT_ADMIN_USERNAME, Base
+from app.db.models import COMPAT_ADMIN_USER_ID, COMPAT_ADMIN_USERNAME, Account, Base, RequestLog
 from app.modules.usage.additional_quota_keys import clear_additional_quota_registry_cache
 
 #: The revision immediately before the one that re-projects the legacy
@@ -3012,3 +3012,60 @@ def test_a_multi_head_ledger_does_not_break_the_drain_check(tmp_path: Path, capl
     with caplog.at_level("WARNING", logger="app.db.migrate"):
         check_legacy_credential_drop(config, forked, "head", has_existing_schema=True)
     assert len(_drain_warnings(caplog)) == 1
+
+
+@pytest.mark.parametrize("target", ["+1", "head"])
+def test_runtime_column_reconciliation_preserves_values_and_relative_target(tmp_path: Path, target: str) -> None:
+    url = _db_url(tmp_path / "runtime-addition-recovery.db")
+    run_upgrade(url, "head", bootstrap_legacy=False)
+    parent = "20260927_190000_add_cache_write_usage"
+    allowance = "20260930_000000_add_pro_legacy_allowance"
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                sa.insert(Account).values(
+                    id="recovery-account",
+                    email="recovery@example.test",
+                    plan_type="pro",
+                    access_token_encrypted=b"fixture",
+                    refresh_token_encrypted=b"fixture",
+                    id_token_encrypted=b"fixture",
+                    last_refresh=datetime(2026, 10, 31),
+                    pro_legacy_allowance=True,
+                )
+            )
+            connection.execute(
+                sa.insert(RequestLog).values(
+                    account_id="recovery-account",
+                    request_id="recovery-request",
+                    model="fixture-model",
+                    status="success",
+                    pricing_basis_json='{"version":1}',
+                    cost_usd=0.125,
+                )
+            )
+            connection.execute(text("UPDATE alembic_version SET version_num = :revision"), {"revision": parent})
+        result = run_upgrade(url, target, bootstrap_legacy=False)
+        assert result.current_revision == (allowance if target == "+1" else inspect_migration_state(url).head_revision)
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT pro_legacy_allowance FROM accounts")).scalar_one() == 1
+            assert connection.execute(text("SELECT pricing_basis_json, cost_usd FROM request_logs")).one() == (
+                '{"version":1}',
+                0.125,
+            )
+    finally:
+        engine.dispose()
+
+
+def test_runtime_column_reconciliation_refuses_incompatible_existing_schema(tmp_path: Path) -> None:
+    url = _db_url(tmp_path / "runtime-addition-incompatible.db")
+    run_upgrade(url, "20260927_190000_add_cache_write_usage", bootstrap_legacy=False)
+    engine = create_engine(to_sync_database_url(url), future=True)
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE accounts ADD COLUMN pro_legacy_allowance TEXT"))
+        with pytest.raises(MigrationBootstrapError, match="incompatible schema"):
+            run_upgrade(url, "head", bootstrap_legacy=False)
+    finally:
+        engine.dispose()

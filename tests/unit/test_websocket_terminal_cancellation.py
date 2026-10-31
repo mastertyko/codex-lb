@@ -162,6 +162,7 @@ async def test_cancelled_websocket_scope_cleanup_is_deadline_bounded_and_remains
 
     service = proxy_service.ProxyService(cast(proxy_service.ProxyRepoFactory, repo_factory))
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         prefer_earlier_reset_accounts=False,
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=0,
@@ -339,6 +340,7 @@ async def test_cancelled_websocket_scope_cleanup_draws_on_published_post_drain_r
 
     service = proxy_service.ProxyService(cast(proxy_service.ProxyRepoFactory, repo_factory))
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         prefer_earlier_reset_accounts=False,
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=0,
@@ -495,6 +497,7 @@ async def test_normal_websocket_scope_cleanup_uses_separate_scope_budget(
 
     service = proxy_service.ProxyService(cast(proxy_service.ProxyRepoFactory, repo_factory))
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         prefer_earlier_reset_accounts=False,
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=0,
@@ -578,6 +581,7 @@ async def test_cancelled_scope_isolates_owned_reconnect_child_failure_and_finish
         yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
 
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         prefer_earlier_reset_accounts=False,
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=0,
@@ -780,6 +784,7 @@ async def test_drain_start_during_admission_rejects_turn_before_connect_or_send(
         yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
 
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         prefer_earlier_reset_accounts=False,
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=0,
@@ -1415,6 +1420,7 @@ async def test_terminal_message_ownership_survives_relay_cancellation(
             "input_tokens": 12,
             "output_tokens": 7,
             "cached_input_tokens": 3,
+            "cache_write_input_tokens": 0,
             "service_tier": request_state.service_tier,
         }
     ]
@@ -1884,6 +1890,7 @@ async def test_scope_cancellation_finalizes_turn_when_connection_lease_release_f
         yield SimpleNamespace(request_logs=request_logs, api_keys=object())
 
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         prefer_earlier_reset_accounts=False,
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=0,
@@ -2088,6 +2095,7 @@ async def test_scope_cancellation_while_waiting_for_reconnect_reader_preserves_a
         yield SimpleNamespace(request_logs=_RequestLogsRecorder(), api_keys=object())
 
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         prefer_earlier_reset_accounts=False,
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=0,

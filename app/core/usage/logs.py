@@ -10,6 +10,7 @@ from app.core.usage.pricing import (
     calculate_cost_from_usage,
     get_pricing_for_model,
 )
+from app.core.usage.pricing_basis import RequestPricingBasis, capture_pricing_basis
 
 # Request-log status classification shared by every error-metric surface
 # (usage builders, time rollups, reports, fleet): `cancelled` is a normal
@@ -107,6 +108,16 @@ def calculated_cost_from_log(log: RequestLogLike, *, precision: int | None = Non
     return round(cost, precision)
 
 
+def captured_cost_from_log(log: RequestLogLike) -> tuple[float | None, RequestPricingBasis | None]:
+    usage = usage_tokens_from_log(log)
+    resolved = get_pricing_for_model(log.model) if log.model else None
+    if usage is None or resolved is None:
+        return None, None
+    model, price = resolved
+    basis = capture_pricing_basis(model, usage, price, log.service_tier)
+    return calculate_cost_from_usage(usage, basis.effective_price()), basis
+
+
 def cost_from_log(log: RequestLogLike, *, precision: int | None = None) -> float | None:
     cost = log.cost_usd
     if cost is None:
@@ -124,7 +135,9 @@ def _totals_match(left: float | None, right: float | None, *, precision: int | N
     return abs(left - right) < (10 ** (-precision)) / 2
 
 
-def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None) -> UsageCostBreakdown:
+def cost_breakdown_from_log(
+    log: RequestLogLike, *, precision: int | None = None, basis: RequestPricingBasis | None = None
+) -> UsageCostBreakdown:
     full_breakdown: UsageCostBreakdown | None = None
     input_usd: float | None = None
     cached_input_usd: float | None = None
@@ -132,21 +145,23 @@ def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None
     raw_total_usd: float | None = None
     total_usd: float | None = None
     if log.model:
-        resolved = get_pricing_for_model(log.model, None, None)
+        resolved = (basis.model, basis.effective_price()) if basis else get_pricing_for_model(log.model, None, None)
         if resolved is not None:
             _, price = resolved
+            # Captured prices already include tier and long-context selection.
+            service_tier = None if basis else log.service_tier
             input_tokens = log.input_tokens
             cached_tokens = cached_input_tokens_from_log(log)
             output_tokens = output_tokens_from_log(log)
             usage = usage_tokens_from_log(log)
             if usage is not None:
-                raw_full_breakdown = calculate_cost_breakdown_from_usage(usage, price, service_tier=log.service_tier)
+                raw_full_breakdown = calculate_cost_breakdown_from_usage(usage, price, service_tier=service_tier)
                 if raw_full_breakdown is not None:
                     raw_total_usd = raw_full_breakdown.total_usd
                 full_breakdown = calculate_cost_breakdown_from_usage(
                     usage,
                     price,
-                    service_tier=log.service_tier,
+                    service_tier=service_tier,
                     precision=precision,
                 )
                 if full_breakdown is not None:
@@ -160,7 +175,7 @@ def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None
                         cache_write_input_tokens=float(log.cache_write_input_tokens or 0),
                     ),
                     price,
-                    service_tier=log.service_tier,
+                    service_tier=service_tier,
                     precision=precision,
                 )
                 if input_breakdown is not None:
@@ -175,7 +190,7 @@ def cost_breakdown_from_log(log: RequestLogLike, *, precision: int | None = None
                         cache_write_input_tokens=float(log.cache_write_input_tokens or 0),
                     ),
                     price,
-                    service_tier=log.service_tier,
+                    service_tier=service_tier,
                     precision=precision,
                 )
                 if output_breakdown is not None:

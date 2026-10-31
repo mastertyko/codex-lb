@@ -19,7 +19,7 @@ from alembic.script import ScriptDirectory
 from alembic.script.revision import RevisionError
 from alembic.util.exc import CommandError
 from anyio import to_thread
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import Boolean, create_engine, inspect, text
 from sqlalchemy import exc as sa_exc
 from sqlalchemy.engine import Connection
 
@@ -913,6 +913,34 @@ def _reconcile_retired_credential_ledger(config: Config) -> str | None:
     return CREDENTIAL_DROP_REVISION
 
 
+def _reconcile_legacy_allowance_column(config: Config, revision: str) -> str:
+    """Recover an already applied additive revision without editing its published DDL."""
+    allowance_revision = "20260930_000000_add_pro_legacy_allowance"
+    with _sync_connection(_required_sqlalchemy_url(config)) as connection:
+        current = _read_current_revisions_from_connection(connection)
+        if allowance_revision not in _pending_revisions(config, current, revision):
+            return revision
+        inspector = inspect(connection)
+        if "accounts" not in inspector.get_table_names():
+            return revision
+        column = next(
+            (item for item in inspector.get_columns("accounts") if item["name"] == "pro_legacy_allowance"), None
+        )
+    if column is None:
+        return revision
+    if not isinstance(column["type"], Boolean) or column["nullable"]:
+        raise MigrationBootstrapError("Existing legacy Pro allowance column has an incompatible schema")
+    script = ScriptDirectory.from_config(config)
+    steps = script._upgrade_revs(revision, cast("Any", current))
+    # Resolve before moving the ledger so relative targets do not move as well.
+    resolved_target = steps[-1].revision.revision
+    allowance = script.get_revision(allowance_revision)
+    assert allowance is not None and isinstance(allowance.down_revision, str)
+    command.upgrade(config, allowance.down_revision)
+    command.stamp(config, allowance_revision)
+    return resolved_target
+
+
 def _schema_ahead_error(state: MigrationState) -> MigrationBootstrapError:
     return MigrationBootstrapError(
         f"Database schema revision(s) {','.join(state.unknown_revisions)} are not known to this build "
@@ -997,6 +1025,7 @@ def _run_upgrade_locked(
     # reconciliation may all have moved the ledger, and the question is what
     # this database has actually applied at the moment the upgrade starts.
     _check_legacy_credential_drop(config, _required_sqlalchemy_url(config), revision)
+    revision = _reconcile_legacy_allowance_column(config, revision)
     command.upgrade(config, revision)
 
     sync_database_url = _required_sqlalchemy_url(config)

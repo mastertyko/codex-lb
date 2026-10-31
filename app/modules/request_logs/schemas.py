@@ -4,6 +4,7 @@ from datetime import datetime
 
 from pydantic import Field
 
+from app.core.usage.pricing_basis import RequestPricingBasis
 from app.modules.shared.schemas import DashboardModel
 
 
@@ -62,6 +63,7 @@ class RequestLogEntry(DashboardModel):
     cached_input_tokens: int | None = None
     reasoning_effort: str | None = None
     cost_usd: float | None = None
+    pricing_basis: RequestPricingBasis | None = None
     cost_breakdown: RequestLogCostBreakdown = Field(default_factory=RequestLogCostBreakdown)
     latency_ms: int | None = None
     latency_first_token_ms: int | None = None

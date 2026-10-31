@@ -187,7 +187,10 @@ def test_http_bridge_rejected_dead_owner_recovery_code_is_not_emitted_from_app()
 def _share_proxy_dashboard_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     class _SettingsCache:
         async def get(self) -> object:
-            return proxy_service.get_settings()
+            settings = proxy_service.get_settings()
+            if isinstance(settings, SimpleNamespace) and not hasattr(settings, "routing_strategy"):
+                return SimpleNamespace(**vars(settings), routing_strategy="usage_weighted")
+            return settings
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache())
 
@@ -10255,6 +10258,7 @@ async def test_stream_via_http_bridge_turn_state_request_ignores_prompt_cache_ow
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -10345,6 +10349,7 @@ async def test_stream_via_http_bridge_durable_outage_does_not_reuse_stale_recove
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -10395,6 +10400,7 @@ async def test_stream_via_http_bridge_keeps_sse_alive_while_session_creation_wai
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=1800,
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -10511,6 +10517,7 @@ async def test_stream_via_http_bridge_stops_session_creation_retry_after_budget_
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=1800,
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -10608,6 +10615,7 @@ async def test_stream_via_http_bridge_usage_limit_session_creation_failure_is_te
 ) -> None:
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=1800,
         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -10884,6 +10892,7 @@ async def test_thread_bridge_durable_lookup_preserves_exact_response_alias_witho
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -11010,6 +11019,7 @@ async def test_stream_via_http_bridge_replaces_retired_hard_gate_before_submit(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -11135,6 +11145,7 @@ async def test_stream_via_http_bridge_replaces_retired_hard_gate_excludes_stuck_
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -11255,6 +11266,7 @@ async def test_stream_via_http_bridge_replaces_retired_hard_gate_keeps_pinned_ac
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -11354,6 +11366,7 @@ async def test_stream_via_http_bridge_soft_prompt_cache_queue_full_reroutes(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -11457,6 +11470,7 @@ async def test_stream_via_http_bridge_file_pin_queue_full_does_not_reroute(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -14351,6 +14365,7 @@ async def test_stream_via_http_bridge_injects_durable_previous_response_anchor(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -14447,6 +14462,7 @@ async def test_stream_via_http_bridge_fences_detached_denial_after_absent_sessio
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -14670,6 +14686,7 @@ async def test_stream_via_http_bridge_trims_replayed_tool_call_items_with_previo
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -14779,6 +14796,7 @@ async def test_stream_via_http_bridge_does_not_inject_session_anchor_for_soft_re
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_enabled=True,
@@ -14902,6 +14920,7 @@ async def test_stream_via_http_bridge_skips_session_anchor_injection_when_trim_w
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_enabled=True,
@@ -15029,6 +15048,7 @@ async def _run_session_anchor_owner_stream(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_enabled=True,
@@ -15167,6 +15187,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -15462,6 +15483,7 @@ async def test_stream_via_http_bridge_preserves_only_safe_trimmable_full_resend_
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -15811,6 +15833,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -15937,6 +15960,7 @@ async def test_stream_via_http_bridge_does_not_prefer_durable_account_for_soft_p
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -16071,6 +16095,7 @@ async def test_stream_via_http_bridge_prefers_durable_account_for_soft_prompt_ca
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -16831,6 +16856,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_anchor_for_live_tu
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -16957,6 +16983,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_anchor_for_live_pr
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -17063,6 +17090,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_anchor_when_forwar
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -17184,6 +17212,7 @@ async def test_stream_via_http_bridge_proves_fallback_owner_key_before_legacy_fo
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -17383,6 +17412,7 @@ async def test_stream_via_http_bridge_preserves_context_after_owner_unavailable(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -17612,6 +17642,7 @@ async def test_stream_via_http_bridge_does_not_inject_durable_previous_response_
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -17737,6 +17768,7 @@ async def test_stream_via_http_bridge_resolves_previous_response_owner_from_requ
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -17834,6 +17866,7 @@ async def test_stream_via_http_bridge_fails_closed_when_previous_response_owner_
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -17966,6 +17999,7 @@ async def test_stream_via_http_bridge_uses_generated_downstream_turn_state_for_o
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -18589,6 +18623,7 @@ async def test_stream_via_http_bridge_does_not_rebind_after_forwarded_bytes(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -18726,6 +18761,7 @@ async def test_stream_via_http_bridge_fails_closed_on_forward_loop_prevented(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -18900,6 +18936,7 @@ async def test_stream_via_http_bridge_reacquires_api_key_reservation_for_local_p
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -19036,6 +19073,7 @@ async def test_stream_via_http_bridge_does_not_rebind_after_downstream_visible(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -19312,6 +19350,7 @@ async def test_stream_via_http_bridge_reuses_api_key_reservation_after_pre_dispa
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -19463,6 +19502,7 @@ async def _run_owner_forward_recovery_with_session(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -19658,6 +19698,7 @@ async def test_stream_via_http_bridge_local_recovery_retry_keeps_injected_interr
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -19836,6 +19877,7 @@ async def _run_owner_forward_recovery_durable_anchor_stream(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -20112,6 +20154,7 @@ async def test_stream_via_http_bridge_local_previous_response_rebind_fails_exist
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -20260,6 +20303,7 @@ async def test_stream_via_http_bridge_rolls_over_session_after_context_length_ex
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -20396,6 +20440,7 @@ async def test_stream_via_http_bridge_context_overflow_keeps_hard_affinity_sessi
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -20534,6 +20579,7 @@ async def test_stream_via_http_bridge_context_overflow_does_not_retry_hard_affin
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -24789,9 +24835,16 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
 
 
 @pytest.mark.asyncio
-async def test_process_http_bridge_upstream_text_masks_failed_replay_usage_limit(
+async def test_process_http_bridge_upstream_text_preserves_failed_replay_usage_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A failed pre-created replay must not hide a quota terminal behind a synthetic 502.
+
+    The upstream already answered with a status-bearing 429 quota envelope before
+    the replay ran, so the original terminal (code and reset metadata) is what
+    the client observes; no override is left behind for the terminal renderer to
+    rewrite.
+    """
     service = proxy_service.ProxyService(cast(Any, nullcontext()))
     request_state = proxy_service._WebSocketRequestState(
         request_id="req-precreated-replay-failed",
@@ -24865,9 +24918,15 @@ async def test_process_http_bridge_upstream_text_masks_failed_replay_usage_limit
     assert isinstance(error, dict)
 
     assert payload["type"] == "response.failed"
-    assert error["code"] == "stream_incomplete"
-    assert "usage_limit_reached" not in json.dumps(payload)
-    assert request_state.error_http_status_override == 502
+    assert error["code"] == "usage_limit_reached"
+    assert error["type"] == "usage_limit_reached"
+    assert error["resets_at"] == 1_778_790_595
+    assert error["resets_in_seconds"] == 14_555
+    # No synthetic rewrite survives: the terminal renderer keeps the upstream
+    # 429 contract instead of turning the quota answer into a 502.
+    assert request_state.error_http_status_override == 429
+    assert request_state.error_code_override is None
+    assert request_state.error_message_override is None
     assert session.pending_requests == deque()
     assert session.queued_request_count == 0
 
@@ -28128,6 +28187,7 @@ async def test_stream_via_http_bridge_fails_closed_before_file_affinity_when_pre
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -28413,6 +28473,7 @@ async def test_stream_via_http_bridge_projects_plaintext_durable_full_resend_whe
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -28664,6 +28725,7 @@ async def test_stream_via_http_bridge_recovers_dead_owner_with_replayable_full_r
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -28799,6 +28861,7 @@ async def test_durable_model_transition_preserves_owner_provenance_when_replacin
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -28851,6 +28914,7 @@ async def test_stream_via_http_bridge_forks_account_neutral_model_transition_aft
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -28970,6 +29034,7 @@ async def test_stream_via_http_bridge_limits_model_transition_owner_conflict_for
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -29063,6 +29128,7 @@ async def test_stream_via_http_bridge_model_transition_owner_conflict_fork_does_
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -29217,6 +29283,7 @@ async def test_stream_via_http_bridge_preserves_verified_replay_kind_for_durable
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -34538,6 +34605,7 @@ async def test_stream_via_http_bridge_recovers_terse_previous_response_rejection
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -34762,6 +34830,7 @@ async def test_stream_via_http_bridge_same_owner_fresh_replay_pins_owner_without
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -36105,6 +36174,7 @@ async def test_stream_http_bridge_or_retry_spills_unanchored_fork_from_capped_pr
         yield 'data: {"type":"response.completed"}\n\n'
 
     dashboard_settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=1800,
     )
@@ -36855,6 +36925,7 @@ async def test_stream_http_bridge_quarantined_full_resend_stays_unanchored_when_
         yield 'data: {"type":"response.completed"}\n\n'
 
     dashboard_settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=1800,
     )
@@ -37028,6 +37099,7 @@ async def test_stream_http_bridge_tombstoned_full_resend_stays_unanchored(
         yield 'data: {"type":"response.completed"}\n\n'
 
     dashboard_settings = SimpleNamespace(
+        routing_strategy="usage_weighted",
         sticky_threads_enabled=False,
         openai_cache_affinity_max_age_seconds=1800,
     )
@@ -39151,6 +39223,7 @@ async def test_stream_via_http_bridge_probe_after_poisoned_circuit_is_unanchored
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -41938,6 +42011,7 @@ async def test_canonicalized_continuity_loads_the_canonical_circuit_before_injec
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -43774,6 +43848,7 @@ async def test_an_abandoned_tombstone_fails_deltas_closed(monkeypatch: pytest.Mo
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -45605,6 +45680,7 @@ async def test_an_unanchored_delta_fails_closed_under_poison_evidence(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -45765,6 +45841,7 @@ async def test_poison_quarantined_anchor_rejection_fails_fast_to_client(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,
                         http_responses_session_bridge_prompt_cache_idle_ttl_seconds=3600,
@@ -47793,3 +47870,89 @@ async def test_http_bridge_reader_stamps_the_upstream_terminal_when_it_parses_th
 
     assert observed == {"terminal_at": 112.0, "finalizer_entered_at": 122.0}
     assert request_state.upstream_terminal_at == 112.0
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_masks_failed_replay_without_quota_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay failures without a status-bearing quota terminal stay fail-closed.
+
+    Same staging as the quota case, but the upstream terminal is a replayable
+    capacity/overload code that is not a status-bearing 429 quota answer: the
+    synthetic ``stream_incomplete`` 502 remains the only safe answer because
+    the original terminal proves nothing about the account.
+    """
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-precreated-replay-failed-nonquota",
+        model="gpt-5.5",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        request_text='{"type":"response.create","model":"gpt-5.5","input":"hello"}',
+        transport="http",
+        skip_request_log=True,
+    )
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("turn_state_header", "http_turn_limit_nonquota", None),
+        headers={"x-codex-turn-state": "http_turn_limit_nonquota"},
+        affinity=proxy_service._AffinityPolicy(
+            key="http_turn_limit_nonquota",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+        ),
+        request_model="gpt-5.5",
+        account=cast(Any, SimpleNamespace(id="acc-nonquota", status=AccountStatus.ACTIVE)),
+        upstream=cast(UpstreamWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+    handle_stream_error = AsyncMock()
+
+    async def failed_replay(target_session: proxy_service._HTTPBridgeSession) -> bool:
+        target_session.account = cast(Any, SimpleNamespace(id="acc-replacement", status=AccountStatus.ACTIVE))
+        return False
+
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", failed_replay)
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 503,
+                "error": {
+                    "type": "overloaded_error",
+                    "message": "Upstream is temporarily overloaded",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    event_queue = request_state.event_queue
+    assert event_queue is not None
+    event_block = await event_queue.get()
+    assert event_block is not None
+    assert await event_queue.get() is None
+    payload = proxy_service.parse_sse_data_json(event_block)
+    assert isinstance(payload, dict)
+    response = payload.get("response")
+    assert isinstance(response, dict)
+    error = response.get("error")
+    assert isinstance(error, dict)
+
+    assert payload["type"] == "response.failed"
+    assert error["code"] == "stream_incomplete"
+    assert request_state.error_http_status_override == 502
+    assert session.pending_requests == deque()
+    assert session.queued_request_count == 0

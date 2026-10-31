@@ -27,7 +27,7 @@ def prepare_http_quota_rebalance(
     session: _HTTPBridgeSession, request: _WebSocketRequestState, client_input: JsonValue
 ) -> str | None:
     from app.modules.proxy._service.http_bridge.service_stubs import _input_prefix_matches_stored_context
-    from app.modules.proxy._service.websocket.quota_rebalance import _complete_context_text
+    from app.modules.proxy.quota_rebalance import complete_context_text
 
     if (
         session.key.affinity_kind not in {"thread_header", "prompt_cache"}
@@ -47,7 +47,7 @@ def prepare_http_quota_rebalance(
         )
     ):
         return None
-    return _complete_context_text(
+    return complete_context_text(
         request,
         _WebSocketContinuityState(
             last_completed_response_id=session.last_completed_response_id,
@@ -66,8 +66,8 @@ async def rebalance_http_bridge(
     *,
     settings: DashboardSettings,
 ) -> str:
-    from app.modules.proxy._service.websocket.helpers import _install_fresh_replay_body
-    from app.modules.proxy._service.websocket.quota_rebalance import quota_rebalance_exclusions
+    from app.modules.proxy.quota_rebalance import quota_rebalance_exclusions
+    from app.modules.proxy.replay_context import install_fresh_replay_body
 
     fresh_text = request.quota_rebalance_request_text
     request.quota_rebalance_request_text = None
@@ -103,7 +103,7 @@ async def rebalance_http_bridge(
         original_fingerprint = request.input_full_fingerprint
         request.fresh_upstream_request_text = fresh_text
         request.fresh_upstream_request_is_retry_safe = True
-        installed = _install_fresh_replay_body(request, fresh_text, account_neutral=True)
+        installed = install_fresh_replay_body(request, fresh_text, account_neutral=True)
         request.input_full_fingerprint = original_fingerprint
         request.hard_continuity_anchor = False
         request.previous_response_owner_account_id = None
@@ -142,10 +142,12 @@ async def prepare_cold_http_quota_rebalance(
     fresh_text: str,
 ) -> tuple[str, set[str]] | None:
     """Prove a cold full resend before the ordinary fenced session claim."""
-    from app.modules.proxy._service.http_bridge.service_stubs import _input_prefix_matches_stored_context
-    from app.modules.proxy._service.response_create import _upstream_response_create_max_bytes
-    from app.modules.proxy._service.websocket.quota_rebalance import quota_rebalance_exclusions
+    from app.modules.proxy._service.http_bridge.service_stubs import (
+        _input_prefix_matches_stored_context,
+        _upstream_response_create_max_bytes,
+    )
     from app.modules.proxy.quota_context import native_quota_context_is_complete
+    from app.modules.proxy.quota_rebalance import quota_rebalance_exclusions
 
     if (
         lookup.account_id is None

@@ -87,7 +87,6 @@ async def test_http_accounting_preserves_raw_tier(async_client, monkeypatch, pat
     await prepare_account(async_client, monkeypatch)
     async with SessionLocal() as session:
         settings = await SettingsRepository(session).get_or_create()
-    settings.http_responses_session_bridge_enabled = False
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(settings))
 
     async def stream(payload, *args, **kwargs):
@@ -182,6 +181,7 @@ def test_websocket_cost_and_key_settlement_agree(app_instance, monkeypatch, path
         await install_catalog(monkeypatch, [fixture.account.id])
 
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(prepare)
         with client.websocket_connect(path, headers=fixture.headers()) as websocket:
             _complete(

@@ -24,7 +24,6 @@ async def test_responses_route_balances_new_process_siblings_and_persists_strate
     await _set_routing_settings(async_client, sticky_threads_enabled=True, routing_strategy="quota_first_balanced")
     async with SessionLocal() as session:
         settings = await SettingsRepository(session).get_or_create()
-    settings.http_responses_session_bridge_enabled = False
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(settings))
     accounts = [await _import_account(async_client, f"quota_{i}", f"quota{i}@example.com") for i in range(2)]
     process = "quota-one-process"
@@ -56,7 +55,6 @@ async def test_responses_route_uses_last_subscription_fraction_before_credits(as
     await _set_routing_settings(async_client, sticky_threads_enabled=True, routing_strategy="quota_first_balanced")
     async with SessionLocal() as session:
         settings = await SettingsRepository(session).get_or_create()
-    settings.http_responses_session_bridge_enabled = False
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(settings))
     credit, subscription = [await _import_account(async_client, f"fund_{i}", f"fund{i}@example.com") for i in range(2)]
     deadline = int(utcnow().replace(tzinfo=timezone.utc).timestamp()) + 3600

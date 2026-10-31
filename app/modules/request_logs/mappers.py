@@ -11,6 +11,7 @@ from app.core.usage.logs import (
     output_tokens_from_log,
     total_tokens_from_log,
 )
+from app.core.usage.pricing_basis import RequestPricingBasis
 from app.db.models import RequestLog
 from app.modules.request_logs.schemas import RequestLogCostBreakdown, RequestLogEntry
 
@@ -43,7 +44,8 @@ def to_request_log_entry(
 ) -> RequestLogEntry:
     log_like = typing_cast(RequestLogLike, log)
     # Leave display rounding to the dashboard so positive microcosts survive.
-    cost_breakdown = cost_breakdown_from_log(log_like)
+    basis = RequestPricingBasis.model_validate_json(log.pricing_basis_json) if log.pricing_basis_json else None
+    cost_breakdown = cost_breakdown_from_log(log_like, basis=basis)
     return RequestLogEntry(
         sticky_key_source=log.sticky_key_source if include_sensitive_metadata else None,
         sticky_kind=log.sticky_kind if include_sensitive_metadata else None,
@@ -92,6 +94,7 @@ def to_request_log_entry(
         reasoning_tokens=log.reasoning_tokens,
         cached_input_tokens=cached_input_tokens_from_log(log_like),
         cost_usd=cost_breakdown.total_usd,
+        pricing_basis=basis,
         cost_breakdown=RequestLogCostBreakdown(**cost_breakdown.__dict__),
         latency_ms=log.latency_ms,
         latency_first_token_ms=log.latency_first_token_ms,

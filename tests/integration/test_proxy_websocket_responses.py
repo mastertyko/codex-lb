@@ -45,6 +45,7 @@ from app.modules.api_keys.service import (
     LimitRuleInput,
 )
 from app.modules.proxy._service.websocket import mixin as websocket_mixin_module
+from app.modules.proxy.account_cache import RoutingAvailabilityCache
 from app.modules.proxy.affinity import _codex_session_selection_key
 from app.modules.proxy.capability_routing import (
     REQUIRED_CAPABILITY_HEADER,
@@ -139,6 +140,15 @@ def _without_installation_metadata(value: Any) -> Any:
 def _assert_upstream_payloads(sent_text: list[str], expected: list[dict[str, Any]]) -> None:
     actual = [json.loads(message) for message in sent_text]
     assert _without_installation_metadata(actual) == expected
+
+
+@pytest.fixture(autouse=True)
+def _stub_inert_account_availability(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Transport fixtures select inert accounts without importing DB rows. Keep
+    # their availability local; real pause/delete behavior has dedicated route
+    # coverage in test_websocket_paused_account and test_cache_invalidation_bus.
+    availability = RoutingAvailabilityCache()
+    monkeypatch.setattr(websocket_mixin_module, "is_account_routing_unavailable", availability.is_unavailable)
 
 
 @pytest.fixture(autouse=True)
@@ -383,6 +393,7 @@ def test_responses_websocket_route_drain_preserves_terminal_ownership_and_reject
         input_tokens: int,
         output_tokens: int,
         cached_input_tokens: int = 0,
+        cache_write_input_tokens: int = 0,
         service_tier: str | None = None,
         cost_microdollars: int | None = None,
     ) -> None:
@@ -395,6 +406,7 @@ def test_responses_websocket_route_drain_preserves_terminal_ownership_and_reject
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cached_input_tokens=cached_input_tokens,
+            cache_write_input_tokens=cache_write_input_tokens,
             service_tier=service_tier,
             cost_microdollars=cost_microdollars,
         )

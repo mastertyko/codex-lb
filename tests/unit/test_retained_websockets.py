@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -14,6 +13,8 @@ from app.modules.proxy._service.support import _WebSocketUpstreamControl
 from app.modules.proxy._service.websocket import retained
 from app.modules.proxy._service.websocket.mixin import _WebSocketMixin
 from app.modules.proxy.load_balancer import AccountLease
+from app.modules.proxy.service import ProxyService
+from tests.simulation.virtual_time import VirtualClock, VirtualScheduler
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio]
 
@@ -28,7 +29,7 @@ def entry(response: str = "resp_1", account_id: str = "account_1") -> retained.R
         account=Account(id=account_id),
         upstream=cast(UpstreamWebSocket, AsyncMock(spec=UpstreamWebSocket)),
         control=_WebSocketUpstreamControl(),
-        lease=AccountLease("lease_" + response, account_id, "stream", 0.0, "key_1"),
+        lease=AccountLease("lease_" + response, account_id, "stream", 0.0, api_key_id="key_1"),
     )
 
 
@@ -42,9 +43,9 @@ async def test_claim_is_single_owner_and_preserves_lease_until_closed():
     assert registry.take(socket.key, socket.account.id) is None
     await asyncio.sleep(0)
     release.assert_not_awaited()
-    socket.upstream.close.assert_not_awaited()
+    cast(AsyncMock, socket.upstream.close).assert_not_awaited()
     await asyncio.gather(registry.close(socket), registry.close(socket))
-    socket.upstream.close.assert_awaited_once()
+    cast(AsyncMock, socket.upstream.close).assert_awaited_once()
     release.assert_awaited_once_with(socket.lease)
     await registry.close_all()
     assert not registry._tasks
@@ -56,10 +57,11 @@ async def test_expiry_closes_socket_and_settles_lease(monkeypatch):
     registry = retained.RetainedWebSockets(release, close_upstream)
     socket = entry()
     assert registry.retain(socket)
+    assert socket.timer is not None
     await asyncio.wait_for(asyncio.shield(socket.timer), timeout=1)
     assert not registry.entries
     assert registry.take(socket.key, socket.account.id) is None
-    socket.upstream.close.assert_awaited_once()
+    cast(AsyncMock, socket.upstream.close).assert_awaited_once()
     release.assert_awaited_once_with(socket.lease)
     await registry.close_all()
 
@@ -71,7 +73,26 @@ async def test_expired_socket_cannot_be_claimed_before_timer_runs():
     socket.expires_at = asyncio.get_running_loop().time() - 1
     assert registry.take(socket.key, socket.account.id) is None
     await registry.close_all()
-    socket.upstream.close.assert_awaited_once()
+    cast(AsyncMock, socket.upstream.close).assert_awaited_once()
+
+
+async def test_retained_expiry_uses_the_injected_clock_and_owns_cleanup():
+    clock = VirtualClock(monotonic_value=100.0)
+    scheduler = VirtualScheduler(clock)
+    release = AsyncMock()
+    registry = retained.RetainedWebSockets(release, close_upstream, clock=clock, scheduler=scheduler)
+    socket = entry()
+    assert registry.retain(socket)
+    assert socket.expires_at == 100.0 + retained.RETAIN_SECONDS
+    await scheduler.advance(retained.RETAIN_SECONDS - 1)
+    assert registry.entries[socket.key] is socket
+    release.assert_not_awaited()
+    await scheduler.advance(1)
+    assert registry.take(socket.key, socket.account.id) is None
+    cast(AsyncMock, socket.upstream.close).assert_awaited_once()
+    release.assert_awaited_once_with(socket.lease)
+    await registry.close_all()
+    assert not scheduler.owned_tasks
 
 
 async def test_capacity_and_duplicate_refusal_leave_ownership_with_caller(monkeypatch):
@@ -83,9 +104,9 @@ async def test_capacity_and_duplicate_refusal_leave_ownership_with_caller(monkey
     assert not registry.retain(refused)
     assert not registry.retain(duplicate)
     await registry.close_all()
-    owned.upstream.close.assert_awaited_once()
-    refused.upstream.close.assert_not_awaited()
-    duplicate.upstream.close.assert_not_awaited()
+    cast(AsyncMock, owned.upstream.close).assert_awaited_once()
+    cast(AsyncMock, refused.upstream.close).assert_not_awaited()
+    cast(AsyncMock, duplicate.upstream.close).assert_not_awaited()
     release.assert_awaited_once_with(owned.lease)
     assert not registry.retain(entry("resp_after_shutdown"))
 
@@ -97,8 +118,8 @@ async def test_account_invalidation_closes_only_matching_owner():
     assert registry.retain(first)
     assert registry.retain(second)
     assert await registry.close_all(first.account.id) == 1
-    first.upstream.close.assert_awaited_once()
-    second.upstream.close.assert_not_awaited()
+    cast(AsyncMock, first.upstream.close).assert_awaited_once()
+    cast(AsyncMock, second.upstream.close).assert_not_awaited()
     assert registry.take(second.key, second.account.id) is second
     await registry.close(second)
     await registry.close_all()
@@ -115,7 +136,7 @@ async def test_shutdown_waits_for_already_expiring_socket(monkeypatch):
         closing.set()
         await finish.wait()
 
-    socket.upstream.close.side_effect = close
+    cast(AsyncMock, socket.upstream.close).side_effect = close
     assert registry.retain(socket)
     await asyncio.wait_for(closing.wait(), 1)
     shutdown = asyncio.create_task(registry.close_all())
@@ -123,7 +144,7 @@ async def test_shutdown_waits_for_already_expiring_socket(monkeypatch):
     assert not shutdown.done()
     finish.set()
     await asyncio.wait_for(shutdown, 1)
-    socket.upstream.close.assert_awaited_once()
+    cast(AsyncMock, socket.upstream.close).assert_awaited_once()
     release.assert_awaited_once_with(socket.lease)
     assert not registry._tasks
 
@@ -137,15 +158,15 @@ async def test_release_failure_does_not_skip_other_socket_cleanup():
     with pytest.raises(RuntimeError, match="release failed"):
         await registry.close_all()
     assert release.await_count == 2
-    first.upstream.close.assert_awaited_once()
-    second.upstream.close.assert_awaited_once()
+    cast(AsyncMock, first.upstream.close).assert_awaited_once()
+    cast(AsyncMock, second.upstream.close).assert_awaited_once()
     assert not registry.entries
     assert not registry._tasks
 
 
 async def test_stuck_transport_close_does_not_hold_lease_or_block_shutdown():
     release = AsyncMock()
-    proxy = SimpleNamespace(_clock=REAL_CLOCK, _scheduler=REAL_SCHEDULER, _background_cleanup_tasks=set())
+    proxy = ProxyService(Mock(), clock=REAL_CLOCK, scheduler=REAL_SCHEDULER)
 
     async def bounded_close(upstream):
         await _WebSocketMixin._close_retained_websocket(proxy, upstream)
@@ -161,7 +182,7 @@ async def test_stuck_transport_close_does_not_hold_lease_or_block_shutdown():
         except asyncio.CancelledError:
             await finish.wait()
 
-    socket.upstream.close.side_effect = stubborn_close
+    cast(AsyncMock, socket.upstream.close).side_effect = stubborn_close
     assert registry.retain(socket)
     await asyncio.wait_for(registry.close_all(), timeout=2)
     assert started.is_set()

@@ -561,6 +561,34 @@ def _merge_latest_additional_usage_entries(
         )
 
 
+def _bound_history_results(
+    grouped: dict[str, list[UsageHistorySnapshot]],
+    since: datetime,
+    cutoffs: dict[str, datetime] | None,
+    row_cap: int | None,
+    recent_floor: datetime | None,
+) -> dict[str, list[UsageHistorySnapshot]]:
+    if not cutoffs and row_cap is None:
+        return grouped
+    result: dict[str, list[UsageHistorySnapshot]] = {}
+    for account_id, rows in grouped.items():
+        cutoff = max(since, (cutoffs or {}).get(account_id, since))
+        rows = [row for row in rows if row.recorded_at >= cutoff]
+        if row_cap is not None:
+            split = next(
+                (
+                    index
+                    for index, row in enumerate(rows)
+                    if recent_floor is not None and row.recorded_at >= recent_floor
+                ),
+                len(rows),
+            )
+            rows = rows[max(0, split - row_cap) :]
+        if rows:
+            result[account_id] = rows
+    return result
+
+
 class UsageRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -938,45 +966,29 @@ class UsageRepository:
     ) -> dict[str, list[UsageHistorySnapshot]]:
         """Fetch minimal usage history fields for multiple accounts in a single query.
 
-        ``since`` is the global floor. ``cutoffs`` optionally tightens the
-        lookback per account: callers whose accounts have different window
-        lengths would otherwise widen the fetch to the longest window for
-        every account and discard the surplus in Python. The SQLite path
-        ignores ``cutoffs`` (its snapshot cache is keyed on the shared
-        floor); callers keep their own per-account trimming, so honoring the
-        bound here only changes how many rows are read, never the result.
-
-        ``per_account_row_cap`` additionally bounds each account's slice to
-        its newest rows inside the cutoff (PostgreSQL only). Live snapshot
-        ingestion appends usage rows per proxied request, so a busy account's
-        7-day window can hold tens of thousands of rows while the projection
-        consumers (EWMA depletion, weekly-pace burn/smoothing) only read the
-        recent tail. Each capped slice keeps oldest-first ordering. The
-        SQLite snapshot-cache path ignores the cap the same way it ignores
-        ``cutoffs``.
-
-        ``uncapped_recent_floor`` exempts rows at or after the given time
-        from the row cap: every in-cutoff row newer than the floor is always
-        returned, and the cap bounds only the older remainder. Consumers
-        whose math weighs every sample in a fixed time window equally (the
-        weekly-pace smoothing mean) pass their window start here so a
-        write-rate burst can never silently truncate that window, while
-        tail-weighted consumers (EWMA) stay covered by the cap alone.
-        Ignored unless ``per_account_row_cap`` is set on PostgreSQL.
+        ``since`` is the global floor and ``cutoffs`` can tighten it per account.
+        ``per_account_row_cap`` bounds the older tail per account. All samples
+        at or after ``uncapped_recent_floor`` survive for equal-weight forecast
+        calculations. Results are oldest-first on both databases. PostgreSQL
+        bounds the query; SQLite slices its reusable snapshot without mutating
+        cached rows or leaking one caller's bounds into another caller.
         """
         if not account_ids:
             return {}
         bind = self._session.get_bind()
         dialect = bind.dialect.name if bind else "sqlite"
         sqlite_path = _sqlite_path_from_bind(bind) if dialect == "sqlite" else None
+        if per_account_row_cap is not None:
+            per_account_row_cap = max(0, per_account_row_cap)
         if sqlite_path is not None:
-            return await to_thread.run_sync(
+            grouped = await to_thread.run_sync(
                 _bulk_history_since_sqlite,
                 str(sqlite_path),
                 list(account_ids),
                 window,
                 since,
             )
+            return _bound_history_results(grouped, since, cutoffs, per_account_row_cap, uncapped_recent_floor)
 
         if per_account_row_cap is not None and dialect == "postgresql":
             return await self._bulk_history_since_capped_postgresql(
@@ -1030,7 +1042,7 @@ class UsageRepository:
                 window_minutes=int(window_minutes) if window_minutes is not None else None,
             )
             grouped.setdefault(account_id, []).append(snapshot)
-        return grouped
+        return _bound_history_results(grouped, since, cutoffs, per_account_row_cap, uncapped_recent_floor)
 
     async def _bulk_history_since_capped_postgresql(
         self,

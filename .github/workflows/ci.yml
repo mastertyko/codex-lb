@@ -24,6 +24,44 @@ permissions:
   pull-requests: read
 
 jobs:
+  publication-privacy:
+    name: Publication privacy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout publication head and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned scanner
+        run: |
+          GOBIN="$RUNNER_TEMP/publication-tools" go install github.com/zricethezav/gitleaks/v8@v8.30.1
+          echo "$RUNNER_TEMP/publication-tools" >> "$GITHUB_PATH"
+
+      - name: Check published tree and newly published history
+        env:
+          PUBLICATION_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          PUBLICATION_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          if [[ -z "$PUBLICATION_BASE" || "$PUBLICATION_BASE" == "0000000000000000000000000000000000000000" ]]; then
+            python3 scripts/check_publication_privacy.py --head "$PUBLICATION_HEAD" --all-history
+          else
+            python3 scripts/check_publication_privacy.py --head "$PUBLICATION_HEAD" --base "$PUBLICATION_BASE"
+          fi
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          python-version: "3.13"
+          enable-cache: true
+          prune-cache: true
+
+      - name: Test the gate with the real scanner
+        run: uv run pytest -q tests/unit/test_publication_privacy.py
+
   # Detect changed areas so PRs can skip unrelated expensive jobs.
   # Pushes to main and merge queue events still run the full suite.
   changes:
@@ -110,7 +148,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -118,9 +156,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run frontend lint
         run: make frontend-lint
@@ -140,7 +178,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -148,9 +186,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run frontend type check
         run: make frontend-typecheck
@@ -173,7 +211,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -181,9 +219,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       # PRs run vitest without coverage instrumentation for a faster signal;
       # main pushes and the merge queue keep the full coverage run.
@@ -210,7 +248,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -218,9 +256,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build frontend
         run: make frontend-build
@@ -240,7 +278,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -248,9 +286,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Cache Playwright browsers
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -399,7 +437,7 @@ jobs:
         if: needs.changes.outputs.backend == 'true'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         if: needs.changes.outputs.backend == 'true'
@@ -408,9 +446,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Set up uv
         if: needs.changes.outputs.backend == 'true'
@@ -454,7 +492,7 @@ jobs:
         if: needs.changes.outputs.backend == 'true'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         if: needs.changes.outputs.backend == 'true'
@@ -463,9 +501,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Set up uv
         if: needs.changes.outputs.backend == 'true'
@@ -552,7 +590,7 @@ jobs:
         if: needs.changes.outputs.backend == 'true'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         if: needs.changes.outputs.backend == 'true'
@@ -561,9 +599,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Set up uv
         if: needs.changes.outputs.backend == 'true'
@@ -650,7 +688,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -658,9 +696,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Set up uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
@@ -848,7 +886,7 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
-          bun-version: "1.3.14"
+          bun-version: "1.4.4"
 
       - name: Cache Bun dependencies
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
@@ -856,9 +894,9 @@ jobs:
           path: |
             ~/.bun/install/cache
             frontend/node_modules
-          key: bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('frontend/bun.lock') }}
           restore-keys: |
-            bun-1.3.14-${{ runner.os }}-${{ runner.arch }}-
+            bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Verify bun.nix is generated from bun.lock
         run: |
@@ -882,6 +920,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - publication-privacy
       - contributors
       - openspec
       - frontend-lint

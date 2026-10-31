@@ -2328,6 +2328,9 @@ class _HTTPBridgeStreamingMixin:
                 return False
             if payload.previous_response_id is not None or rewritten_file_account_id is not None:
                 return False
+            if durable_full_resend_proof is not None:
+                # A context-only proof does not authorize account relocation.
+                return False
             retiring_account_id = request_state.preferred_account_id
             if durable_lookup is None or retiring_account_id is None:
                 # Nothing durable to retire: the owner came from the
@@ -2556,9 +2559,9 @@ class _HTTPBridgeStreamingMixin:
                 self, fresh_state, durable_lookup, fresh_text=fresh_text
             )
             if candidate is not None:
-                from app.modules.proxy._service.websocket.helpers import _install_fresh_replay_body
+                from app.modules.proxy.replay_context import install_fresh_replay_body
 
-                text_data = _install_fresh_replay_body(request_state, candidate[0], account_neutral=True)
+                text_data = install_fresh_replay_body(request_state, candidate[0], account_neutral=True)
                 request_state.hard_continuity_anchor = False
                 request_state.previous_response_owner_account_id = None
                 request_state.previous_response_owner_lookup_outcome = None

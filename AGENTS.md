@@ -34,6 +34,12 @@ This repo uses **OpenSpec as the primary workflow and SSOT** for change-driven d
   - Main specs: `openspec/specs/<capability>/spec.md`
   - Archived changes: `openspec/changes/archive/YYYY-MM-DD-<change>/`
 
+## Publication privacy
+
+Before publishing to GitHub, review both the intended tree and newly published history for secrets and personal or infrastructure data. Use `scripts/push_checked.sh` for Git pushes so the repository pre-push gate inspects the actual pushed refs. The gate requires Gitleaks and fails closed; do not bypass it with `--no-verify`. Other publishing paths must run `scripts/check_publication_privacy.py` against the exact head/base first.
+
+Exceptions require a review reason and exact content fingerprint in `.github/publication-privacy-allowlist.json`. Never approve a finding merely to make the check pass. Do not publish raw logs, account records, credentials, local operator paths or screenshots containing personal data. See [publication guidance](docs/development/publication.md) and the [owning specification](openspec/specs/publication-privacy/spec.md).
+
 ## Documentation & Release Notes
 
 - **OpenSpec is the SSOT for feature/behavior documentation.** User-facing rendering lives under `docs/` (the published docs pages), and each spec-governed page MUST link back to the owning `openspec/specs/<capability>/` entry. Do not create `docs/` content that has no OpenSpec counterpart, and do not add feature docs as new README sections. Keep normative requirements in `openspec/specs/<capability>/spec.md` and free-form rationale in the capability's `context.md` (or change-level context under `openspec/changes/<change>/context.md`).

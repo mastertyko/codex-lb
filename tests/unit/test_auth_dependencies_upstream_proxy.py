@@ -23,7 +23,9 @@ async def test_validate_proxy_api_key_requires_carrier_authentication(
     principal = object()
     request = cast(
         Any,
-        SimpleNamespace(headers=Headers({CODEX_LB_REQUIRED_CAPABILITY_HEADER: "trusted_cyber"})),
+        SimpleNamespace(
+            state=SimpleNamespace(), headers=Headers({CODEX_LB_REQUIRED_CAPABILITY_HEADER: "trusted_cyber"})
+        ),
     )
 
     async def required_auth(authorization: str | None) -> object:
@@ -49,7 +51,7 @@ async def test_validate_proxy_api_key_preserves_headerless_authentication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     principal = object()
-    request = cast(Any, SimpleNamespace(headers=Headers()))
+    request = cast(Any, SimpleNamespace(state=SimpleNamespace(), headers=Headers()))
 
     async def fail_required_auth(_authorization: str | None) -> None:
         pytest.fail("headerless provider request must retain ordinary authentication")
@@ -107,7 +109,9 @@ async def test_validate_codex_provider_usage_identity_preserves_headerless_ident
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     principal = object()
-    request = cast(Any, SimpleNamespace(headers=Headers({"Authorization": "Bearer ordinary-token"})))
+    request = cast(
+        Any, SimpleNamespace(state=SimpleNamespace(), headers=Headers({"Authorization": "Bearer ordinary-token"}))
+    )
 
     async def fail_required_auth(_authorization: str | None) -> None:
         pytest.fail("headerless usage identity must retain ordinary validation")
@@ -403,5 +407,11 @@ async def test_validate_codex_usage_identity_fails_closed_when_route_unavailable
 
     with pytest.raises(auth_dependencies.ProxyUpstreamError):
         await auth_dependencies.validate_codex_usage_identity(
-            cast(Any, SimpleNamespace(headers={"Authorization": "Bearer access", "chatgpt-account-id": "chatgpt_1"}))
+            cast(
+                Any,
+                SimpleNamespace(
+                    state=SimpleNamespace(),
+                    headers={"Authorization": "Bearer access", "chatgpt-account-id": "chatgpt_1"},
+                ),
+            )
         )

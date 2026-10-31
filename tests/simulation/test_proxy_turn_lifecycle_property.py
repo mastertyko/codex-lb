@@ -1047,7 +1047,7 @@ async def test_bridge_turn_lifecycle_checker_catches_retry_reacquisition_canary(
 @pytest.mark.asyncio
 @pytest.mark.skipif(
     not ABANDONED_SHIELD_ORACLE_SUPPORTED,
-    reason="asyncio.shield leaves no callback residue before CPython 3.14; the oracle cannot see this canary",
+    reason="this asyncio.shield implementation leaves no callback residue; the oracle cannot see this canary",
 )
 async def test_bridge_turn_lifecycle_checker_catches_reshielded_release_canary() -> None:
     with pytest.raises(AssertionError, match=r"^violated=abandoned_shields "):
@@ -1055,7 +1055,9 @@ async def test_bridge_turn_lifecycle_checker_catches_reshielded_release_canary()
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(ABANDONED_SHIELD_ORACLE_SUPPORTED, reason="on CPython 3.14+ the canary is caught (test above)")
+@pytest.mark.skipif(
+    ABANDONED_SHIELD_ORACLE_SUPPORTED, reason="on an affected shield implementation the canary is caught (test above)"
+)
 async def test_bridge_turn_lifecycle_reshielded_release_canary_is_invisible_before_python_3_14() -> None:
     """Documents the CI blind spot: on 3.13 the leak shape has no observable residue.
 

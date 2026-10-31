@@ -81,6 +81,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         self._model_sources: dict[str, ModelSource] = {}
         self._limit_id_seq = 0
         self._reservations: dict[str, UsageReservationData] = {}
+        self._pending_status_transitions: dict[str, UsageReservationData] = {}
         self.list_all_accounts_calls = 0
         self.list_accounts_by_ids_calls: list[list[str]] = []
         self.commit_calls = 0
@@ -214,10 +215,13 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
     async def commit(self) -> None:
         self.commit_calls += 1
         self.commit_count += 1
+        self._pending_status_transitions.clear()
         return None
 
     async def rollback(self) -> None:
         self.rollback_calls += 1
+        self._reservations.update(self._pending_status_transitions)
+        self._pending_status_transitions.clear()
         return None
 
     async def get_limits_by_key(self, key_id: str) -> list[ApiKeyLimit]:
@@ -399,6 +403,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         reservation = self._reservations.get(reservation_id)
         if reservation is None or reservation.status != expected_status:
             return False
+        self._pending_status_transitions.setdefault(reservation_id, reservation)
         self._reservations[reservation_id] = UsageReservationData(
             reservation_id=reservation.reservation_id,
             api_key_id=reservation.api_key_id,
@@ -461,6 +466,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         output_tokens: int | None,
         cached_input_tokens: int | None,
         cost_microdollars: int | None,
+        cache_write_input_tokens: int | None = None,
     ) -> None:
         reservation = self._reservations.get(reservation_id)
         if reservation is None:

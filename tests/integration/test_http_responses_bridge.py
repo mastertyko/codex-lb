@@ -8197,7 +8197,7 @@ async def test_v1_responses_http_bridge_opens_fresh_session_for_previous_respons
 
 
 @pytest.mark.parametrize(
-    ("developer_message_extra", "fresh_developer_message", "leading_input_item", "preserves_full_resend"),
+    ("developer_message_extra", "fresh_developer_message", "leading_input_item", "account_neutral_resend"),
     [
         pytest.param({}, None, None, True, id="unowned-developer-message"),
         pytest.param({"id": "msg_response_owned"}, None, None, False, id="response-owned-developer-message"),
@@ -8233,7 +8233,7 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
     developer_message_extra,
     fresh_developer_message,
     leading_input_item,
-    preserves_full_resend,
+    account_neutral_resend,
 ):
     _install_bridge_settings(monkeypatch, enabled=True)
     account_id = await _import_account(
@@ -8246,6 +8246,7 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
     replay_upstream = _FakeBridgeUpstreamWebSocket("resp_preserve_replay")
     upstreams = [first_upstream, replay_upstream]
     connect_headers: list[dict[str, str]] = []
+    selections: list[dict[str, object]] = []
     service = get_proxy_service_for_app(app_instance)
     predecessor_release_started = asyncio.Event()
     allow_predecessor_release = asyncio.Event()
@@ -8266,7 +8267,8 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
         return lookup
 
     async def fake_select_account_with_budget(self, deadline, **kwargs):
-        del self, deadline, kwargs
+        del self, deadline
+        selections.append(kwargs)
         return AccountSelection(account=account, error_message=None, error_code=None)
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
@@ -8387,11 +8389,13 @@ async def test_v1_responses_http_bridge_classifies_responses_lite_developer_inte
     assert len(first_upstream.sent_text) == 1
     assert len(replay_upstream.sent_text) == 1
     replay_payload = json.loads(replay_upstream.sent_text[0])
-    if preserves_full_resend:
-        assert "previous_response_id" not in replay_payload
-        assert replay_payload["input"] == full_resend
-    else:
-        assert replay_payload["previous_response_id"] == "resp_bridge_custom_1"
+    assert "previous_response_id" not in replay_payload
+    assert replay_payload["input"] == full_resend
+    if not account_neutral_resend:
+        # The complete tool batch has a separate same-owner proof. It may stay
+        # unanchored, but the account-neutral proof must not authorize failover.
+        assert selections[-1]["preferred_account_id"] == account.id
+        assert selections[-1]["fallback_on_preferred_account_unavailable"] is False
 
 
 @pytest.mark.asyncio
@@ -16743,14 +16747,16 @@ async def test_v1_responses_http_bridge_quarantines_reattach_that_streams_withou
             json={
                 "model": "gpt-5.1",
                 "instructions": "Return exactly OK.",
-                "input": full_resend,
+                # A delta needs the durable anchor; a proved full resend
+                # is deliberately preserved unanchored.
+                "input": [full_resend[-1]],
             },
             headers=session_headers,
         ),
         timeout=_TEST_SYNC_TIMEOUT_SECONDS,
     )
 
-    # The reattach injected the durable anchor and then wedged: events flowed
+    # The delta reattach injected the durable anchor and then wedged: events flowed
     # but response.created never arrived, so the turn fails terminally.
     assert second.status_code != 200
     assert len(wedged_upstream.sent_text) == 1
@@ -16918,14 +16924,16 @@ async def test_v1_responses_http_bridge_quarantined_unsafe_full_resend_dispatche
             json={
                 "model": "gpt-5.1",
                 "instructions": "Return exactly OK.",
-                "input": full_resend,
+                # A delta needs the durable anchor; a proved full resend
+                # is deliberately preserved unanchored.
+                "input": [full_resend[-1]],
             },
             headers=session_headers,
         ),
         timeout=_TEST_SYNC_TIMEOUT_SECONDS,
     )
 
-    # The reattach injected the durable anchor and then wedged: the key is now
+    # The delta reattach injected the durable anchor and then wedged: the key is now
     # quarantined.
     assert second.status_code != 200
     assert len(wedged_upstream.sent_text) == 1

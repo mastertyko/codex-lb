@@ -428,9 +428,6 @@ def _facade() -> Any:
     return sys.modules["app.modules.proxy.service"]
 
 
-_REQUEST_TRANSPORT_HTTP = "http"
-
-
 class _StreamingMixin(_StreamingRetryMixin):
     _handle_stream_error = _handle_stream_error_helper
     _resolve_upstream_route_for_account = _resolve_upstream_route_for_account_helper
@@ -447,7 +444,7 @@ class _StreamingMixin(_StreamingRetryMixin):
         api_key: ApiKeyData | None = None,
         api_key_reservation: ApiKeyUsageReservationData | None = None,
         suppress_text_done_events: bool = False,
-        request_transport: str = _REQUEST_TRANSPORT_HTTP,
+        request_transport: str = "http",
         client_ip: str | None = None,
         enforce_openai_sdk_contract: bool = True,
     ) -> AsyncIterator[str]:

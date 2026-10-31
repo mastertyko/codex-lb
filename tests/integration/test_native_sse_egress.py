@@ -682,7 +682,13 @@ async def test_routed_native_selection_stops_after_response_head(
     assert len(accepted_heads) == 1
     assert accepted_heads[0].startswith(b"POST http://upstream.invalid/codex/responses ")
     assert not unexpected_replays
-    assert trace == proxy_module.UpstreamProxyRouteTrace("account_bound", "fallback-pool", "selected", True)
+    assert trace == proxy_module.UpstreamProxyRouteTrace(
+        transport="http",
+        mode="account_bound",
+        pool_id="fallback-pool",
+        endpoint_id="selected",
+        fallback_used=True,
+    )
     assert session.closed
     assert not native_worker._streams
     if outcome == "completed":
@@ -748,7 +754,13 @@ async def test_routed_missing_helper_uses_python_parser_on_resolved_proxy(
     assert scan_count > 0
     assert len(hits) == 1
     assert hits[0].startswith(b"POST http://upstream.invalid/codex/responses ")
-    assert trace == proxy_module.UpstreamProxyRouteTrace("account_bound", "python-fallback", "python-proxy", False)
+    assert trace == proxy_module.UpstreamProxyRouteTrace(
+        transport="http",
+        mode="account_bound",
+        pool_id="python-fallback",
+        endpoint_id="python-proxy",
+        fallback_used=False,
+    )
     assert missing._process is None
 
 
@@ -1338,7 +1350,13 @@ async def test_native_compact_routed_fallback_keeps_metadata_and_never_replays_a
                 assert not caught.value.retryable_same_contract
     assert len(accepted) == 1
     assert not replays
-    assert trace == proxy_module.UpstreamProxyRouteTrace("account_bound", "compact-fallback", "selected", True)
+    assert trace == proxy_module.UpstreamProxyRouteTrace(
+        transport="http",
+        mode="account_bound",
+        pool_id="compact-fallback",
+        endpoint_id="selected",
+        fallback_used=True,
+    )
     assert not native_worker._streams
 
 

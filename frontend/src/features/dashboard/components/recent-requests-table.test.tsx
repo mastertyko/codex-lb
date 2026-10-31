@@ -96,6 +96,7 @@ const LAYOUT_REQUEST = {
   reasoningEffort: null,
   costUsd: 0.01,
   costBreakdown: null,
+  pricingBasis: null,
   latencyMs: 1000,
 } satisfies RequestLog;
 
@@ -280,6 +281,32 @@ describe("RecentRequestsTable", () => {
     }]} />);
     const dialog = openRequestDetails();
     expect(dialog).toHaveTextContent("$0.000003 ≈ 10 Input ($0.000001) + 0 Cached ($0.00) + 1 Output ($0.000001)");
+  });
+
+  it("shows the captured unit prices and rate-card version", () => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[{
+      ...LAYOUT_REQUEST,
+      pricingBasis: {
+        schemaVersion: 1,
+        priceVersion: `sha256:${"a".repeat(64)}`,
+        model: "fixture-model",
+        inputPer1M: 2,
+        cachedInputPer1M: 0.2,
+        cacheWriteInputPer1M: 3,
+        outputPer1M: 8,
+      },
+    }]} />);
+    const prices = within(openRequestDetails()).getByTestId("captured-pricing-basis");
+    expect(prices).toHaveTextContent("Captured input price / 1M tokens$2.00");
+    expect(prices).toHaveTextContent("Captured cached input price / 1M tokens$0.20");
+    expect(prices).toHaveTextContent("Captured cache write price / 1M tokens$3.00");
+    expect(prices).toHaveTextContent("Captured output price / 1M tokens$8.00");
+    expect(prices).toHaveTextContent("Price versionaaaaaaaaaaaa");
+  });
+
+  it("does not claim captured prices for historical rows", () => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[LAYOUT_REQUEST]} />);
+    expect(within(openRequestDetails()).queryByTestId("captured-pricing-basis")).toBeNull();
   });
 
   it("identifies web search in the table and details with its recorded HTTP upstream", () => {
@@ -500,6 +527,7 @@ describe("RecentRequestsTable", () => {
              cachedInputTokens: 200,
              reasoningEffort: "high",
              costUsd: 0.01,
+             pricingBasis: null,
              costBreakdown: {
                inputUsd: 0.004,
                cachedInputUsd: 0.001,
@@ -594,6 +622,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 0,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 10,
             latencyFirstTokenMs: null,
@@ -644,6 +673,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 0,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1000,
             latencyFirstTokenMs: 200,
@@ -764,6 +794,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 0,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1000,
             latencyFirstTokenMs: 200,
@@ -863,6 +894,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 0,
             reasoningEffort: null,
             costUsd: 0.01,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 250,
           },
@@ -918,6 +950,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -951,6 +984,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -998,6 +1032,7 @@ describe("RecentRequestsTable", () => {
              cachedInputTokens: null,
              reasoningEffort: null,
              costUsd: 0,
+             pricingBasis: null,
              costBreakdown: null,
              latencyMs: 1,
            },
@@ -1046,6 +1081,7 @@ describe("RecentRequestsTable", () => {
              cachedInputTokens: null,
              reasoningEffort: null,
              costUsd: 0,
+             pricingBasis: null,
              costBreakdown: null,
              latencyMs: 1,
            },
@@ -1095,6 +1131,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 200,
             reasoningEffort: null,
             costUsd: 0.01,
+            pricingBasis: null,
             costBreakdown: {
               inputUsd: 0.004,
               cachedInputUsd: 0.002,
@@ -1155,6 +1192,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -1219,6 +1257,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -1275,6 +1314,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 0,
             reasoningEffort: null,
             costUsd: 0.01,
+            pricingBasis: null,
             costBreakdown: {
               inputUsd: 0.01,
               cachedInputUsd: null,
@@ -1328,6 +1368,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 200,
             reasoningEffort: null,
             costUsd: 0.01,
+            pricingBasis: null,
             costBreakdown: {
               inputUsd: 0.006,
               cachedInputUsd: 0.004,
@@ -1386,6 +1427,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: 200,
             reasoningEffort: null,
             costUsd: null,
+            pricingBasis: null,
             costBreakdown: {
               inputUsd: 0.006,
               cachedInputUsd: 0.004,
@@ -1446,6 +1488,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -1508,6 +1551,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -1566,6 +1610,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 4.321234,
+            pricingBasis: null,
             costBreakdown: {
               inputUsd: null,
               cachedInputUsd: null,
@@ -1623,6 +1668,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -1678,6 +1724,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -1736,6 +1783,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },
@@ -1789,6 +1837,7 @@ describe("RecentRequestsTable", () => {
             cachedInputTokens: null,
             reasoningEffort: null,
             costUsd: 0,
+            pricingBasis: null,
             costBreakdown: null,
             latencyMs: 1,
           },

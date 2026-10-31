@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from app.core.clients.native_egress import NativeEgressTransportError, NativeEgressWebSocket
+from app.core.clients.native_egress import (
+    NativeEgressTransportError,
+    NativeEgressWebSocket,
+    SubprocessNativeEgressClient,
+)
 from app.core.clients.proxy_websocket import NativeUpstreamWebSocket
 
 pytestmark = [pytest.mark.unit, pytest.mark.asyncio, pytest.mark.timeout(10)]
@@ -14,7 +17,7 @@ pytestmark = [pytest.mark.unit, pytest.mark.asyncio, pytest.mark.timeout(10)]
 
 def socket():
     events = asyncio.Queue()
-    owner = SimpleNamespace(_finish_request=Mock(), _abort_request=AsyncMock())
+    owner = Mock(spec=SubprocessNativeEgressClient, _finish_request=Mock(), _abort_request=AsyncMock())
     ws = NativeEgressWebSocket(
         status=101, headers=(), client=owner, process=Mock(), request_id="burst", generation=1, events=events
     )

@@ -1,4 +1,4 @@
-"""Context proof for an unchanged full resend pinned to its durable owner."""
+"""Context validation for complete HTTP tool resends on their durable owner."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from app.core.openai.requests import MutableJsonObject, strip_replayed_tool_call_namespaces_from_payload
 from app.core.types import JsonValue
 from app.modules.proxy.replay_safety import (
+    _input_item_has_only_known_fields,
     _is_retained_response_message,
     _message_has_valid_account_neutral_content,
     project_responses_input_for_account_neutral_fresh_replay,
@@ -17,12 +18,10 @@ from app.modules.proxy.replay_safety import (
 def retains_owner_bound_tool_context(
     input_items: list[JsonValue], *, stored_count: int, pending_tool_calls: Mapping[str, str] | None
 ) -> bool:
-    """Verify context only; never serialize this projection or use it to move accounts.
+    """Check a temporary view; never authorize relocation or replace wire input.
 
-    The caller separately proves the durable prefix and owner. Native metadata
-    and reasoning remain in the original wire body on that owner. The projection
-    lets the existing exact-manifest verifier check tool settlement independently
-    of metadata's stricter cross-account policy.
+    The caller proves the exact durable prefix and account separately. Metadata
+    and historical controls remain in the original request on that account.
     """
     if not pending_tool_calls:
         return False
@@ -35,22 +34,20 @@ def retains_owner_bound_tool_context(
     )
     if projection is None:
         return False
-    items: list[JsonValue] = [
-        {key: value for key, value in item.items() if key != "internal_chat_message_metadata_passthrough"}
-        if isinstance(item, dict)
-        else item
-        for item in projection.input_items
-    ]
+    items: list[JsonValue] = []
+    for item in projection.input_items:
+        if isinstance(item, dict) and "internal_chat_message_metadata_passthrough" in item:
+            if not isinstance(item["internal_chat_message_metadata_passthrough"], dict):
+                return False
+            item = {key: value for key, value in item.items() if key != "internal_chat_message_metadata_passthrough"}
+        items.append(item)
     boundary = projection.stored_prefix_count
-    # A retained assistant preamble may precede the response's calls. It cannot
-    # substitute for a call or result, or introduce new input after settlement.
-    # The prefix is already bound to an accepted request by its exact hash.
-    # Keep historical developer controls on the wire, but do not apply the
-    # cross-account interleave restriction while checking its tool lifecycle.
     prefix: list[JsonValue] = []
     for item in items[:boundary]:
         if isinstance(item, dict) and item.get("role") == "developer" and item.get("type") in (None, "message"):
-            if not _message_has_valid_account_neutral_content(item):
+            if not _input_item_has_only_known_fields(item, "message") or not (
+                _message_has_valid_account_neutral_content(item)
+            ):
                 return False
             continue
         prefix.append(item)
@@ -59,7 +56,7 @@ def retains_owner_bound_tool_context(
         item = items[end]
         if not isinstance(item, dict) or item.get("role") != "assistant":
             break
-        if not _is_retained_response_message(item):
+        if not _input_item_has_only_known_fields(item, "message") or not _is_retained_response_message(item):
             return False
         end += 1
     return responses_input_suffix_matches_pending_tool_calls(

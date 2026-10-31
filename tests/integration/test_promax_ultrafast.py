@@ -1,7 +1,6 @@
 import json
 from collections import Counter
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -54,7 +53,6 @@ async def test_ultrafast_routes_all_promax_accounts_without_rewriting_tiers(asyn
         await session.execute(update(Account).where(Account.id.in_(ids)).values(plan_type="promax"))
         await session.commit()
         settings = await SettingsRepository(session).get_or_create()
-    settings.http_responses_session_bridge_enabled = False
     monkeypatch.setattr(proxy_module, "get_settings_cache", lambda: _SettingsCache(settings))
     await install_catalog(monkeypatch, ids)
     seen = []
@@ -103,12 +101,16 @@ def test_ultrafast_omission_retains_socket_owner_and_delta(app_instance, monkeyp
             await session.execute(update(Account).where(Account.id == fixture.account.id).values(plan_type="promax"))
             await session.commit()
         await install_catalog(monkeypatch, [fixture.account.id, "other-promax-advertiser"])
-        bridge = SimpleNamespace(account=fixture.account, catalog_omission_quota_admission=None)
+        from tests.unit.test_http_bridge_idle_leases import _make_bridge_session
+
+        bridge = _make_bridge_session()
+        bridge.account = fixture.account
         assert _http_bridge_session_supports_service_tier(
             bridge, request_model="gpt-6.1-sol", request_service_tier="ultrafast"
         )
 
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(prepare)
         with client.websocket_connect(path, headers=fixture.headers()) as websocket:
             first = {**_create([_FIRST]), "model": "gpt-6.1-sol", "service_tier": "ultrafast"}

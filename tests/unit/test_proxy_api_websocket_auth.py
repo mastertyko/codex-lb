@@ -91,7 +91,7 @@ async def test_validate_proxy_websocket_request_returns_firewall_denial(monkeypa
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", fail_auth)
 
     api_key, response = await proxy_api_module._validate_proxy_websocket_request(
-        cast(WebSocket, SimpleNamespace(headers={})),
+        cast(WebSocket, SimpleNamespace(state=SimpleNamespace(), headers={})),
     )
 
     assert api_key is None
@@ -110,7 +110,7 @@ async def test_validate_proxy_websocket_request_maps_auth_error(monkeypatch):
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", fail_auth)
 
     api_key, response = await proxy_api_module._validate_proxy_websocket_request(
-        cast(WebSocket, SimpleNamespace(headers={"authorization": "Bearer invalid"})),
+        cast(WebSocket, SimpleNamespace(state=SimpleNamespace(), headers={"authorization": "Bearer invalid"})),
     )
 
     assert api_key is None
@@ -148,7 +148,7 @@ async def test_validate_proxy_websocket_request_returns_validated_api_key(monkey
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", pass_auth)
 
     resolved_api_key, response = await proxy_api_module._validate_proxy_websocket_request(
-        cast(WebSocket, SimpleNamespace(headers={"authorization": "Bearer valid-key"})),
+        cast(WebSocket, SimpleNamespace(state=SimpleNamespace(), headers={"authorization": "Bearer valid-key"})),
     )
 
     assert response is None
@@ -183,7 +183,7 @@ async def test_validate_proxy_websocket_request_supports_legacy_auth_override(mo
     monkeypatch.setattr(proxy_api_module, "validate_proxy_api_key_authorization", legacy_auth_override)
 
     resolved_api_key, response = await proxy_api_module._validate_proxy_websocket_request(
-        cast(WebSocket, SimpleNamespace(headers={"authorization": "Bearer legacy-key"})),
+        cast(WebSocket, SimpleNamespace(state=SimpleNamespace(), headers={"authorization": "Bearer legacy-key"})),
     )
 
     assert response is None
@@ -209,7 +209,7 @@ async def test_validate_proxy_websocket_request_reraises_unrelated_type_error(mo
 
     with pytest.raises(TypeError, match="unexpected keyword argument 'request_id'"):
         await proxy_api_module._validate_proxy_websocket_request(
-            cast(WebSocket, SimpleNamespace(headers={"authorization": "Bearer broken-key"})),
+            cast(WebSocket, SimpleNamespace(state=SimpleNamespace(), headers={"authorization": "Bearer broken-key"})),
         )
 
     assert calls == 1

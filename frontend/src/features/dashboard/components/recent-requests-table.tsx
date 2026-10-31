@@ -658,6 +658,15 @@ export function RecentRequestsTable({
                   ) : null}
                 </div>
               ) : null}
+              {selectedRequest?.pricingBasis ? (
+                <div className="grid gap-3 rounded-md border p-3 sm:grid-cols-2" data-testid="captured-pricing-basis">
+                  <RequestDetailField label={t("dashboard.requestDetails.capturedInputRate")} value={formatRequestCost(selectedRequest.pricingBasis.inputPer1M, true)} mono />
+                  <RequestDetailField label={t("dashboard.requestDetails.capturedCachedRate")} value={formatRequestCost(selectedRequest.pricingBasis.cachedInputPer1M, true)} mono />
+                  <RequestDetailField label={t("dashboard.requestDetails.capturedWriteRate")} value={formatRequestCost(selectedRequest.pricingBasis.cacheWriteInputPer1M, true)} mono />
+                  <RequestDetailField label={t("dashboard.requestDetails.capturedOutputRate")} value={formatRequestCost(selectedRequest.pricingBasis.outputPer1M, true)} mono />
+                  <RequestDetailField label={t("dashboard.requestDetails.priceVersion")} value={selectedRequest.pricingBasis.priceVersion.slice(7, 19)} mono />
+                </div>
+              ) : null}
               {PHASE_TIMING_FIELDS.some(([field]) => selectedRequest?.[field] != null) ? (
                 <div className="grid gap-3 sm:grid-cols-2">
                   {PHASE_TIMING_FIELDS.map(([field, label]) => selectedRequest?.[field] != null ? (

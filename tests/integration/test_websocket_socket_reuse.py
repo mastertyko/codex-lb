@@ -50,7 +50,7 @@ class _RetainedSocketFixture:
         self.connects = []
         self.released_leases = []
         self.keys = {}
-        self.account = None
+        self._account: Account | None = None
         self.limited = limited
         fixture = self
         original_release = proxy_module.LoadBalancer.release_account_lease
@@ -94,6 +94,11 @@ class _RetainedSocketFixture:
         monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", write_request_log)
         monkeypatch.setattr(proxy_module.LoadBalancer, "release_account_lease", release)
 
+    @property
+    def account(self) -> Account:
+        assert self._account is not None, "prepare() must create the owner before accessing it"
+        return self._account
+
     async def prepare(self):
         async with SessionLocal() as session:
             account = Account(
@@ -111,7 +116,7 @@ class _RetainedSocketFixture:
             await session.commit()
             await session.refresh(account)
             session.expunge(account)
-            self.account = account
+            self._account = account
             clear_account_routing_unavailable(account.id)
         async with SessionLocal() as session:
             service = ApiKeysService(ApiKeysRepository(session))
@@ -155,6 +160,7 @@ def test_completed_socket_reconnect_sends_only_delta(app_instance, monkeypatch):
     )
     fixture = _RetainedSocketFixture(monkeypatch, [upstream])
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect(_PATH, headers=fixture.headers()) as websocket:
@@ -181,6 +187,7 @@ def test_openai_compatible_route_does_not_retain_codex_socket(app_instance, monk
     upstream = _SequencedUpstreamWebSocket([], deferred_message_batches=[_completed_first_turn_upstream_batch(_PARENT)])
     fixture = _RetainedSocketFixture(monkeypatch, [upstream])
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect("/v1/responses", headers=fixture.headers()) as websocket:
@@ -199,6 +206,7 @@ def test_retained_socket_cannot_cross_owner_scope(app_instance, monkeypatch, mis
     )
     fixture = _RetainedSocketFixture(monkeypatch, [first, replacement])
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect(_PATH, headers=fixture.headers()) as websocket:
@@ -236,6 +244,7 @@ def test_noncompleted_socket_is_closed_instead_of_retained(app_instance, monkeyp
     upstream = _SequencedUpstreamWebSocket([], deferred_message_batches=[batch])
     fixture = _RetainedSocketFixture(monkeypatch, [upstream])
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect(_PATH, headers=fixture.headers()) as websocket:
@@ -261,6 +270,7 @@ def test_revoked_api_key_cannot_reclaim_completed_socket(app_instance, monkeypat
             await ApiKeysRepository(session).update(fixture.keys["Bearer first"].id, is_active=False)
 
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect(_PATH, headers=fixture.headers()) as websocket:
@@ -291,6 +301,7 @@ def test_changed_model_policy_cannot_reclaim_completed_socket(app_instance, monk
             )
 
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect(_PATH, headers=fixture.headers()) as websocket:
@@ -320,6 +331,7 @@ def test_lost_upstream_during_grace_does_not_replay_incomplete_context(app_insta
     upstream = LostUpstream([], deferred_message_batches=[_completed_first_turn_upstream_batch(_PARENT)])
     fixture = _RetainedSocketFixture(monkeypatch, [upstream])
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect(_PATH, headers=fixture.headers()) as websocket:
@@ -364,6 +376,7 @@ def test_revalidation_failure_releases_prepared_reservation(app_instance, monkey
                 await asyncio.sleep(0.005)
 
     with TestClient(app_instance) as client:
+        assert client.portal is not None
         client.portal.call(fixture.prepare)
         service = get_proxy_service_for_app(app_instance)
         with client.websocket_connect(_PATH, headers=fixture.headers()) as websocket:

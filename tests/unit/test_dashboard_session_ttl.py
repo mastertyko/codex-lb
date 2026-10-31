@@ -11,7 +11,6 @@ from app.core.auth.dashboard_mode import DashboardAuthMode
 from app.core.auth.dashboard_session_ttl import (
     DEFAULT_DASHBOARD_SESSION_TTL_SECONDS,
     REMOTE_DASHBOARD_SESSION_TTL_SECONDS,
-    resolve_admin_dashboard_session_ttl_seconds,
     resolve_dashboard_session_ttl_seconds,
 )
 
@@ -169,30 +168,18 @@ def test_shorter_configured_dashboard_session_ttl_is_preserved_for_remote_reques
     assert ttl_seconds == 7200
 
 
-def test_admin_sessions_are_capped_at_twelve_hours_for_non_loopback_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("configured", [3600, 30 * 24 * 60 * 60, DEFAULT_DASHBOARD_SESSION_TTL_SECONDS])
+def test_remote_session_lifetime_matches_configured_threshold(monkeypatch, configured):
     _patch_settings(monkeypatch, _settings())
-    thirty_days = 30 * 24 * 60 * 60
     remote = _request(client_host="203.0.113.10", host="lb.example")
-
-    # The generic rule keeps 30 days everywhere; the admin rule caps the remote request.
-    assert resolve_dashboard_session_ttl_seconds(remote, thirty_days) == thirty_days
-    assert resolve_admin_dashboard_session_ttl_seconds(remote, thirty_days) == REMOTE_DASHBOARD_SESSION_TTL_SECONDS
+    expected = configured if configured <= 30 * 24 * 60 * 60 else REMOTE_DASHBOARD_SESSION_TTL_SECONDS
+    assert resolve_dashboard_session_ttl_seconds(remote, configured) == expected
 
 
-def test_admin_sessions_keep_the_full_lifetime_for_loopback_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_loopback_keeps_full_configured_lifetime(monkeypatch):
     _patch_settings(monkeypatch, _settings())
-    thirty_days = 30 * 24 * 60 * 60
-    loopback = _request(client_host="127.0.0.1", host="127.0.0.1:2455")
-
-    assert resolve_admin_dashboard_session_ttl_seconds(loopback, thirty_days) == thirty_days
+    local = _request(client_host="127.0.0.1", host="localhost")
     assert (
-        resolve_admin_dashboard_session_ttl_seconds(loopback, DEFAULT_DASHBOARD_SESSION_TTL_SECONDS)
+        resolve_dashboard_session_ttl_seconds(local, DEFAULT_DASHBOARD_SESSION_TTL_SECONDS)
         == DEFAULT_DASHBOARD_SESSION_TTL_SECONDS
     )
-
-
-def test_admin_cap_never_extends_a_shorter_configured_lifetime(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_settings(monkeypatch, _settings())
-    remote = _request(client_host="203.0.113.10", host="lb.example")
-
-    assert resolve_admin_dashboard_session_ttl_seconds(remote, 3600) == 3600

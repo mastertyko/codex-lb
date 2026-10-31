@@ -41,21 +41,21 @@ Fidelity notes (each pinned by ``tests/simulation/test_virtual_time.py``):
   pending (Python 3.14 leaves their ``_clear_awaited_by_callback`` behind,
   the growth behind the 2026-08-30 event-loop livelock). A live shield
   carries both of its callbacks and counts as zero; the fan-out helper adds
-  none. The oracle observes only on CPython 3.14+
+  none. The oracle observes only on affected CPython shield implementations
   (``ABANDONED_SHIELD_ORACLE_SUPPORTED``): 3.13's ``shield`` registers a
   single callback and removes it when the outer is cancelled, so there is no
-  residue to count and the oracle reads zero whatever the code does.
+  residue to count and the oracle reads zero whatever the code does. Patched
+  3.14 releases also remove the clear callback and leave no residue.
 """
 
 from __future__ import annotations
 
 import asyncio
 import heapq
-import sys
 from collections.abc import Awaitable, Coroutine, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from types import TracebackType
+from types import CodeType, TracebackType
 from typing import Any, TypeVar
 
 import anyio
@@ -67,14 +67,19 @@ T = TypeVar("T")
 # accumulate binary floating-point error past an ``advance(0.3)`` target.
 _DEADLINE_SLACK_SECONDS = 1e-9
 
-# ``asyncio.shield`` registers ``_clear_awaited_by_callback`` on the inner
-# future only from CPython 3.14 (task ``awaited_by`` introspection, the leak
-# behind the 2026-08-30 livelock). On 3.13 the outer's cancellation removes the
-# single ``_inner_done_callback`` again, so an abandoned shield leaves nothing to
-# count. CI's unit slice runs on 3.13 (``.github/workflows/ci.yml``) while the
-# production image is 3.14: assertions on the oracle's *count* are gated on this
-# flag, and the ``abandoned_shields`` invariant is vacuous where it is false.
-ABANDONED_SHIELD_ORACLE_SUPPORTED = sys.version_info >= (3, 14)
+# The oracle examines private callback names, so detect the corresponding
+# implementation rather than assuming every 3.14 patch release still leaks.
+# Patched CPython removes the clear callback in the outer callback; early 3.14
+# leaves it on the inner future. The runtime test verifies both count outcomes.
+ABANDONED_SHIELD_ORACLE_SUPPORTED = any(
+    isinstance(code, CodeType)
+    and code.co_name == "_outer_done_callback"
+    and "_clear_awaited_by_callback" not in code.co_freevars
+    for code in asyncio.shield.__code__.co_consts
+) and any(
+    isinstance(code, CodeType) and code.co_name == "_clear_awaited_by_callback"
+    for code in asyncio.shield.__code__.co_consts
+)
 
 
 @dataclass(slots=True)

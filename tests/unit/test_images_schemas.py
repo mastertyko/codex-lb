@@ -344,6 +344,7 @@ class TestImagePricingPresent:
             service_tier = None
             input_tokens = 1000
             output_tokens = 500
+            cache_write_input_tokens = None
             cached_input_tokens = None
             reasoning_tokens = None
             cost_usd = None

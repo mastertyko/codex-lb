@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from app.core.clients.proxy_websocket import UpstreamWebSocket
+from app.core.clock import REAL_CLOCK, REAL_SCHEDULER, Clock, Scheduler
 from app.db.models import Account
 from app.modules.proxy.load_balancer import AccountLease
 
@@ -41,15 +42,19 @@ class RetainedWebSockets:
         self,
         release: Callable[[AccountLease | None], Awaitable[None]],
         close_upstream: Callable[[UpstreamWebSocket], Awaitable[None]],
+        *,
+        clock: Clock = REAL_CLOCK,
+        scheduler: Scheduler = REAL_SCHEDULER,
     ) -> None:
         self.entries: dict[RetainedKey, RetainedWebSocket] = {}
         self._release = release
         self._close_upstream = close_upstream
+        self._clock, self._scheduler = clock, scheduler
         self._tasks: set[asyncio.Task[None]] = set()
         self._closed = False
 
     def _track(self, coroutine: Coroutine[Any, Any, None], name: str) -> asyncio.Task[None]:
-        task = asyncio.create_task(coroutine, name=name)
+        task = self._scheduler.create_task(coroutine, name=name)
         self._tasks.add(task)
 
         def done(completed: asyncio.Task[None]) -> None:
@@ -63,7 +68,7 @@ class RetainedWebSockets:
     def retain(self, entry: RetainedWebSocket) -> bool:
         if self._closed or entry.key in self.entries or len(self.entries) >= MAX_RETAINED:
             return False
-        entry.expires_at = asyncio.get_running_loop().time() + RETAIN_SECONDS
+        entry.expires_at = self._clock.monotonic() + RETAIN_SECONDS
         self.entries[entry.key] = entry
         entry.timer = self._track(self._expire(entry), "websocket-retained-expiry")
         logger.info("websocket_retained event=parked connection_id=%s", entry.control.diagnostic_connection_id)
@@ -73,7 +78,7 @@ class RetainedWebSockets:
         entry = self.entries.get(key)
         if entry is None or entry.account.id != account_id:
             return None
-        if asyncio.get_running_loop().time() >= entry.expires_at:
+        if self._clock.monotonic() >= entry.expires_at:
             # The timer owns disposal; do not resurrect expired entries if its
             # scheduled callback has not run yet.
             return None
@@ -84,7 +89,7 @@ class RetainedWebSockets:
         return entry
 
     async def _expire(self, entry: RetainedWebSocket) -> None:
-        await asyncio.sleep(max(0.0, entry.expires_at - asyncio.get_running_loop().time()))
+        await self._scheduler.sleep(max(0.0, entry.expires_at - self._clock.monotonic()))
         if self.entries.get(entry.key) is entry:
             self.entries.pop(entry.key)
             await self.close(entry)

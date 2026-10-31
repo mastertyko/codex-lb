@@ -6,6 +6,7 @@ import gc
 import hashlib
 import json
 import logging
+import re
 import socket
 import ssl
 import sys
@@ -9927,7 +9928,7 @@ async def test_native_codex_stream_preserves_missing_terminal_without_synthesis(
 
 
 @pytest.mark.asyncio
-async def test_native_codex_stream_suppresses_marked_synthetic_transport_terminal() -> None:
+async def test_native_codex_stream_translates_marked_synthetic_transport_terminal() -> None:
     async def synthetic_failure_stream() -> AsyncIterator[str]:
         yield (
             'data: {"type":"response.failed","_codex_lb_synthetic_transport_failure":true,'
@@ -9936,19 +9937,34 @@ async def test_native_codex_stream_suppresses_marked_synthetic_transport_termina
         )
         yield "data: [DONE]\n\n"
 
-    with pytest.raises(proxy_module.ProxyResponseError):
-        _ = [
-            event_block
-            async for event_block in proxy_api._normalize_public_responses_stream(
-                synthetic_failure_stream(),
-                enforce_openai_sdk_contract=False,
-                preserve_native_failure_lifecycle=True,
-            )
-        ]
+    events = [
+        event_block
+        async for event_block in proxy_api._normalize_public_responses_stream(
+            synthetic_failure_stream(),
+            enforce_openai_sdk_contract=False,
+            preserve_native_failure_lifecycle=True,
+        )
+    ]
+
+    # codex-lb has already given up: rather than re-raising (which would
+    # close the already-200'd stream with zero bytes), it must emit exactly
+    # one terminal ``response.failed`` naming a retryable code, then end the
+    # stream (the ``data: [DONE]`` upstream sent after the marked event is
+    # never reached/forwarded).
+    assert len(events) == 1
+    payload = parse_sse_data_json(events[0])
+    assert payload is not None
+    assert payload["type"] == "response.failed"
+    response = cast(dict[str, JsonValue], payload["response"])
+    error = cast(dict[str, JsonValue], response["error"])
+    assert error["code"] == "rate_limit_exceeded"
+    error_message = cast(str, error["message"])
+    assert re.match(r"^Please try again in 5s\. ", error_message)
+    assert "upstream_request_timeout" in error_message
 
 
 @pytest.mark.asyncio
-async def test_native_codex_stream_suppresses_marked_incomplete_terminal_as_eof() -> None:
+async def test_native_codex_stream_translates_marked_incomplete_terminal() -> None:
     async def synthetic_failure_stream() -> AsyncIterator[str]:
         yield (
             'data: {"type":"response.failed","_codex_lb_synthetic_transport_failure":true,'
@@ -9957,15 +9973,66 @@ async def test_native_codex_stream_suppresses_marked_incomplete_terminal_as_eof(
         )
         yield "data: [DONE]\n\n"
 
-    with pytest.raises(proxy_module.ProxyResponseError):
-        _ = [
-            event_block
-            async for event_block in proxy_api._normalize_public_responses_stream(
-                synthetic_failure_stream(),
-                enforce_openai_sdk_contract=False,
-                preserve_native_failure_lifecycle=True,
+    events = [
+        event_block
+        async for event_block in proxy_api._normalize_public_responses_stream(
+            synthetic_failure_stream(),
+            enforce_openai_sdk_contract=False,
+            preserve_native_failure_lifecycle=True,
+        )
+    ]
+
+    assert len(events) == 1
+    payload = parse_sse_data_json(events[0])
+    assert payload is not None
+    assert payload["type"] == "response.failed"
+    response = cast(dict[str, JsonValue], payload["response"])
+    error = cast(dict[str, JsonValue], response["error"])
+    assert error["code"] == "rate_limit_exceeded"
+    error_message = cast(str, error["message"])
+    assert re.match(r"^Please try again in 5s\. ", error_message)
+    assert "stream_incomplete" in error_message
+
+
+@pytest.mark.asyncio
+async def test_native_giveup_closes_the_inner_stream_chain() -> None:
+    class ClosableStream:
+        def __init__(self) -> None:
+            self.closed = False
+            self._blocks = iter(
+                [
+                    'data: {"type":"response.failed","_codex_lb_synthetic_transport_failure":true,'
+                    '"response":{"status":"failed","error":{"code":"stream_incomplete",'
+                    '"message":"Native upstream transport ended before a terminal event"}}}\n\n',
+                    "data: [DONE]\n\n",
+                ]
             )
-        ]
+
+        def __aiter__(self) -> "ClosableStream":
+            return self
+
+        async def __anext__(self) -> str:
+            try:
+                return next(self._blocks)
+            except StopIteration as exc:
+                raise StopAsyncIteration from exc
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    source = ClosableStream()
+    iterator = proxy_api._normalize_public_responses_stream(
+        source,
+        enforce_openai_sdk_contract=False,
+        preserve_native_failure_lifecycle=True,
+    )
+
+    event = await iterator.__anext__()
+    payload = parse_sse_data_json(event)
+    assert payload is not None
+    assert payload["type"] == "response.failed"
+    await cast(Any, iterator).aclose()
+    assert source.closed is True
 
 
 @pytest.mark.asyncio
@@ -9991,26 +10058,114 @@ async def test_non_native_stream_emits_synthetic_transport_terminal_without_inte
 
 
 @pytest.mark.asyncio
-async def test_native_codex_stream_reraises_transport_failure_without_terminal_event() -> None:
+async def test_native_codex_stream_emits_retryable_terminal_event_instead_of_reraising() -> None:
+    class FailingClosableStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def __aiter__(self) -> "FailingClosableStream":
+            return self
+
+        async def __anext__(self) -> str:
+            raise proxy_module.ProxyResponseError(
+                502,
+                openai_error("upstream_request_timeout", "timed out; try again in 99s"),
+                retry_after_seconds=7,
+            )
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    failed_stream = FailingClosableStream()
+
+    events = [
+        event
+        async for event in proxy_api._stream_response_error_events(
+            failed_stream,
+            owns_reservation=False,
+            reservation=None,
+            preserve_native_failure_lifecycle=True,
+        )
+    ]
+
+    # Starlette has already sent the 200 by the time codex-lb gives up here,
+    # so a bare re-raise used to close the stream with zero bytes (the
+    # "Stream disconnected before completion" symptom). It must instead
+    # surface exactly one named, retryable terminal event.
+    assert len(events) == 1
+    payload = parse_sse_data_json(events[0])
+    assert payload is not None
+    assert payload["type"] == "response.failed"
+    response = cast(dict[str, JsonValue], payload["response"])
+    error = cast(dict[str, JsonValue], response["error"])
+    assert error["code"] == "rate_limit_exceeded"
+    error_message = cast(str, error["message"])
+    assert "upstream_request_timeout" in error_message
+    assert "timed out; try again in 99s" in error_message
+    assert re.match(r"^Please try again in 7s\. ", error_message)
+    assert failed_stream.closed is True
+
+
+@pytest.mark.asyncio
+async def test_native_codex_stream_error_events_default_retry_delay_when_unknown() -> None:
     async def failed_stream() -> AsyncIterator[str]:
         raise proxy_module.ProxyResponseError(
             502,
-            openai_error("upstream_request_timeout", "timed out"),
+            openai_error("stream_idle_timeout", "idle too long"),
         )
         yield ""  # pragma: no cover
 
-    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
-        _ = [
-            event
-            async for event in proxy_api._stream_response_error_events(
-                failed_stream(),
-                owns_reservation=False,
-                reservation=None,
-                preserve_native_failure_lifecycle=True,
-            )
-        ]
+    events = [
+        event
+        async for event in proxy_api._stream_response_error_events(
+            failed_stream(),
+            owns_reservation=False,
+            reservation=None,
+            preserve_native_failure_lifecycle=True,
+        )
+    ]
 
-    assert _proxy_error_code(exc_info.value) == "upstream_request_timeout"
+    assert len(events) == 1
+    payload = parse_sse_data_json(events[0])
+    assert payload is not None
+    response = cast(dict[str, JsonValue], payload["response"])
+    error = cast(dict[str, JsonValue], response["error"])
+    assert error["code"] == "rate_limit_exceeded"
+    error_message = cast(str, error["message"])
+    assert re.match(r"^Please try again in 5s\. ", error_message)
+
+
+@pytest.mark.asyncio
+async def test_native_codex_stream_error_events_unaffected_for_non_giveup_codes() -> None:
+    """Errors outside the overload/transport-failure set are untouched by
+    this patch: they keep going through the pre-existing terminal-event path
+    with their own code (not relabeled to rate_limit_exceeded, and not
+    re-raised -- only the four give-up codes are special-cased for native
+    clients)."""
+
+    async def failed_stream() -> AsyncIterator[str]:
+        raise proxy_module.ProxyResponseError(
+            502,
+            openai_error("bridge_continuity_persistence_failed", "retry the request"),
+        )
+        yield ""  # pragma: no cover
+
+    events = [
+        event
+        async for event in proxy_api._stream_response_error_events(
+            failed_stream(),
+            owns_reservation=False,
+            reservation=None,
+            preserve_native_failure_lifecycle=True,
+        )
+    ]
+
+    assert len(events) == 1
+    payload = parse_sse_data_json(events[0])
+    assert payload is not None
+    response = cast(dict[str, JsonValue], payload["response"])
+    error = cast(dict[str, JsonValue], response["error"])
+    assert error["code"] == "bridge_continuity_persistence_failed"
 
 
 @pytest.mark.asyncio
@@ -10021,8 +10176,8 @@ async def test_native_codex_stream_surfaces_local_pre_dispatch_refusal_as_unmark
     ``stream_incomplete``, which is also how an upstream transport failure ends,
     so without the provenance flag the native lifecycle aborted the committed
     body and the client received nothing at all. The terminal must also stay
-    unmarked — ``_normalize_public_responses_stream`` turns a terminal marked as
-    a synthetic transport failure back into an abort for native clients.
+    unmarked — proxy-owned refusals must not be relabeled as exhausted upstream
+    transport.
     """
 
     def _refusal(*, local_pre_dispatch_refusal: bool) -> proxy_module.ProxyResponseError:
@@ -10062,20 +10217,24 @@ async def test_native_codex_stream_surfaces_local_pre_dispatch_refusal_as_unmark
         raise _refusal(local_pre_dispatch_refusal=False)
         yield ""  # pragma: no cover
 
-    # The same error without the provenance flag still ends the native stream
-    # without a terminal: the flag is the whole of the new behaviour.
-    with pytest.raises(proxy_module.ProxyResponseError) as exc_info:
-        _ = [
-            event
-            async for event in proxy_api._stream_response_error_events(
-                unflagged_stream(),
-                owns_reservation=False,
-                reservation=None,
-                preserve_native_failure_lifecycle=True,
-            )
-        ]
-
-    assert _proxy_error_code(exc_info.value) == "stream_incomplete"
+    # An observed upstream transport failure now gets the same named terminal
+    # even without the local-refusal provenance flag. The flag still matters
+    # because it keeps a proxy-owned refusal on the original public code and
+    # prevents synthetic transport marking.
+    unflagged_events = [
+        parse_sse_data_json(event)
+        async for event in proxy_api._stream_response_error_events(
+            unflagged_stream(),
+            owns_reservation=False,
+            reservation=None,
+            preserve_native_failure_lifecycle=True,
+        )
+    ]
+    assert len(unflagged_events) == 1
+    assert unflagged_events[0] is not None
+    unflagged_response = cast(dict[str, JsonValue], unflagged_events[0]["response"])
+    unflagged_error = cast(dict[str, JsonValue], unflagged_response["error"])
+    assert unflagged_error["code"] == "rate_limit_exceeded"
 
 
 def test_stream_startup_error_response_preserves_exact_retry_after_header() -> None:
@@ -20729,6 +20888,70 @@ async def test_stream_with_retry_finalizes_generated_terminal_failure_before_dow
     assert await service.drain_persistence_tasks(timeout_seconds=1)
     settle_stream_usage.assert_awaited_once()
     record_success.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_native_stream_with_retry_keeps_exhausted_transport_marker(monkeypatch):
+    """A native committed stream must hand transport provenance to the API edge."""
+    settings = _make_proxy_settings()
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
+    account = _make_account("acc_native_retry_generated_terminal")
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_native_retry_generated_terminal",
+        key_id="key_native_retry_generated_terminal",
+        model="gpt-5.1",
+    )
+
+    monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    monkeypatch.setattr(streaming_retry_module.ProcessNetworkRecovery, "wait", AsyncMock(return_value=None))
+    settle_stream_usage = AsyncMock(return_value=True)
+    monkeypatch.setattr(service, "_settle_stream_api_key_usage", settle_stream_usage)
+    monkeypatch.setattr(
+        service,
+        "_select_account_with_budget_compatible",
+        AsyncMock(return_value=AccountSelection(account=account, error_message=None)),
+    )
+    monkeypatch.setattr(service, "_ensure_fresh_with_budget", AsyncMock(return_value=account))
+
+    async def fake_stream_once(*args: object, **kwargs: object):
+        settlement = cast(proxy_service._StreamSettlement, kwargs["settlement"])
+        settlement.downstream_visible = True
+        settlement.response_id = "resp_native_retry_generated_terminal"
+        yield (
+            'data: {"type":"response.created","response":{"id":"resp_native_retry_generated_terminal",'
+            '"status":"in_progress","output":[]}}\n\n'
+        )
+        raise streaming_retry_module._TransientStreamError(
+            "upstream_unavailable",
+            {"message": "transport exploded after first event"},
+        )
+
+    monkeypatch.setattr(service, "_stream_once", fake_stream_once)
+    payload = ResponsesRequest.model_validate({"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True})
+    stream = service._stream_with_retry(
+        payload,
+        {"originator": "codex_exec"},
+        codex_session_affinity=False,
+        propagate_http_errors=False,
+        openai_cache_affinity=False,
+        api_key=None,
+        api_key_reservation=reservation,
+        suppress_text_done_events=False,
+        request_transport="http",
+        upstream_stream_transport_override="http",
+        enforce_openai_sdk_contract=False,
+    )
+
+    first_chunk = await anext(stream)
+    terminal_chunk = await anext(stream)
+    assert "response.created" in first_chunk
+    terminal = json.loads(terminal_chunk.split("data: ", 1)[1])
+    assert terminal["type"] == "response.failed"
+    assert terminal[SYNTHETIC_TRANSPORT_FAILURE_MARKER] is True
+    assert terminal["response"]["error"]["code"] == "upstream_unavailable"
+    await cast(Any, stream).aclose()
+    settle_stream_usage.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -34796,6 +35019,7 @@ async def test_stream_api_key_settlement_detaches_and_closes_repo(monkeypatch):
             "input_tokens": 12,
             "output_tokens": 34,
             "cached_input_tokens": 5,
+            "cache_write_input_tokens": 0,
             "service_tier": "default",
         }
     ]
@@ -36397,6 +36621,8 @@ async def _run_websocket_clean_close_during_send_failure(
         upstream_control: proxy_service._WebSocketUpstreamControl,
         response_create_gate: asyncio.Semaphore,
         downstream_activity: proxy_service._DownstreamWebSocketActivity,
+        continuity_state: proxy_service._WebSocketContinuityState | None = None,
+        codex_session_affinity: bool = False,
     ) -> bool:
         result = await original_transport_end(
             proxy,
@@ -36412,6 +36638,8 @@ async def _run_websocket_clean_close_during_send_failure(
             upstream_control=upstream_control,
             response_create_gate=response_create_gate,
             downstream_activity=downstream_activity,
+            continuity_state=continuity_state,
+            codex_session_affinity=codex_session_affinity,
         )
         assert upstream_control.replay_request_state is not None
         reader_published_replay.set()
@@ -38490,16 +38718,15 @@ async def test_stream_with_retry_releases_api_key_reservation_when_owner_lookup_
     owner_lookup.assert_awaited_once()
     select_account.assert_not_called()
     get_usage_reservation_mock.assert_awaited_once_with(reservation.reservation_id)
+    transition_usage_reservation_status_mock.assert_awaited_once_with(
+        reservation.reservation_id,
+        expected_status="reserved",
+        new_status="released",
+    )
     if release_read_fails:
-        transition_usage_reservation_status_mock.assert_not_awaited()
         settle_usage_reservation_mock.assert_not_awaited()
         commit_mock.assert_not_awaited()
     else:
-        transition_usage_reservation_status_mock.assert_awaited_once_with(
-            reservation.reservation_id,
-            expected_status="reserved",
-            new_status="released",
-        )
         settle_usage_reservation_mock.assert_awaited_once()
         commit_mock.assert_awaited_once()
 
@@ -41979,6 +42206,7 @@ async def test_compact_usage_settlement_surfaces_when_fail_safe_release_fails(mo
         input_tokens=7,
         output_tokens=3,
         cached_input_tokens=0,
+        cache_write_input_tokens=0,
         service_tier=None,
     )
     primary_service.release_usage_reservation.assert_not_awaited()
@@ -52368,7 +52596,7 @@ def test_maybe_dump_oversized_response_create_dedups_via_product_path(monkeypatc
 
 @pytest.mark.asyncio
 async def test_submit_http_bridge_request_reinlines_final_text(monkeypatch):
-    service = proxy_service.ProxyService.__new__(proxy_service.ProxyService)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
     service._durable_bridge = None
     proxy_service._initialize_http_bridge_retry_circuit(service)
     original_text = json.dumps(
@@ -52423,6 +52651,7 @@ async def test_submit_http_bridge_request_reinlines_final_text(monkeypatch):
         last_used_at=0.0,
         idle_ttl_seconds=120.0,
     )
+    service._http_bridge_sessions[session.key] = session
 
     inline = AsyncMock(return_value=inlined_text)
     monkeypatch.setattr(service, "_inline_http_bridge_image_urls", inline)
@@ -52457,7 +52686,7 @@ async def test_submit_http_bridge_request_reinlines_final_text(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_submit_http_bridge_network_send_failure_is_neutral_and_not_replayed(monkeypatch):
-    service = proxy_service.ProxyService.__new__(proxy_service.ProxyService)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
     service._durable_bridge = None
     proxy_service._initialize_http_bridge_retry_circuit(service)
     request_state = proxy_service._WebSocketRequestState(
@@ -52495,6 +52724,7 @@ async def test_submit_http_bridge_network_send_failure_is_neutral_and_not_replay
         last_used_at=0.0,
         idle_ttl_seconds=120.0,
     )
+    service._http_bridge_sessions[session.key] = session
     cleanup_observed_closed: list[bool] = []
 
     async def cleanup(*_args: object, **_kwargs: object) -> None:
@@ -52532,7 +52762,7 @@ async def test_submit_http_bridge_network_send_failure_is_neutral_and_not_replay
 
 @pytest.mark.asyncio
 async def test_submit_http_bridge_marks_ambiguous_operation_before_releasing_owner(monkeypatch):
-    service = proxy_service.ProxyService.__new__(proxy_service.ProxyService)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
     events: list[str] = []
     service._durable_bridge = SimpleNamespace(
         mark_operation_unknown=AsyncMock(side_effect=lambda **_kwargs: events.append("mark") or True),
@@ -52575,6 +52805,7 @@ async def test_submit_http_bridge_marks_ambiguous_operation_before_releasing_own
         durable_session_id="durable-owner-fence-order",
         durable_owner_epoch=4,
     )
+    service._http_bridge_sessions[session.key] = session
 
     async def cleanup(*_args: object, **_kwargs: object) -> None:
         events.append("cleanup")
@@ -52600,7 +52831,7 @@ async def test_submit_http_bridge_marks_ambiguous_operation_before_releasing_own
 
 @pytest.mark.asyncio
 async def test_submit_http_bridge_preflight_failure_keeps_operation_pre_dispatch(monkeypatch):
-    service = proxy_service.ProxyService.__new__(proxy_service.ProxyService)
+    service = proxy_service.ProxyService(_repo_factory(_RequestLogsRecorder()))
     service._durable_bridge = None
     proxy_service._initialize_http_bridge_retry_circuit(service)
     request_state = proxy_service._WebSocketRequestState(
@@ -52633,6 +52864,7 @@ async def test_submit_http_bridge_preflight_failure_keeps_operation_pre_dispatch
         last_used_at=0.0,
         idle_ttl_seconds=120.0,
     )
+    service._http_bridge_sessions[session.key] = session
     send_frame = AsyncMock(
         side_effect=proxy_module.ProxyResponseError(
             400,

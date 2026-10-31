@@ -994,6 +994,7 @@ async def test_bridge_connect_failure_records_prepared_anchor_provenance(
             SimpleNamespace(
                 get=AsyncMock(
                     return_value=SimpleNamespace(
+                        routing_strategy="usage_weighted",
                         upstream_stream_transport="auto",
                         sticky_threads_enabled=False,
                         openai_cache_affinity_max_age_seconds=1800,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -400,12 +401,25 @@ def test_parent_unknown_to_the_base_ref_does_not_report_a_fork(checker: ModuleTy
     assert report.errors == []
 
 
-def test_base_ref_revisions_reads_the_graph_out_of_git(checker: ModuleType) -> None:
+def test_base_ref_revisions_reads_the_graph_out_of_git(checker: ModuleType, tmp_path: Path) -> None:
     """The git plumbing must reproduce the same edges as reading the working tree."""
     base_revisions = checker.base_ref_revisions("HEAD")
     assert base_revisions is not None
     from_git = {revision.revision: revision.down_revisions for revision in base_revisions}
-    from_disk = {revision.revision: revision.down_revisions for revision in checker.load_graph(VERSIONS_DIR)}
+    # Compare against the committed tree, including while a new migration is uncommitted.
+    committed = tmp_path / "versions"
+    committed.mkdir()
+    paths = subprocess.check_output(
+        ["git", "ls-tree", "-r", "--name-only", "HEAD", "--", str(VERSIONS_DIR.relative_to(REPO_ROOT))],
+        cwd=REPO_ROOT,
+        text=True,
+    ).splitlines()
+    for path in paths:
+        if path.endswith(".py"):
+            (committed / Path(path).name).write_bytes(
+                subprocess.check_output(["git", "show", f"HEAD:{path}"], cwd=REPO_ROOT)
+            )
+    from_disk = {revision.revision: revision.down_revisions for revision in checker.load_graph(committed)}
     assert from_git == from_disk
     assert "__init__" not in from_git
 

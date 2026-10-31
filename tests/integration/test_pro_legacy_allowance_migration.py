@@ -18,7 +18,7 @@ async def test_legacy_allowance_migration_preserves_historical_rows_and_roundtri
     parent = "20260918_000000_merge_scim_and_overflow_heads"
     revision = "20260930_000000_add_pro_legacy_allowance"
     config = _build_alembic_config(url)
-    assert ScriptDirectory.from_config(config).get_heads() == [revision]
+    assert ScriptDirectory.from_config(config).get_revision(revision) is not None
     await to_thread.run_sync(lambda: run_upgrade(url, parent, bootstrap_legacy=False))
     engine = create_async_engine(url)
     try:

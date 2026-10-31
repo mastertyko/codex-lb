@@ -21,6 +21,7 @@ from app.core.usage.logs import (
     NON_ERROR_STATUSES,
     RequestLogLike,
     calculated_cost_from_log,
+    captured_cost_from_log,
 )
 from app.core.usage.types import (
     BucketConversationAggregate,
@@ -1120,13 +1121,12 @@ class RequestLogsRepository:
                 upstream_proxy_fail_closed_reason=upstream_proxy_fail_closed_reason,
                 requested_at=requested_at or utcnow(),
             )
-            log.cost_usd = (
-                cost_usd
-                if cost_usd is not None
-                else 0.0
-                if model_source_id is not None
-                else calculated_cost_from_log(typing_cast(RequestLogLike, log))
-            )
+            if cost_usd is None and model_source_id is None:
+                log.cost_usd, basis = captured_cost_from_log(typing_cast(RequestLogLike, log))
+                log.pricing_basis_json = basis.model_dump_json() if basis is not None else None
+            else:
+                log.cost_usd = cost_usd if cost_usd is not None else 0.0
+                log.pricing_basis_json = None
             # Core insert instead of unit-of-work: the row is fully built
             # above, so the ORM flush (relationship cascade scan,
             # per-attribute history snapshots) is pure overhead on every

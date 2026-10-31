@@ -32,6 +32,7 @@ from app.modules.proxy.downstream_delivery import (
     OUTCOME_TERMINAL_WRITTEN,
     DeliveryTracedStreamingResponse,
 )
+from app.modules.proxy.load_balancer import AccountLease
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository
 from tests.fixtures.encrypted_output import (
@@ -2208,9 +2209,12 @@ async def test_v1_responses_default_smart_policy_routes_http_downstream_by_stick
         base_url=None,
         raise_for_status=False,
         upstream_stream_transport_override=None,
+        route_trace=None,
     ):
         del payload, headers, access_token, account_id, base_url, raise_for_status
         captured["transport"] = upstream_stream_transport_override
+        assert route_trace is not None
+        route_trace.transport = "http" if upstream_stream_transport_override == "http" else "websocket"
         yield (
             'data: {"type":"response.completed","response":{"id":"resp_http_smart","object":"response",'
             '"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
@@ -2231,11 +2235,12 @@ async def test_v1_responses_default_smart_policy_routes_http_downstream_by_stick
         result = await session.execute(select(RequestLog).where(RequestLog.request_id == "resp_http_smart"))
         log = result.scalar_one()
     assert log.transport == "http"
-    assert log.upstream_transport == expected_transport
+    actual_transport = "http" if expected_transport == "http" else "websocket"
+    assert log.upstream_transport == actual_transport
     assert metric_calls == [
         {
             "downstream_transport": "http",
-            "upstream_transport": expected_transport,
+            "upstream_transport": actual_transport,
             "policy": "smart",
             "sticky": expected_transport == "auto",
             "status": "success",
@@ -2289,6 +2294,7 @@ async def test_v1_responses_upstream_transport_metric_counts_terminal_errors(
         metric_calls.append(dict(labels))
 
     async def fake_stream(*_args, **_kwargs):
+        _kwargs["route_trace"].transport = "http"
         if False:
             yield ""
         raise proxy_client_module.ProxyResponseError(
@@ -4399,3 +4405,65 @@ async def test_v1_responses_disconnect_stamp_reaches_traced_response_through_rea
         "request_id=req_delivery_trace_stamp surface=responses outcome=terminal_after_disconnect "
         "terminal=response.completed"
     ) in records[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_native_responses_exhausted_transport_renders_terminal_and_releases_lease(
+    async_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    email = "native-giveup@example.com"
+    raw_account_id = "acc_native_giveup"
+    imported = await async_client.post(
+        "/api/accounts/import",
+        files={"auth_json": ("auth.json", json.dumps(_make_auth_json(raw_account_id, email)), "application/json")},
+    )
+    assert imported.status_code == 200
+
+    request_logs: list[dict[str, object]] = []
+    released_leases: list[AccountLease] = []
+    original_release = proxy_module.LoadBalancer.release_account_lease
+
+    async def release_lease(self: proxy_module.LoadBalancer, lease: AccountLease | None) -> None:
+        if lease is not None:
+            released_leases.append(lease)
+        await original_release(self, lease)
+
+    async def write_request_log(_self: object, **kwargs: object) -> None:
+        request_logs.append(kwargs)
+
+    async def failed_upstream(
+        _payload: ResponsesRequest,
+        *_args: object,
+        **_kwargs: object,
+    ) -> AsyncIterator[str]:
+        yield (
+            'data: {"type":"response.created","response":{"id":"resp_native_giveup",'
+            '"object":"response","status":"in_progress","output":[]}}\n\n'
+        )
+        raise proxy_client_module.aiohttp.ClientConnectionError("controlled upstream disconnect")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", failed_upstream)
+    monkeypatch.setattr(proxy_module.ProxyService, "_write_request_log", write_request_log)
+    monkeypatch.setattr(proxy_module.LoadBalancer, "release_account_lease", release_lease)
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True},
+        headers={"accept": "text/event-stream", "originator": "codex_exec"},
+    ) as response:
+        assert response.status_code == 200
+        lines = [line async for line in response.aiter_lines() if line]
+
+    events = list(_iter_sse_events(lines))
+    assert [event["type"] for event in events] == ["response.created", "response.failed"]
+    error = events[-1]["response"]["error"]
+    assert error["code"] == "rate_limit_exceeded"
+    assert error["message"].startswith("Please try again in 5s. ")
+    assert "stream_incomplete" in error["message"]
+    assert all("_codex_lb_synthetic_transport_failure" not in event for event in events)
+    assert "data: [DONE]" not in lines
+    assert len(request_logs) == 1
+    assert request_logs[0]["error_code"] == "stream_incomplete"
+    assert len(released_leases) == 1

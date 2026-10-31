@@ -279,6 +279,79 @@ test("dashboard usage donuts stay within supported viewports", async ({ page }) 
   }
 });
 
+test("request details show captured prices on desktop and mobile", async ({ page }, testInfo) => {
+  const errors: string[] = [];
+  page.on("response", (response) => {
+    if (response.status() >= 400) errors.push(`${new URL(response.url()).pathname}: HTTP ${response.status()}`);
+  });
+  page.on("pageerror", (error) => errors.push(error.message));
+  page.on("console", (message) => {
+    if (message.type() === "error" || message.type() === "warning") errors.push(message.text());
+  });
+  await installMobileContainmentFixtures(page);
+  await page.route("**/health/ready", (route) => route.fulfill({ json: { status: "ok" } }));
+  await page.route("**/api/runtime/version", (route) => route.fulfill({ json: {
+    currentVersion: "1.0.0",
+    latestVersion: "1.0.0",
+    updateAvailable: false,
+    checkedAt: "2026-01-01T00:00:00Z",
+    source: "fixture",
+    releaseUrl: "https://example.test/releases",
+  } }));
+  await page.route((url) => url.pathname === "/api/conversation-archive/records", (route) =>
+    route.fulfill({ json: { records: [], total: 0, hasMore: false } }),
+  );
+  await page.route((url) => url.pathname === "/api/request-logs", async (route) => {
+    await route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify(createRequestLogsResponse([createRequestLogEntry({
+        accountId: "acc_primary",
+        requestId: "req_captured_prices",
+        serviceTier: "priority",
+        requestedServiceTier: "priority",
+        actualServiceTier: "priority",
+        costUsd: 0.006624,
+        costBreakdown: { inputUsd: 0.00176, cachedInputUsd: 0.000064, outputUsd: 0.0048, totalUsd: 0.006624 },
+        pricingBasis: {
+          schemaVersion: 1,
+          priceVersion: `sha256:${"a".repeat(64)}`,
+          model: "gpt-5.1",
+          inputPer1M: 2,
+          cachedInputPer1M: 0.2,
+          cacheWriteInputPer1M: 3,
+          outputPer1M: 8,
+        },
+      })], 1, false)),
+    });
+  });
+  await page.goto("/dashboard", { waitUntil: "networkidle" });
+  await expect(page).toHaveURL(/\/dashboard$/);
+  await expect(page).toHaveTitle("Codex LB");
+  await expect(page.getByRole("heading", { name: "Dashboard", exact: true })).toBeVisible();
+  await expect(page.locator("vite-error-overlay")).toHaveCount(0);
+  await page.getByRole("button", { name: "View Details" }).click();
+  const dialog = page.getByRole("dialog");
+  const prices = dialog.getByTestId("captured-pricing-basis");
+  await expect(prices).toContainText("Captured input price / 1M tokens$2.00");
+  await expect(prices).toContainText("Captured cached input price / 1M tokens$0.20");
+  await expect(prices).toContainText("Captured cache write price / 1M tokens$3.00");
+  await expect(prices).toContainText("Captured output price / 1M tokens$8.00");
+  await expect(prices).toContainText("Price versionaaaaaaaaaaaa");
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+    await resizeViewportAndSettle(page, viewport);
+    await prices.scrollIntoViewIfNeeded();
+    await expect(prices).toBeVisible();
+    const bounds = await prices.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(viewport.width);
+    await page.screenshot({ path: testInfo.outputPath(`captured-prices-${viewport.width}.png`) });
+  }
+  await dialog.getByRole("button", { name: "Close", exact: true }).first().click();
+  await expect(dialog).toBeHidden();
+  expect(errors).toEqual([]);
+});
+
 test("desktop route navigation resets new pages without overriding query, history, or hash scrolling", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await openLongSettingsPage(page, 1400);

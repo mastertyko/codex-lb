@@ -3,7 +3,7 @@
   "private": true,
   "version": "1.25.0-beta.9",
   "type": "module",
-  "packageManager": "bun@1.3.14",
+  "packageManager": "bun@1.4.4",
   "scripts": {
     "generate:bun-nix": "bun2nix -o bun.nix",
     "dev": "vite",

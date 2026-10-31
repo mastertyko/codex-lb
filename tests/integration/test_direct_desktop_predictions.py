@@ -713,6 +713,7 @@ async def test_prediction_exact_owner_policy_survives_voice_removal(harness, tra
             owner.chatgpt_account_id = "another-workspace"
         elif state == "scope":
             key = await session.get(ApiKey, harness.key_id)
+            assert key is not None
             key.account_assignment_scope_enabled = True
             # An empty enabled assignment set excludes every owner.
         await session.commit()
@@ -738,6 +739,7 @@ async def test_prediction_exact_owner_policy_survives_voice_removal(harness, tra
         assert not reservations
         if allowed:
             owner = await session.get(Account, "voice-owner")
+            assert owner is not None
             assert owner.status == (AccountStatus.ACTIVE if state == "active" else AccountStatus.PAUSED)
 
 
@@ -757,6 +759,7 @@ async def test_prediction_rechecks_owner_after_routing_and_releases_lease(harnes
         assert operation == "desktop_prediction"
         async with SessionLocal() as session:
             owner = await session.get(Account, account.id)
+            assert owner is not None
             if mutation == "identity":
                 owner.chatgpt_user_id = "changed-user"
             else:

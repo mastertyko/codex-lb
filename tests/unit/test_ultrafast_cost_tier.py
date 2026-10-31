@@ -52,7 +52,9 @@ def test_unrelated_requests_keep_reported_tier(model, requested, actual, expecte
 )
 def test_offline_ultrafast_rates(monkeypatch, model, factor, inputs, cached, writes, sol_cost):
     monkeypatch.setattr(pricing_catalog, "_prices", None)
-    _, price = get_pricing_for_model(model)
+    resolved = get_pricing_for_model(model)
+    assert resolved is not None
+    _, price = resolved
     # Astra cached input is 6 rather than Sol's .6 (10x), while other rates are 5x.
     expected = sol_cost * factor
     if factor == 5:
