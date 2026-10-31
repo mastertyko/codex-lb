@@ -83,3 +83,12 @@ reconstructed. Local Python tests use 3.14.10; production reported 3.14.8.
 Health inspection was read-only and skipped the drain probe, which can perform
 housekeeping. No deployment, restart, production migration, PR or main-branch
 update is part of this delivery.
+
+## Delivery
+
+The source checkpoint was committed as `af218f5465aac970cc8ed3ddb7af037884a84c76` and
+pushed to the separate fork branch `chore/production-runtime-checkpoint-20261031`.
+A fresh remote lookup confirmed equality with the local commit. The publication
+review covers the exact staged tree and every newly published commit; operational
+evidence remains outside the repository. Subsequent documentation finalization
+does not change any file covered by the runtime/build-input manifest.

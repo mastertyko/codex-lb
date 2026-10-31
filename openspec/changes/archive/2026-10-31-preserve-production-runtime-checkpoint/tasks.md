@@ -13,5 +13,5 @@
 
 ## 3. Delivery
 
-- [ ] 3.1 Commit the reviewed checkpoint and push only its explicit topic ref to the fork.
-- [ ] 3.2 Verify local and fork commit equality and record the final validation evidence.
+- [x] 3.1 Commit the reviewed checkpoint and push only its explicit topic ref to the fork.
+- [x] 3.2 Verify local and fork commit equality and record the final validation evidence.
