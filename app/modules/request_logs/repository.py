@@ -1268,6 +1268,9 @@ class RequestLogsRepository:
         error_codes_in: list[str] | None = None,
         error_codes_excluding: list[str] | None = None,
         *,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
         cache_mode: str = "since",
         timeframe: str | None = None,
         include_sensitive_metadata: bool = True,
@@ -1277,6 +1280,9 @@ class RequestLogsRepository:
         since = _naive_utc(since) if since is not None else None
         until = _naive_utc(until) if until is not None else None
         filters = self._build_filters(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             search=search,
             since=since,
             until=until,
@@ -1313,7 +1319,14 @@ class RequestLogsRepository:
             return RequestLogsResult(logs=logs, total=total, aggregated_cost_usd=aggregated_cost_usd)
 
         demand_params: _DemandCountParams | None = None
-        if search is None and not error_codes_in and not error_codes_excluding:
+        if (
+            search is None
+            and not error_codes_in
+            and not error_codes_excluding
+            and not request_kinds
+            and not transports
+            and not upstream_transports
+        ):
             demand_params = _DemandCountParams(
                 since=since,
                 until=until,
@@ -1333,6 +1346,9 @@ class RequestLogsRepository:
         window_identity = ("timeframe", timeframe) if cache_mode == "timeframe" else ("since", since)
         cache_key = (
             search,
+            tuple(sorted(request_kinds or ())),
+            tuple(sorted(transports or ())),
+            tuple(sorted(upstream_transports or ())),
             window_identity,
             until,
             conversation_id,
@@ -1489,8 +1505,14 @@ class RequestLogsRepository:
         model_options: list[tuple[str, str | None]] | None = None,
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
     ) -> tuple[list[str], list[tuple[str, str | None]], list[str], list[tuple[str, str | None]]]:
         filters = self._build_filters(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             since=since,
             until=until,
             account_ids=account_ids,
@@ -1506,6 +1528,9 @@ class RequestLogsRepository:
             exclude_soft_deleted=True,
         )
         api_key_facet_filters = self._build_filters(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             since=since,
             until=until,
             account_ids=account_ids,
@@ -1521,7 +1546,20 @@ class RequestLogsRepository:
             exclude_soft_deleted=True,
         )
 
-        unfiltered = not any((since, until, account_ids, api_key_ids, model_options, models, reasoning_efforts))
+        unfiltered = not any(
+            (
+                since,
+                until,
+                account_ids,
+                api_key_ids,
+                model_options,
+                models,
+                reasoning_efforts,
+                request_kinds,
+                transports,
+                upstream_transports,
+            )
+        )
         if unfiltered:
             # PostgreSQL has no loose index scan: with no user filters each
             # DISTINCT below is a full pass over request_logs, four times per
@@ -1653,6 +1691,9 @@ class RequestLogsRepository:
         model_options: list[tuple[str, str | None]] | None = None,
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
         include_success: bool = True,
         include_cancelled: bool = True,
         include_error_other: bool = True,
@@ -1676,6 +1717,20 @@ class RequestLogsRepository:
             conditions.append(RequestLog.account_id.in_(account_ids))
         if api_key_ids:
             conditions.append(RequestLog.api_key_id.in_(api_key_ids))
+        if request_kinds:
+            kinds = set(request_kinds)
+            if "warmup" in kinds:
+                kinds.add("limit_warmup")
+            conditions.append(RequestLog.request_kind.in_(kinds))
+        for column, values in (
+            (RequestLog.transport, transports),
+            (RequestLog.upstream_transport, upstream_transports),
+        ):
+            if values:
+                transport_conditions = [column.in_([value for value in values if value != "unknown"])]
+                if "unknown" in values:
+                    transport_conditions.append(or_(column.is_(None), column.not_in(("http", "websocket"))))
+                conditions.append(or_(*transport_conditions))
         if model_options:
             pair_conditions = []
             for model, effort in model_options:
@@ -1721,6 +1776,12 @@ class RequestLogsRepository:
                 RequestLog.model.ilike(search_pattern),
                 RequestLog.reasoning_effort.ilike(search_pattern),
                 RequestLog.source.ilike(search_pattern),
+                RequestLog.request_kind.ilike(search_pattern),
+                RequestLog.transport.ilike(search_pattern),
+                RequestLog.upstream_transport.ilike(search_pattern),
+                case((RequestLog.request_kind == "codex_control_alpha_search", "Web search"), else_="").ilike(
+                    search_pattern
+                ),
                 RequestLog.status.ilike(search_pattern),
                 RequestLog.error_code.ilike(search_pattern),
                 RequestLog.error_message.ilike(search_pattern),

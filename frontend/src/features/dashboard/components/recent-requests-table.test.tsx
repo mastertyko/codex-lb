@@ -11,9 +11,15 @@ import {
   MIN_REQUEST_LOG_COLUMN_WIDTH,
   REQUEST_LOG_COLUMN_WIDTH_STEP,
 } from "@/features/dashboard/request-log-columns";
-import type { RequestLog } from "@/features/dashboard/schemas";
+import { RequestLogSchema, type RequestLog } from "@/features/dashboard/schemas";
 
 const ISO = "2026-01-01T12:00:00+00:00";
+const NULL_PHASE_TIMINGS = {
+  latencyResponseCreatedMs: null,
+  latencyFirstUpstreamEventMs: null,
+  latencyResponseCreateGateWaitMs: null,
+  latencyBridgeQueueWaitMs: null,
+};
 const NULL_FAILURE_METADATA = {
   failurePhase: null,
   failureDetail: null,
@@ -77,6 +83,7 @@ const LAYOUT_REQUEST = {
   errorCode: null,
   errorMessage: null,
   ...NULL_FAILURE_METADATA,
+  ...NULL_PHASE_TIMINGS,
   ...NULL_USERAGENT_METADATA,
   tokens: 1200,
   inputTokens: 1000,
@@ -130,6 +137,160 @@ describe("RecentRequestsTable", () => {
     expect(screen.getAllByRole("columnheader")).toHaveLength(ALL_REQUEST_LOG_COLUMNS.length);
     expect(screen.getByText("Layout Key")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "View Details" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["prewarm", "Prewarm"],
+    ["compaction", "Compaction"],
+    ["realtime_live", "Realtime"],
+    ["limit_warmup", "Warmup"],
+  ] as const)("labels %s while preserving model identity", (requestKind, label) => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[{ ...LAYOUT_REQUEST, requestKind }]} />);
+    expect(screen.getByText(label)).toBeInTheDocument();
+    expect(screen.getByText("gpt-5.1")).toBeInTheDocument();
+    const dialog = openRequestDetails();
+    expect(within(dialog).getByText(label)).toBeInTheDocument();
+    expect(within(dialog).getByText("gpt-5.1")).toBeInTheDocument();
+  });
+
+  it("shows recorded failure and phase metadata without inventing TTFT", () => {
+    const request = {
+      ...LAYOUT_REQUEST,
+      status: "error",
+      latencyFirstTokenMs: null,
+      latencyResponseCreatedMs: 25,
+      latencyFirstUpstreamEventMs: 20,
+      latencyResponseCreateGateWaitMs: 0,
+      failurePhase: "upstream_connect",
+      failureDetail: "connect_timeout",
+      failureExceptionType: "TimeoutError",
+      upstreamStatusCode: 504,
+      upstreamErrorCode: "upstream_timeout",
+      bridgeStage: "owner_forward",
+    };
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[request]} />);
+    const dialog = openRequestDetails();
+    for (const value of ["upstream_connect", "connect_timeout", "TimeoutError", "504", "upstream_timeout", "owner_forward", "25 ms", "20 ms", "0 ms"]) {
+      expect(within(dialog).getByText(value)).toBeInTheDocument();
+    }
+    expect(within(dialog).queryByText("Bridge queue wait")).not.toBeInTheDocument();
+    expect(within(dialog).getByText("TTFT").closest(".space-y-1")).toHaveTextContent("—");
+  });
+
+  it.each([
+    [0.00002, "< $0.01", "$0.00002"],
+    [0.0000002, "< $0.01", "< $0.000001"],
+    [0.0000001, "< $0.01", "< $0.000001"],
+    [0, "$0.00", "$0.00"],
+    [null, "--", "--"],
+  ])("distinguishes small, zero and missing costs (%s)", (costUsd, tableCost, detailCost) => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[{ ...LAYOUT_REQUEST, costUsd }]} />);
+    const row = screen.getAllByRole("row")[1];
+    expect(within(row).getAllByText(tableCost).length).toBeGreaterThan(0);
+    const dialog = openRequestDetails();
+    expect(within(dialog).getByText("Estimated cost").closest(".space-y-1")).toHaveTextContent(detailCost);
+    expect(within(dialog).queryByText("Failure phase")).not.toBeInTheDocument();
+    expect(within(dialog).queryByText("First upstream event")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["default", "priority", "default", "Standard", "Upstream-reported tier"],
+    ["auto", "priority", "default", "Standard", "Upstream-reported tier"],
+    ["priority", "priority", "priority", "Fast", "Upstream-reported tier"],
+    ["fast", "priority", "priority", "Fast", "Upstream-reported tier"],
+    ["flex", "flex", "flex", "Flex", "Upstream-reported tier"],
+    ["ultrafast", "ultrafast", "ultrafast", "Ultrafast", "Upstream-reported tier"],
+    ["ultrafast", "ultrafast", "default", "Ultrafast", "Requested tier (unconfirmed)"],
+    ["ultrafast", "ultrafast", "auto", "Ultrafast", "Requested tier (unconfirmed)"],
+    ["ultrafast", "ultrafast", null, "Ultrafast", "Requested tier (unconfirmed)"],
+    ["priority", "priority", null, "Fast", "Requested tier (unconfirmed)"],
+    ["flex", null, null, "Flex", "Recorded pricing tier"],
+    [null, "priority", null, "Unknown pricing tier", "Unknown pricing tier"],
+    ["unrecognized", "priority", "default", "Unknown pricing tier", "Unknown pricing tier"],
+  ])("explains pricing tier %s with requested %s and upstream %s", (serviceTier, requestedServiceTier, actualServiceTier, tier, basis) => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[{
+      ...LAYOUT_REQUEST, serviceTier, requestedServiceTier, actualServiceTier,
+    }]} />);
+    const row = screen.getAllByRole("row")[1];
+    if (tier !== "Unknown pricing tier") expect(within(row).getByText(tier)).toBeInTheDocument();
+    expect(within(row).queryByText("Requested", { exact: true }) !== null).toBe(basis === "Requested tier (unconfirmed)");
+    const dialog = openRequestDetails();
+    const details = within(dialog).getByTestId("request-cost-basis");
+    expect(within(details).getByText("Price tier").closest(".space-y-1")).toHaveTextContent(tier);
+    expect(details).toHaveTextContent(`Estimate basis: ${basis}`);
+    expect(within(details).getByText("Requested tier", { exact: true }).closest(".space-y-1")).toHaveTextContent(requestedServiceTier ?? "—");
+    expect(within(details).getByText("Upstream tier").closest(".space-y-1")).toHaveTextContent(actualServiceTier ?? "—");
+    expect(details).toHaveTextContent("API-equivalent token estimate");
+    if (basis === "Requested tier (unconfirmed)") expect(details).toHaveTextContent("Upstream has not confirmed this tier.");
+  });
+
+  it.each([
+    [{ costUsd: null }, "No estimate available"],
+    [{ modelSourceId: "provider-source", serviceTier: "priority" }, "Provider pricing"],
+  ])("does not invent API pricing for missing or external estimates (%s)", (overrides, basis) => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[{ ...LAYOUT_REQUEST, ...overrides }]} />);
+    const details = within(openRequestDetails()).getByTestId("request-cost-basis");
+    expect(details).toHaveTextContent(`Estimate basis: ${basis}`);
+    expect(details).not.toHaveTextContent("API-equivalent token estimate");
+    expect(details).not.toHaveTextContent("Upstream-reported tier");
+  });
+
+  it("marks independently rounded cost components as approximate", () => {
+    render(<RecentRequestsTable {...PAGINATION_PROPS} accounts={[]} requests={[{
+      ...LAYOUT_REQUEST,
+      inputTokens: 10,
+      outputTokens: 1,
+      costUsd: 0.0000028,
+      costBreakdown: { inputUsd: 0.0000014, cachedInputUsd: 0, outputUsd: 0.0000014, totalUsd: 0.0000028 },
+    }]} />);
+    const dialog = openRequestDetails();
+    expect(dialog).toHaveTextContent("$0.000003 ≈ 10 Input ($0.000001) + 0 Cached ($0.00) + 1 Output ($0.000001)");
+  });
+
+  it("identifies web search in the table and details with its recorded HTTP upstream", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[RequestLogSchema.parse({
+          ...LAYOUT_REQUEST,
+          requestKind: "codex_control_alpha_search",
+          model: "",
+          tokens: null,
+          inputTokens: null,
+          outputTokens: null,
+          outputTokensRaw: null,
+          cachedInputTokens: null,
+          reasoningTokens: null,
+          latencyFirstTokenMs: null,
+          costUsd: null,
+        })]}
+      />,
+    );
+
+    const row = screen.getAllByRole("row")[1];
+    expect(within(row).getByText("Web search")).toBeInTheDocument();
+    expect(within(row).getByText("Up HTTP")).toBeInTheDocument();
+    expect(within(row).getAllByText("--")).toHaveLength(4);
+    const dialog = openRequestDetails();
+    expect(within(dialog).getAllByText("Web search")).toHaveLength(2);
+    expect(within(dialog).queryByText("codex_control_alpha_search")).not.toBeInTheDocument();
+  });
+
+  it("does not infer web search or HTTP upstream from an unidentified empty model", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[{ ...LAYOUT_REQUEST, model: "", upstreamTransport: null }]}
+      />,
+    );
+
+    expect(screen.queryByText("Web search")).not.toBeInTheDocument();
+    expect(screen.queryByText("Up HTTP")).not.toBeInTheDocument();
+    const dialog = openRequestDetails();
+    expect(within(dialog).getByText("Normal")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Web search")).not.toBeInTheDocument();
   });
 
   it("renders only selected headers and matching row cells", () => {
@@ -287,6 +448,7 @@ describe("RecentRequestsTable", () => {
              errorCode: "rate_limit_exceeded",
              errorMessage: longError,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             ...NULL_USERAGENT_METADATA,
             upstreamTransport: "auto",
             upstreamProxyRouteMode: "account_bound",
@@ -387,6 +549,7 @@ describe("RecentRequestsTable", () => {
             errorCode: "client_disconnected",
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -436,6 +599,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1200,
             inputTokens: 1000,
             outputTokens: 200,
@@ -556,6 +720,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1200,
             inputTokens: 1000,
             outputTokens: 200,
@@ -652,6 +817,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 120,
             inputTokens: 100,
             outputTokens: 20,
@@ -697,6 +863,7 @@ describe("RecentRequestsTable", () => {
             requestKind: "normal",
             source: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             model: "gpt-5.1",
             serviceTier: null,
             requestedServiceTier: null,
@@ -729,6 +896,7 @@ describe("RecentRequestsTable", () => {
             requestKind: "warmup",
             source: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             model: "gpt-5.1",
             serviceTier: null,
             requestedServiceTier: null,
@@ -784,6 +952,7 @@ describe("RecentRequestsTable", () => {
              errorCode: null,
              errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
              tokens: 1,
              inputTokens: 1,
              outputTokens: 0,
@@ -831,6 +1000,7 @@ describe("RecentRequestsTable", () => {
              errorCode: "upstream_error",
              errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
              tokens: 1,
              inputTokens: 1,
              outputTokens: 0,
@@ -879,6 +1049,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1400,
             inputTokens: 1000,
             outputTokens: 400,
@@ -904,10 +1075,10 @@ describe("RecentRequestsTable", () => {
     const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
 
     expect(within(dialog).getByText("Cost")).toBeInTheDocument();
-    expect(costSection).toHaveTextContent("$0.01 =");
-    expect(costSection).toHaveTextContent("800 Input ($0.00)");
-    expect(costSection).toHaveTextContent("200 Cached ($0.00)");
-    expect(costSection).toHaveTextContent("400 Output ($0.00)");
+    expect(costSection).toHaveTextContent("$0.01 ≈");
+    expect(costSection).toHaveTextContent("800 Input ($0.004)");
+    expect(costSection).toHaveTextContent("200 Cached ($0.002)");
+    expect(costSection).toHaveTextContent("400 Output ($0.004)");
   });
 
   it("shows the full user agent in request details when present", () => {
@@ -938,6 +1109,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1001,6 +1173,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1056,6 +1229,7 @@ describe("RecentRequestsTable", () => {
             errorCode: "upstream_error",
             errorMessage: "boom",
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1108,6 +1282,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 700,
             inputTokens: 700,
             outputTokens: null,
@@ -1133,9 +1308,9 @@ describe("RecentRequestsTable", () => {
     const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
 
     expect(within(dialog).getByText("Cost")).toBeInTheDocument();
-    expect(costSection).toHaveTextContent("$0.01 =");
-    expect(costSection).toHaveTextContent("500 Input ($0.01)");
-    expect(costSection).toHaveTextContent("200 Cached ($0.00)");
+    expect(costSection).toHaveTextContent("$0.01 ≈");
+    expect(costSection).toHaveTextContent("500 Input ($0.006)");
+    expect(costSection).toHaveTextContent("200 Cached ($0.004)");
     expect(costSection).not.toHaveTextContent("Output");
   });
 
@@ -1165,6 +1340,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: null,
             inputTokens: 1000,
             outputTokens: null,
@@ -1190,9 +1366,9 @@ describe("RecentRequestsTable", () => {
     const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
 
     expect(within(dialog).getByText("Cost")).toBeInTheDocument();
-    expect(costSection).not.toHaveTextContent("=");
-    expect(costSection).toHaveTextContent("800 Input ($0.01)");
-    expect(costSection).toHaveTextContent("200 Cached ($0.00)");
+    expect(costSection).not.toHaveTextContent("≈");
+    expect(costSection).toHaveTextContent("800 Input ($0.006)");
+    expect(costSection).toHaveTextContent("200 Cached ($0.004)");
     expect(costSection).not.toHaveTextContent("Output");
   });
 
@@ -1224,6 +1400,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1285,6 +1462,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1342,6 +1520,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1500,
             inputTokens: 1000,
             outputTokens: 500,
@@ -1398,6 +1577,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1452,6 +1632,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1509,6 +1690,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -1561,6 +1743,7 @@ describe("RecentRequestsTable", () => {
             errorCode: null,
             errorMessage: null,
             ...NULL_FAILURE_METADATA,
+            ...NULL_PHASE_TIMINGS,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,

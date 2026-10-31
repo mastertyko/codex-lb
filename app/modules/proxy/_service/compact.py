@@ -798,6 +798,7 @@ class _CompactMixin:
         response: CompactResponsePayload | None = None
         request_service_tier: str | None = None
         actual_service_tier: str | None = None
+        upstream_transport: str | None = None
         route_mode: str | None = None
         route_pool_id: str | None = None
         route_endpoint_id: str | None = None
@@ -1134,6 +1135,7 @@ class _CompactMixin:
                 account_response_create_lease: AccountLease | None = None,
             ) -> CompactResponsePayload:
                 nonlocal route_fallback_used, route_mode, route_pool_id, route_endpoint_id
+                nonlocal upstream_transport
                 access_token = proxy._encryptor.decrypt(target.access_token_encrypted)
                 account_id = _header_account_id(target.chatgpt_account_id)
                 remaining_budget = _remaining_budget_seconds(deadline)
@@ -1191,6 +1193,7 @@ class _CompactMixin:
                             upstream_budget,
                             remaining_budget,
                         )
+                        upstream_transport = _REQUEST_TRANSPORT_HTTP
                         response = await asyncio.wait_for(
                             _call_with_supported_optional_kwargs(
                                 _service_core_compact_responses(),
@@ -2184,6 +2187,7 @@ class _CompactMixin:
                 ),
                 reasoning_effort=reasoning_effort,
                 transport=_REQUEST_TRANSPORT_HTTP,
+                upstream_transport=upstream_transport,
                 service_tier=_effective_service_tier(request_service_tier, actual_service_tier),
                 requested_service_tier=request_service_tier,
                 actual_service_tier=actual_service_tier,

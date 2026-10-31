@@ -22,7 +22,7 @@ from app.core.openai.model_registry import get_model_registry
 from app.core.openai.models import CompactResponsePayload, OpenAIResponsePayload
 from app.core.openai.requests import ResponsesCompactRequest
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, StickySessionKind
+from app.db.models import Account, AccountStatus, RequestLog, StickySessionKind
 from app.db.session import SessionLocal
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService
@@ -505,7 +505,8 @@ async def test_proxy_compact_surfaces_additional_quota_exhausted(async_client):
 
 
 @pytest.mark.asyncio
-async def test_proxy_compact_success(async_client, monkeypatch):
+@pytest.mark.parametrize("request_kind", ["normal", "compaction"])
+async def test_proxy_compact_success(async_client, monkeypatch, request_kind):
     email = "compact@example.com"
     raw_account_id = "acc_compact"
     auth_json = _make_auth_json(raw_account_id, email)
@@ -538,7 +539,11 @@ async def test_proxy_compact_success(async_client, monkeypatch):
         )
 
     payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
-    response = await async_client.post("/backend-api/codex/responses/compact", json=payload)
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        json=payload,
+        headers={"x-codex-turn-metadata": json.dumps({"request_kind": request_kind})},
+    )
     assert response.status_code == 200
     assert response.json()["output"] == []
     assert seen["access_token"] == "access-token"
@@ -549,6 +554,10 @@ async def test_proxy_compact_success(async_client, monkeypatch):
     assert response.headers.get("x-codex-credits-has-credits") == "true"
     assert response.headers.get("x-codex-credits-unlimited") == "false"
     assert response.headers.get("x-codex-credits-balance") == "12.50"
+    async with SessionLocal() as session:
+        row = (await session.execute(select(RequestLog))).scalar_one()
+        assert row.request_kind == request_kind
+        assert row.upstream_transport == "http"
 
 
 @pytest.mark.asyncio
@@ -1066,6 +1075,10 @@ async def test_proxy_compact_masks_previous_response_not_found(async_client, mon
     assert body["error"]["code"] == "stream_incomplete"
     assert body["error"]["message"] == "Upstream websocket closed before response.completed"
     assert "resp_compact_missing" not in response.text
+    async with SessionLocal() as session:
+        row = (await session.execute(select(RequestLog))).scalar_one()
+        assert row.status == "error"
+        assert row.upstream_transport == "http"
 
 
 @pytest.mark.asyncio
@@ -1688,6 +1701,13 @@ async def test_proxy_compact_preflight_permanent_refresh_settles_reservation(asy
         await async_client.post("/backend-api/codex/responses/compact", json=payload)
 
     settle_compact_usage.assert_awaited_once()
+    from app.dependencies import get_proxy_service_for_app
+
+    service = get_proxy_service_for_app(async_client._transport.app)
+    assert await service.drain_persistence_tasks(timeout_seconds=5)
+    async with SessionLocal() as session:
+        row = (await session.execute(select(RequestLog))).scalar_one()
+        assert row.upstream_transport is None
 
 
 @pytest.mark.asyncio

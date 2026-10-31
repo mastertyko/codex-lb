@@ -99,6 +99,9 @@ class RequestLogsService:
         reasoning_efforts: list[str] | None = None,
         status: list[str] | None = None,
         *,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
         cache_mode: str = "since",
         timeframe: str | None = None,
         include_sensitive_metadata: bool,
@@ -110,6 +113,9 @@ class RequestLogsService:
             [(option.model, option.reasoning_effort) for option in model_options] if model_options else None
         )
         result = await self._repo.list_recent(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             limit=limit,
             offset=offset,
             search=search,
@@ -168,6 +174,9 @@ class RequestLogsService:
         model_options: list[RequestLogModelOption] | None = None,
         models: list[str] | None = None,
         reasoning_efforts: list[str] | None = None,
+        request_kinds: list[str] | None = None,
+        transports: list[str] | None = None,
+        upstream_transports: list[str] | None = None,
     ) -> RequestLogFilterOptions:
         normalized_model_options = (
             [(option.model, option.reasoning_effort) for option in model_options] if model_options else None
@@ -178,6 +187,9 @@ class RequestLogsService:
             option_api_key_ids,
             status_values,
         ) = await self._repo.list_filter_options(
+            request_kinds=request_kinds,
+            transports=transports,
+            upstream_transports=upstream_transports,
             since=since,
             until=until,
             account_ids=account_ids,

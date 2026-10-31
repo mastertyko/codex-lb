@@ -66,6 +66,39 @@ function createWrapper(
 }
 
 describe("useRequestLogs", () => {
+  it("restores operational filters from the URL, sends facets, and clears them on reset", async () => {
+    const calls: URLSearchParams[] = [];
+    server.use(
+      http.get("/api/request-logs", ({ request }) => {
+        calls.push(new URL(request.url).searchParams);
+        return HttpResponse.json({ requests: [], total: 0, hasMore: false });
+      }),
+      http.get("/api/request-logs/options", ({ request }) => {
+        calls.push(new URL(request.url).searchParams);
+        return HttpResponse.json({ accountIds: [], apiKeys: [], modelOptions: [], statuses: [] });
+      }),
+    );
+    let locationSearch = "";
+    const wrapper = createWrapper(createTestQueryClient(),
+      "/dashboard?view=request-logs&requestKind=prewarm&requestKind=compaction&transport=websocket&upstreamTransport=http&upstreamTransport=unknown",
+      (value) => { locationSearch = value; });
+    const { result } = renderHook(() => useRequestLogs(), { wrapper });
+    await waitFor(() => expect(result.current.optionsQuery.isSuccess && result.current.logsQuery.isSuccess).toBe(true));
+    expect(result.current.filters).toMatchObject({ requestKinds: ["prewarm", "compaction"], transports: ["websocket"], upstreamTransports: ["http", "unknown"] });
+    expect(result.current.emptyStateFiltersApplied).toBe(true);
+    expect(calls).toHaveLength(2);
+    for (const params of calls) {
+      expect(params.getAll("requestKind")).toEqual(["prewarm", "compaction"]);
+      expect(params.getAll("transport")).toEqual(["websocket"]);
+      expect(params.getAll("upstreamTransport")).toEqual(["http", "unknown"]);
+    }
+    act(() => result.current.updateFilters({ requestKinds: [], transports: [], upstreamTransports: [], offset: 0 }));
+    await waitFor(() => expect(result.current.logsQuery.isPlaceholderData).toBe(false));
+    expect(result.current.emptyStateFiltersApplied).toBe(false);
+    const params = new URLSearchParams(locationSearch);
+    expect(params.get("view")).toBe("request-logs");
+    expect(params.has("requestKind") || params.has("transport") || params.has("upstreamTransport")).toBe(false);
+  });
   it("keeps symbolic timeframes stable across refetch despite browser clock skew", async () => {
     const listCalls: URLSearchParams[] = [];
     const optionCalls: URLSearchParams[] = [];
@@ -601,6 +634,9 @@ describe("requestLogFiltersApplied", () => {
     apiKeyIds: [],
     modelOptions: [],
     statuses: [],
+    requestKinds: [],
+    transports: [],
+    upstreamTransports: [],
     conversationId: null,
     limit: 25,
     offset: 0,

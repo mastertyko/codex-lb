@@ -1,0 +1,19 @@
+## Verification and deployment context
+
+The change preserves the earlier standalone Web search fix and unrelated production overlays. The production frontend baseline matched all 90 served asset hashes before adaptation. The image overlay changes seven Python modules plus compiled frontend assets; the complete 837-file Python/static manifest is checked during the build, together with imports, filter construction and timing null/zero semantics. Parent layers and runtime command, environment, user, ports, healthcheck and working directory remain identical.
+
+Focused local checks: 86 backend tests passed in the main logging/compaction/warmup run; 79 additional checks passed and one PostgreSQL-only plan test was skipped in the SQLite run. The compaction success test was subsequently expanded to both normal and explicit compaction metadata. The working-tree frontend passed 108 tests, lint, typecheck and build; the production-adapted frontend passed 114 tests, lint, typecheck and build. Browser QA used the actual production build with deterministic API fixtures at 1440×1000 and 390×844, exercising selection, URL persistence, reload, reset, type labels, small costs, zero phase timing, absent TTFT and failure details. There were no console errors, warnings or unhandled API requests. Browser plugin was unavailable; the available Playwright fallback was used.
+
+## TTFT investigation boundary
+
+The original fixed 24-hour audit had 340 successful normal WebSocket rows with output tokens but missing TTFT. A later bounded query found one additional row in the 2026-10-31 10:00 UTC hour. Production's first-token classifier matches the inspected source and intentionally excludes control/lifecycle-only events. The conversation archive environment flag is false, its dashboard override is null, and no archive files for October 30–31 are present. Archive IDs on request-log rows are not proof that event bodies were retained.
+
+Without those event sequences, no specific missing-output-event cause is proven. This change does not alter TTFT detection, enable payload collection, or backfill a value from first-upstream-event latency. The cause remains unresolved; the additional measured phase fields improve inspection without claiming to repair it.
+
+## Production verification
+
+The image-only cutover completed successfully in 12.696 seconds on 2026-10-31. The new image is `sha256:e6a62289dcdab49b5957dd54aa85a255c2c27e36edbf551cb94a02790b570286`; the prior Web search image remains the rollback target. Alembic stays on `20260930_000000_add_pro_legacy_allowance`. The pinned live verifier passed, including readiness and drain. Postgres retained its September 30 start time and zero restart count; the application has zero unexpected restarts. The running 837-file manifest and all 90 assets fetched through the live HTTPS endpoint match the verified build.
+
+A real native Web search at 10:18:46 UTC / 11:18:46 Stockholm completed successfully in 3277 ms. Its persisted row records `codex_control_alpha_search`, downstream HTTP and upstream HTTP. The authenticated dashboard matched the same request ID and displayed Web search / Up HTTP / OK. No synthetic success row or historical backfill was inserted.
+
+Production UI checks also exercised combined Prewarm + upstream WS filtering, URL preservation after reload, Reset, and existing failure metadata. A real prewarm row displays `< $0.01` in the table and `$0.00002` in details, response-created 808 ms, first-upstream-event 708 ms, gate wait 0 ms, and unavailable TTFT. An existing failed Web search exposes failure phase `status` and upstream status 400. Browser console errors/warnings and the checked post-deploy persistence/dashboard-error signatures were absent during verification. This is bounded runtime evidence, not a claim about all historical log delivery.

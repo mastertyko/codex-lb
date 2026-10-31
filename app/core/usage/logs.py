@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from math import isclose
 from typing import Protocol
 
 from app.core.usage.pricing import (
@@ -114,7 +115,7 @@ def _totals_match(left: float | None, right: float | None, *, precision: int | N
     if left is None or right is None:
         return False
     if precision is None:
-        return left == right
+        return isclose(left, right, rel_tol=1e-12)
     return abs(left - right) < (10 ** (-precision)) / 2
 
 

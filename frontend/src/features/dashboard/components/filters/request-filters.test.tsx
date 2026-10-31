@@ -13,6 +13,9 @@ const BASE_FILTERS: FilterState = {
   apiKeyIds: [],
   modelOptions: [],
   statuses: [],
+  requestKinds: [],
+  transports: [],
+  upstreamTransports: [],
   conversationId: null,
   limit: 25,
   offset: 0,
@@ -37,6 +40,9 @@ function renderFilters(
     onApiKeyChange: vi.fn(),
     onModelChange: vi.fn(),
     onStatusChange: vi.fn(),
+    onRequestKindChange: vi.fn(),
+    onTransportChange: vi.fn(),
+    onUpstreamTransportChange: vi.fn(),
     onConversationDismiss: vi.fn(),
     onReset: vi.fn(),
   };
@@ -45,6 +51,17 @@ function renderFilters(
 }
 
 describe("RequestFilters API key filter", () => {
+  it.each([
+    ["Request types", "Prewarm", "onRequestKindChange", "prewarm"],
+    ["Transport", "WS", "onTransportChange", "websocket"],
+    ["Upstream", "Unknown", "onUpstreamTransportChange", "unknown"],
+  ] as const)("selects %s", async (label, option, callback, value) => {
+    const user = userEvent.setup();
+    const props = renderFilters();
+    await user.click(screen.getByRole("button", { name: label }));
+    await user.click(screen.getByRole("menuitemcheckbox", { name: option }));
+    expect(props[callback]).toHaveBeenCalledWith([value]);
+  });
   it("renders the API key filter by default", () => {
     renderFilters();
 

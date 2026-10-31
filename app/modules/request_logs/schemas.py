@@ -66,6 +66,10 @@ class RequestLogEntry(DashboardModel):
     latency_ms: int | None = None
     latency_first_token_ms: int | None = None
     latency_queue_ms: int | None = None
+    latency_response_created_ms: int | None = None
+    latency_first_upstream_event_ms: int | None = None
+    latency_response_create_gate_wait_ms: int | None = None
+    latency_bridge_queue_wait_ms: int | None = None
 
 
 class RequestLogConversation(DashboardModel):

@@ -28,6 +28,7 @@ import { ConversationTimeframeSelect } from "@/features/dashboard/components/fil
 import { DashboardViewSelector } from "@/features/dashboard/components/filters/dashboard-view-selector";
 import { OverviewTimeframeSelect } from "@/features/dashboard/components/filters/overview-timeframe-select";
 import { RequestFilters } from "@/features/dashboard/components/filters/request-filters";
+import { REQUEST_KIND_LABEL_KEYS } from "@/features/dashboard/request-log-presentation";
 import { RecentRequestsTable } from "@/features/dashboard/components/recent-requests-table";
 import { StatsGrid } from "@/features/dashboard/components/stats-grid";
 import { UsageDonuts } from "@/features/dashboard/components/usage-donuts";
@@ -330,6 +331,20 @@ export function DashboardPage() {
     if (filters.search) {
       suffixParts.push(`"${filters.search}"`);
     }
+    if (filters.requestKinds.length > 0) {
+      suffixParts.push(filters.requestKinds.map((kind) =>
+        REQUEST_KIND_LABEL_KEYS[kind] ? t(REQUEST_KIND_LABEL_KEYS[kind]) : kind,
+      ).join(", "));
+    }
+    for (const [label, values] of [
+      [t("dashboard.filters.transport"), filters.transports],
+      [t("dashboard.filters.upstreamTransport"), filters.upstreamTransports],
+    ] as const) {
+      if (values.length > 0) {
+        const labels = values.map((value) => value === "websocket" ? "WS" : value === "http" ? "HTTP" : t("dashboard.filters.unknownTransport"));
+        suffixParts.push(`${label}: ${labels.join(", ")}`);
+      }
+    }
 
     const codeClass = "rounded bg-muted px-1 py-0.5 text-xs font-mono";
 
@@ -616,6 +631,9 @@ export function DashboardPage() {
                         updateFilters({ modelOptions: modelOptionsSelected, offset: 0 })
                       }
                       onStatusChange={(statuses) => updateFilters({ statuses, offset: 0 })}
+                      onRequestKindChange={(requestKinds) => updateFilters({ requestKinds, offset: 0 })}
+                      onTransportChange={(transports) => updateFilters({ transports, offset: 0 })}
+                      onUpstreamTransportChange={(upstreamTransports) => updateFilters({ upstreamTransports, offset: 0 })}
                       onConversationDismiss={handleConversationDismiss}
                       onReset={() =>
                         updateFilters({
@@ -625,6 +643,9 @@ export function DashboardPage() {
                           apiKeyIds: [],
                           modelOptions: [],
                           statuses: [],
+                          requestKinds: [],
+                          transports: [],
+                          upstreamTransports: [],
                           conversationId: null,
                           offset: 0,
                         })

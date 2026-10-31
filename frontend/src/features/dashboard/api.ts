@@ -25,6 +25,9 @@ export type RequestLogsListFilters = {
   apiKeyIds?: string[];
   statuses?: string[];
   modelOptions?: string[];
+  requestKinds?: string[];
+  transports?: string[];
+  upstreamTransports?: string[];
   timeframe?: Exclude<RequestLogTimeframe, "all">;
   since?: string;
   until?: string;
@@ -38,6 +41,9 @@ export type RequestLogFacetFilters = {
   accountIds?: string[];
   apiKeyIds?: string[];
   modelOptions?: string[];
+  requestKinds?: string[];
+  transports?: string[];
+  upstreamTransports?: string[];
 };
 
 export type DashboardOverviewParams = {
@@ -80,6 +86,9 @@ export function getRequestLogs(params: RequestLogsListFilters = {}) {
   appendMany(query, "apiKeyId", params.apiKeyIds);
   appendMany(query, "status", params.statuses);
   appendMany(query, "modelOption", params.modelOptions);
+  appendMany(query, "requestKind", params.requestKinds);
+  appendMany(query, "transport", params.transports);
+  appendMany(query, "upstreamTransport", params.upstreamTransports);
   if (params.conversationId) {
     query.set("conversation_id", params.conversationId);
   }
@@ -110,6 +119,9 @@ export function getRequestLogOptions(params: RequestLogFacetFilters = {}) {
   appendMany(query, "accountId", params.accountIds);
   appendMany(query, "apiKeyId", params.apiKeyIds);
   appendMany(query, "modelOption", params.modelOptions);
+  appendMany(query, "requestKind", params.requestKinds);
+  appendMany(query, "transport", params.transports);
+  appendMany(query, "upstreamTransport", params.upstreamTransports);
   const suffix = query.size > 0 ? `?${query.toString()}` : "";
   return get(`${REQUEST_LOGS_PATH}/options${suffix}`, RequestLogFilterOptionsSchema);
 }

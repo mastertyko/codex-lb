@@ -328,6 +328,7 @@ class _WarmupMixin:
         cached_input_tokens: int | None = None
         reasoning_tokens: int | None = None
         reservation: ApiKeyUsageReservationData | None = None
+        upstream_transport: str | None = None
         upstream_proxy_route_mode: str | None = None
         upstream_proxy_pool_id: str | None = None
         upstream_proxy_endpoint_id: str | None = None
@@ -358,6 +359,7 @@ class _WarmupMixin:
                 prohibit_fast_mode=prohibit_fast_mode,
                 request_id=request_id,
             )
+            upstream_transport = _REQUEST_TRANSPORT_HTTP
             response = await _call_with_supported_optional_kwargs(
                 _service_core_compact_responses(),
                 payload,
@@ -460,6 +462,7 @@ class _WarmupMixin:
                     cached_input_tokens=cached_input_tokens,
                     reasoning_tokens=reasoning_tokens,
                     transport=_REQUEST_TRANSPORT_HTTP,
+                    upstream_transport=upstream_transport,
                     request_kind="warmup",
                     upstream_proxy_route_mode=upstream_proxy_route_mode,
                     upstream_proxy_pool_id=upstream_proxy_pool_id,

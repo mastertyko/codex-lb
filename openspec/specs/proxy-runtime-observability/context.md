@@ -56,3 +56,31 @@ GROUP BY sticky_key_source, sticky_kind, sticky_key_hash;
 The affinity history converges with dashboard roles, users, the final compatibility-credential projection and audit actor columns through a no-op merge. Published revisions remain unchanged. Databases already on the authentication branch retain their current credentials and session generations; the earlier credential projection is not replayed on merge-only reupgrade. Databases on the older affinity history run the existing authentication backfills once. Ledgerless schema bootstrap retains those migrations' existing legacy-credential projection behavior.
 
 The subsequent invite migration converges through a second no-op join. Pending, consumed and revoked invite rows retain their hashes, expiry/consumption/revocation times, creator snapshots and flags. The older affinity history creates an empty invite table through the unchanged upstream migration.
+
+## Standalone web search labels
+
+Standalone Codex `alpha/search` calls are control operations with no inference usage recorded by this path. Their request logs use `codex_control_alpha_search`, which the English dashboard renders as `Web search` in the model cell and request-kind details. The stored model remains empty, so model filters and pricing do not acquire a fictitious model. For example, a successful dispatched search appears as `Web search`, downstream `HTTP`, upstream `Up HTTP`, status `OK`, and unavailable token/cost values.
+
+Upstream HTTP is recorded at control-client dispatch. An upstream rejection keeps HTTP plus its existing error status; an account-selection or route-resolution failure before dispatch keeps upstream transport unknown. Search response bodies, routing, and authentication retain the existing control-request contract.
+
+Older rows cannot be safely identified from an empty model alone because other control operations share that shape. They retain their original labels and transport metadata. Backend and frontend changes belong in the same release because the dashboard validates the explicit request-kind values it accepts. No database migration or configuration is required. See [the requirements](spec.md#requirement-standalone-web-search-is-identifiable-in-request-logs).
+
+## Request-log diagnostics and filtering
+
+Known operational kinds have friendly labels beside their recorded model. Repeated `requestKind`, `transport` and `upstreamTransport` filters combine values within a dimension with OR and dimensions with AND. The dashboard retains them in its URL and clears them with Reset. For example, `requestKind=prewarm&upstreamTransport=websocket` isolates prewarm calls using upstream WS. Warmup includes legacy `limit_warmup`; unknown transport includes null and unrecognized values. Existing account, API-key and conversation permission boundaries still apply.
+
+Counts and facets use the same filters. Kind/transport-filtered counts bypass demand aggregates that lack those dimensions, and their cache keys include all three dimensions. Free-text search also matches recorded type/transport and the English Web search label.
+
+Compaction and warmup record upstream HTTP at client dispatch. Preparation, account refresh, routing or admission failures before dispatch retain null; a failed dispatched request retains HTTP. Historical missing values are not backfilled. Compaction retains its existing metadata-based request-kind classification.
+
+Details show recorded response-created, first-upstream-event, response-create-gate-wait and bridge-queue-wait measurements, along with available failure phase/detail, exception type, upstream status/error code and bridge stage. An explicit zero means a measured zero; missing phase fields are omitted and missing TTFT stays unavailable. First-upstream-event is a control/event timing, not an inferred first model token.
+
+Request-log cost display uses `< $0.01` for positive costs that would otherwise round to zero and up to six decimal places in details. For example, a USD 0.00002 prewarm estimate is visible as `$0.00002` in details. These remain estimates; no pricing or settlement calculation changes.
+
+### Cost precision and pricing-tier provenance
+
+The request-log API preserves unrounded costs and available components until the dashboard formats them. A two-token Luna prewarm estimated at USD 0.0000002 therefore remains positive and displays `< $0.000001` in details. Exact zero and missing cost remain distinct. The cost breakdown uses an approximation sign because its components are rounded separately for display.
+
+Price tier is derived from the recorded pricing tier; requested and upstream-reported tiers are displayed separately. For requested `priority` and reported/recorded `default`, the price tier is Standard and the basis is upstream-reported. For requested/recorded `ultrafast` with reported `default`, the price tier is Ultrafast and the requested basis is explicitly unconfirmed. Missing or unrecognized recorded tiers stay unknown, and external model-source pricing is identified separately.
+
+This presentation describes an API-equivalent token estimate, not measured subscription consumption or an invoice. It does not establish execution speed from a requested tier. Saved totals remain authoritative when a catalog changes; relative floating-point tolerance allows harmless representation differences in matching breakdowns without equating a positive microcost with zero. Presentation changes do not trigger historical cost rewrites or pricing-tier changes.

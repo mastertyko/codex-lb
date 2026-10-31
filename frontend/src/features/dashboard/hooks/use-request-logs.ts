@@ -17,6 +17,9 @@ const DEFAULT_FILTER_STATE: FilterState = {
   apiKeyIds: [],
   modelOptions: [],
   statuses: [],
+  requestKinds: [],
+  transports: [],
+  upstreamTransports: [],
   conversationId: null,
   limit: 25,
   offset: 0,
@@ -30,6 +33,9 @@ export function requestLogFiltersApplied(filters: FilterState): boolean {
     filters.apiKeyIds.length > 0 ||
     filters.modelOptions.length > 0 ||
     filters.statuses.length > 0 ||
+    filters.requestKinds.length > 0 ||
+    filters.transports.length > 0 ||
+    filters.upstreamTransports.length > 0 ||
     Boolean(filters.conversationId)
   );
 }
@@ -41,6 +47,9 @@ const REQUEST_LOG_PARAM_KEYS = [
   "apiKeyId",
   "modelOption",
   "status",
+  "requestKind",
+  "transport",
+  "upstreamTransport",
   "conversationId",
   "limit",
   "offset",
@@ -62,6 +71,9 @@ function parseFilterState(params: URLSearchParams): FilterState {
     apiKeyIds: params.getAll("apiKeyId"),
     modelOptions: params.getAll("modelOption"),
     statuses: params.getAll("status"),
+    requestKinds: params.getAll("requestKind"),
+    transports: params.getAll("transport"),
+    upstreamTransports: params.getAll("upstreamTransport"),
     conversationId: params.get("conversationId") || null,
     limit: parseNumber(params.get("limit"), DEFAULT_FILTER_STATE.limit),
     offset: parseNumber(params.get("offset"), DEFAULT_FILTER_STATE.offset),
@@ -95,6 +107,15 @@ function writeFilterState(state: FilterState, base?: URLSearchParams): URLSearch
   }
   for (const value of state.statuses) {
     params.append("status", value);
+  }
+  for (const value of state.requestKinds) {
+    params.append("requestKind", value);
+  }
+  for (const value of state.transports) {
+    params.append("transport", value);
+  }
+  for (const value of state.upstreamTransports) {
+    params.append("upstreamTransport", value);
   }
   if (state.conversationId) {
     params.set("conversationId", state.conversationId);
@@ -145,6 +166,9 @@ export function useRequestLogs(options: UseRequestLogsOptions = {}) {
       apiKeyIds: filters.apiKeyIds,
       statuses: filters.statuses,
       modelOptions: filters.modelOptions,
+      requestKinds: filters.requestKinds,
+      transports: filters.transports,
+      upstreamTransports: filters.upstreamTransports,
       timeframe,
       conversationId: filters.conversationId ?? undefined,
     }),
@@ -156,8 +180,11 @@ export function useRequestLogs(options: UseRequestLogsOptions = {}) {
       accountIds: filters.accountIds,
       apiKeyIds: filters.apiKeyIds,
       modelOptions: filters.modelOptions,
+      requestKinds: filters.requestKinds,
+      transports: filters.transports,
+      upstreamTransports: filters.upstreamTransports,
     }),
-    [filters.accountIds, filters.apiKeyIds, filters.modelOptions, timeframe],
+    [filters.accountIds, filters.apiKeyIds, filters.modelOptions, filters.requestKinds, filters.transports, filters.upstreamTransports, timeframe],
   );
 
   const {

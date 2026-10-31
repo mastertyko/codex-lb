@@ -41,7 +41,8 @@ def to_request_log_entry(
     include_api_key_identity: bool = True,
 ) -> RequestLogEntry:
     log_like = typing_cast(RequestLogLike, log)
-    cost_breakdown = cost_breakdown_from_log(log_like, precision=6)
+    # Leave display rounding to the dashboard so positive microcosts survive.
+    cost_breakdown = cost_breakdown_from_log(log_like)
     return RequestLogEntry(
         sticky_key_source=log.sticky_key_source if include_sensitive_metadata else None,
         sticky_kind=log.sticky_kind if include_sensitive_metadata else None,
@@ -94,4 +95,8 @@ def to_request_log_entry(
         latency_ms=log.latency_ms,
         latency_first_token_ms=log.latency_first_token_ms,
         latency_queue_ms=log.latency_queue_ms,
+        latency_response_created_ms=log.latency_response_created_ms,
+        latency_first_upstream_event_ms=log.latency_first_upstream_event_ms,
+        latency_response_create_gate_wait_ms=log.latency_response_create_gate_wait_ms,
+        latency_bridge_queue_wait_ms=log.latency_bridge_queue_wait_ms,
     )

@@ -827,6 +827,50 @@ async def test_codex_alpha_search_forwards_request_and_response(async_client, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "upstream_error", "no_accounts"])
+async def test_codex_alpha_search_request_log_metadata(async_client, monkeypatch, outcome):
+    if outcome != "no_accounts":
+        await _import_account(async_client, "acc_search_log", "search-log@example.com")
+
+    async def fake_codex_control_request(*_args, **_kwargs):
+        assert outcome != "no_accounts"
+        if outcome == "upstream_error":
+            raise ProxyResponseError(
+                400,
+                {"error": {"code": "invalid_request_error", "message": "Rejected search"}},
+            )
+        return core_proxy.CodexControlResponse(
+            status_code=200,
+            body=b'{"results":[]}',
+            headers={"content-type": "application/json"},
+        )
+
+    monkeypatch.setattr(proxy_module, "core_codex_control_request", fake_codex_control_request)
+    request_id = f"req-search-log-{outcome}"
+    response = await async_client.post(
+        "/backend-api/codex/alpha/search",
+        json={"query": "example"},
+        headers={"x-request-id": request_id},
+    )
+    assert response.status_code == {"success": 200, "upstream_error": 400, "no_accounts": 503}[outcome]
+    service = get_proxy_service_for_app(async_client._transport.app)
+    assert await service.drain_persistence_tasks(timeout_seconds=1)
+
+    logs = await async_client.get("/api/request-logs")
+    assert logs.status_code == 200
+    [entry] = [row for row in logs.json()["requests"] if row["requestId"] == request_id]
+    assert entry["requestKind"] == "codex_control_alpha_search"
+    assert entry["upstreamTransport"] == (None if outcome == "no_accounts" else "http")
+    assert entry["transport"] == "http"
+    assert entry["status"] == ("ok" if outcome == "success" else "error")
+    assert entry["model"] == ""
+    assert entry["inputTokens"] is None
+    assert entry["outputTokens"] is None
+    assert entry["tokens"] is None
+    assert entry["costUsd"] is None
+
+
+@pytest.mark.asyncio
 async def test_codex_alpha_search_preserves_normalized_control_error_contract(async_client, monkeypatch):
     async def fake_codex_control_request(*_args, **_kwargs):
         raise ProxyResponseError(
